@@ -17,15 +17,20 @@ from openpyxl import load_workbook
 
 FIELDS = {
     "date": ("日期", "凭证日期", "业务日期", "记账日期", "date"),
+    "fiscal_year": ("会计年度", "账簿年度", "年度", "年", "fiscal year"),
+    "period": ("期间", "会计期间", "月份", "月", "period"),
     "voucher_no": ("凭证号", "凭证编号", "凭证号码", "凭证字号", "voucher no", "voucher number"),
     "voucher_type": ("凭证字", "凭证类型", "凭证类别", "字", "voucher type"),
     "account_code": ("科目编码", "科目代码", "会计科目编码", "科目编号", "account code"),
-    "account_name": ("科目名称", "会计科目", "科目", "account name"),
+    "account_name": ("科目名称", "科目全名", "会计科目", "科目", "account name"),
     "summary": ("摘要", "业务摘要", "说明", "description", "memo"),
     "debit": ("借方金额", "借方发生额", "本期借方", "借方", "debit"),
     "credit": ("贷方金额", "贷方发生额", "本期贷方", "贷方", "credit"),
     "counterparty": ("往来单位", "对方单位", "客商", "客户", "供应商", "counterparty"),
-    "auxiliary": ("辅助核算", "核算项目", "辅助项", "项目", "部门", "auxiliary"),
+    "auxiliary": ("辅助核算", "核算维度", "核算项目", "辅助项", "项目", "部门", "auxiliary"),
+    "currency": ("币别", "币种", "货币", "currency"),
+    "original_amount": ("原币金额", "外币金额", "原币", "original amount"),
+    "maker": ("制单", "制单人", "录入人", "prepared by"),
     "opening_debit": ("期初借方", "期初借方余额", "年初借方", "opening debit"),
     "opening_credit": ("期初贷方", "期初贷方余额", "年初贷方", "opening credit"),
     "period_debit": ("本期借方发生额", "借方本期发生额", "本期借方", "借方发生额", "period debit"),
@@ -83,6 +88,31 @@ def date_text(value: object) -> str:
     return raw
 
 
+def year_text(value: object) -> str:
+    raw = text_value(value)
+    if not raw:
+        return ""
+    if re.fullmatch(r"\d{4}(?:\.0+)?", raw):
+        return raw[:4]
+    raise ValueError(f"会计年度无法识别：{raw}")
+
+
+def period_text(value: object) -> str:
+    raw = text_value(value)
+    if not raw:
+        return ""
+    if re.fullmatch(r"\d{1,2}(?:\.0+)?", raw):
+        number = int(float(raw))
+        if 1 <= number <= 13:
+            return str(number)
+    raise ValueError(f"会计期间无法识别：{raw}")
+
+
+def period_from_date(date: str) -> tuple[str, str]:
+    match = re.fullmatch(r"(\d{4})-(\d{2})-\d{2}", date)
+    return (match.group(1), str(int(match.group(2)))) if match else ("", "")
+
+
 def text_value(value: object) -> str:
     if value is None:
         return ""
@@ -130,7 +160,7 @@ def rows(path: Path, sheet: str) -> Iterator[tuple[int, list[object]]]:
 
 def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
     mapping: dict[str, int] = {}
-    fields = ("date", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "closing_debit", "closing_credit", "closing_balance", "direction")
+    fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "closing_debit", "closing_credit", "closing_balance", "direction")
     for field in fields:
         aliases = FIELDS[field]
         for index, header in enumerate(headers):
@@ -183,14 +213,20 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
     spec.validate()
     last_account_code = ""
     last_account_name = ""
+    last_voucher = {field: "" for field in ("date", "fiscal_year", "period", "voucher_type", "voucher_no")}
     for row_no, row in rows(spec.path, spec.sheet):
-        if row_no <= spec.header_row or not any(value is not None and str(value).strip() for value in row):
+        if row_no <= spec.header_row:
+            continue
+        if not any(value is not None and str(value).strip() for value in row):
+            last_voucher = {field: "" for field in last_voucher}
+            last_account_code = last_account_name = ""
             continue
         values = {field: row[index] if index < len(row) else None for field, index in spec.mapping.items()}
         code = text_value(values.get("account_code"))
         name = text_value(values.get("account_name"))
         summary = text_value(values.get("summary"))
         if SUBTOTAL.match(name) or SUBTOTAL.match(summary) or summary in ("期初余额", "上年结转"):
+            last_voucher = {field: "" for field in last_voucher}
             continue
         if code or name:
             last_account_code, last_account_name = code, name
@@ -204,15 +240,40 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
             debit, credit = money(values.get("debit")), money(values.get("credit"))
             if debit == 0 and credit == 0:
                 continue
+            explicit_date = date_text(values.get("date"))
+            explicit_year = year_text(values.get("fiscal_year"))
+            explicit_period = period_text(values.get("period"))
+            explicit_type = text_value(values.get("voucher_type"))
+            explicit_no = text_value(values.get("voucher_no"))
+            derived_year, derived_period = period_from_date(explicit_date)
+            year = explicit_year or derived_year or last_voucher["fiscal_year"]
+            period = explicit_period or derived_period or last_voucher["period"]
+            same_period = not (year and last_voucher["fiscal_year"] and year != last_voucher["fiscal_year"]) and not (period and last_voucher["period"] and period != last_voucher["period"])
+            continuation = not explicit_date and not explicit_type and not explicit_no and same_period
+            if continuation:
+                date = last_voucher["date"]
+                voucher_type = last_voucher["voucher_type"]
+                voucher_no = last_voucher["voucher_no"]
+            else:
+                same_voucher = explicit_no and explicit_no == last_voucher["voucher_no"] and (not explicit_type or explicit_type == last_voucher["voucher_type"]) and same_period
+                date = explicit_date or (last_voucher["date"] if same_voucher else "")
+                voucher_type = explicit_type or (last_voucher["voucher_type"] if same_voucher else "")
+                voucher_no = explicit_no
+            last_voucher = {"date": date, "fiscal_year": year, "period": period, "voucher_type": voucher_type, "voucher_no": voucher_no}
             yield row_no, {
-                "date": date_text(values.get("date")),
-                "voucher_no": text_value(values.get("voucher_no")),
-                "voucher_type": text_value(values.get("voucher_type")),
+                "date": date,
+                "fiscal_year": year,
+                "period": period,
+                "voucher_no": voucher_no,
+                "voucher_type": voucher_type,
                 "account_code": code,
                 "account_name": name,
                 "summary": text_value(values.get("summary")),
                 "counterparty": text_value(values.get("counterparty")),
                 "auxiliary": text_value(values.get("auxiliary")),
+                "currency": text_value(values.get("currency")),
+                "original_amount": text_value(values.get("original_amount")),
+                "maker": text_value(values.get("maker")),
                 "debit_cents": debit,
                 "credit_cents": credit,
                 "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False),

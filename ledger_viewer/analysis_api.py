@@ -14,8 +14,8 @@ def candidate_entries(store: LedgerStore, keywords: list[str], limit: int = 5000
     for word in keywords:
         clauses.append("(a.name LIKE ? OR e.summary LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
         args.extend([f"%{word}%"] * 4)
-    query = """SELECT e.id,e.entry_date,e.voucher_type,e.voucher_no,a.code,a.name,
-        e.summary,e.counterparty,e.auxiliary,e.debit_cents,e.credit_cents,
+    query = """SELECT e.id,e.entry_date,e.fiscal_year,e.period,e.voucher_type,e.voucher_no,a.code,a.name,
+        e.summary,e.counterparty,e.auxiliary,e.currency,e.original_amount,e.maker,e.debit_cents,e.credit_cents,
         s.filename,s.sheet,e.row_no,s.sha256 FROM entries e
         JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
         WHERE """ + " OR ".join(clauses) + " ORDER BY e.entry_date,e.id LIMIT ?"

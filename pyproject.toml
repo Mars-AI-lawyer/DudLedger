@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legal-ledger-viewer"
-version = "0.1.0"
+version = "0.2.0"
 description = "离线法律尽调账簿浏览器"
 requires-python = ">=3.11"
 dependencies = ["openpyxl>=3.1,<4"]

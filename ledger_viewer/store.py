@@ -24,9 +24,12 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE TABLE IF NOT EXISTS entries (
  id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id),
- row_no INTEGER NOT NULL, entry_date TEXT NOT NULL, voucher_no TEXT NOT NULL,
+ row_no INTEGER NOT NULL, entry_date TEXT NOT NULL, fiscal_year TEXT NOT NULL DEFAULT '',
+ period TEXT NOT NULL DEFAULT '', voucher_no TEXT NOT NULL,
  voucher_type TEXT NOT NULL, account_key TEXT NOT NULL REFERENCES accounts(key),
  summary TEXT NOT NULL, counterparty TEXT NOT NULL, auxiliary TEXT NOT NULL,
+ currency TEXT NOT NULL DEFAULT '', original_amount TEXT NOT NULL DEFAULT '',
+ maker TEXT NOT NULL DEFAULT '',
  debit_cents INTEGER NOT NULL, credit_cents INTEGER NOT NULL, raw_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS balances (
@@ -59,9 +62,18 @@ class LedgerStore:
             if existing and not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_meta'").fetchone():
                 raise ValueError("这不是本软件创建的账套文件")
             self.db.executescript(SCHEMA)
-            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v1')")
-            if self.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0] != "legal-ledger-viewer-v1":
+            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v2')")
+            version = self.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0]
+            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2"):
                 raise ValueError("账套格式版本不兼容")
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(entries)")}
+            for name in ("fiscal_year", "period", "currency", "original_amount", "maker"):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE entries ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            if version == "legal-ledger-viewer-v1":
+                self.db.execute("UPDATE entries SET fiscal_year=substr(entry_date,1,4), period=CAST(CAST(substr(entry_date,6,2) AS INTEGER) AS TEXT) WHERE entry_date GLOB '????-??-??'")
+                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v2' WHERE key='format'")
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_entries_voucher_period ON entries(fiscal_year,period,voucher_type,voucher_no)")
             self.db.commit()
         except Exception:
             self.db.close()
@@ -70,10 +82,18 @@ class LedgerStore:
     def close(self) -> None:
         self.db.close()
 
-    def import_sheet(self, spec: ImportSpec) -> int:
+    def import_sheet(self, spec: ImportSpec, replace: bool = False) -> int:
         spec.validate()
         digest = file_hash(spec.path)
         with self.db:
+            conflicts = self.db.execute("SELECT id FROM sources WHERE (sha256=? OR original_path=?) AND sheet=? AND kind=?", (digest, str(spec.path.resolve()), spec.sheet, spec.kind)).fetchall()
+            if conflicts and not replace:
+                raise sqlite3.IntegrityError("该来源工作表已有导入记录")
+            if replace:
+                for old in conflicts:
+                    self.db.execute("DELETE FROM entries WHERE source_id=?", (old["id"],))
+                    self.db.execute("DELETE FROM balances WHERE source_id=?", (old["id"],))
+                    self.db.execute("DELETE FROM sources WHERE id=?", (old["id"],))
             cur = self.db.execute(
                 "INSERT INTO sources(kind,filename,original_path,sheet,sha256,mapping_json) VALUES(?,?,?,?,?,?)",
                 (spec.kind, spec.path.name, str(spec.path.resolve()), spec.sheet, digest, json.dumps({"header_row": spec.header_row, "mapping": spec.mapping}, ensure_ascii=False)),
@@ -86,8 +106,8 @@ class LedgerStore:
                 self.db.execute("INSERT INTO accounts(key,code,name) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE accounts.name END", (key, code, name))
                 if spec.kind == "entry":
                     self.db.execute(
-                        "INSERT INTO entries(source_id,row_no,entry_date,voucher_no,voucher_type,account_key,summary,counterparty,auxiliary,debit_cents,credit_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (source_id, row_no, data["date"], data["voucher_no"], data["voucher_type"], key, data["summary"], data["counterparty"], data["auxiliary"], data["debit_cents"], data["credit_cents"], data["raw_json"]),
+                        "INSERT INTO entries(source_id,row_no,entry_date,fiscal_year,period,voucher_no,voucher_type,account_key,summary,counterparty,auxiliary,currency,original_amount,maker,debit_cents,credit_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (source_id, row_no, data["date"], data["fiscal_year"], data["period"], data["voucher_no"], data["voucher_type"], key, data["summary"], data["counterparty"], data["auxiliary"], data["currency"], data["original_amount"], data["maker"], data["debit_cents"], data["credit_cents"], data["raw_json"]),
                     )
                 else:
                     self.db.execute(
@@ -98,12 +118,18 @@ class LedgerStore:
             if count == 0:
                 raise ValueError("没有识别到有效数据行，请检查表头和列映射")
             self.db.execute("UPDATE sources SET row_count=? WHERE id=?", (count, source_id))
+            self.db.execute("DELETE FROM accounts WHERE key NOT IN (SELECT account_key FROM entries UNION SELECT account_key FROM balances)")
         return count
 
     def sources(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM sources ORDER BY id").fetchall()
 
-    def summary(self, search: str = "") -> list[sqlite3.Row]:
+    def periods(self) -> list[tuple[str, str]]:
+        return [(row[0], row[1]) for row in self.db.execute("SELECT DISTINCT fiscal_year,period FROM entries WHERE fiscal_year<>'' AND period<>'' ORDER BY CAST(fiscal_year AS INTEGER),CAST(period AS INTEGER)")]
+
+    def summary(self, search: str = "", balance_source_id: int | None = None) -> list[sqlite3.Row]:
+        if balance_source_id is None:
+            balance_source_id = self.db.execute("SELECT COALESCE(MAX(id),-1) FROM sources WHERE kind='balance'").fetchone()[0]
         pattern = f"%{search}%"
         return self.db.execute("""
           SELECT a.key,a.code,a.name,
@@ -116,18 +142,21 @@ class LedgerStore:
           LEFT JOIN (SELECT account_key,SUM(opening_debit_cents) od,SUM(opening_credit_cents) oc,
             SUM(period_debit_cents) pd,SUM(period_credit_cents) pc,
             SUM(closing_debit_cents) cd,SUM(closing_credit_cents) cc,COUNT(*) n
-            FROM balances GROUP BY account_key) b ON b.account_key=a.key
+            FROM balances WHERE source_id=? GROUP BY account_key) b ON b.account_key=a.key
           LEFT JOIN (SELECT account_key,SUM(debit_cents) debit,SUM(credit_cents) credit,COUNT(*) n
             FROM entries GROUP BY account_key) e ON e.account_key=a.key
           WHERE a.code LIKE ? OR a.name LIKE ? ORDER BY a.code,a.name
-        """, (pattern, pattern)).fetchall()
+        """, (balance_source_id, pattern, pattern)).fetchall()
 
-    def entries(self, account: str | None = None, search: str = "", limit: int = 3000) -> list[sqlite3.Row]:
+    def entries(self, account: str | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None) -> list[sqlite3.Row]:
         where = []
         args: list[object] = []
         if account:
             where.append("e.account_key=?")
             args.append(account)
+        if fiscal_year and period:
+            where.append("e.fiscal_year=? AND e.period=?")
+            args.extend((fiscal_year, period))
         if search:
             where.append("(a.code LIKE ? OR a.name LIKE ? OR e.summary LIKE ? OR e.voucher_no LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
             args.extend([f"%{search}%"] * 6)
@@ -148,31 +177,48 @@ class LedgerStore:
             return []
         if not target["voucher_no"]:
             return [target]
+        if target["fiscal_year"] and target["period"]:
+            where = "e.fiscal_year=? AND e.period=? AND e.voucher_type=? AND e.voucher_no=?"
+            args = (target["fiscal_year"], target["period"], target["voucher_type"], target["voucher_no"])
+        elif target["entry_date"]:
+            where = "e.entry_date=? AND e.voucher_type=? AND e.voucher_no=?"
+            args = (target["entry_date"], target["voucher_type"], target["voucher_no"])
+        else:
+            return [target]
         return self.db.execute("""SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path
             FROM entries e JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
-            WHERE e.entry_date=? AND e.voucher_type=? AND e.voucher_no=?
-            ORDER BY e.source_id,e.row_no""", (target["entry_date"], target["voucher_type"], target["voucher_no"])).fetchall()
+            WHERE """ + where + " ORDER BY e.source_id,e.row_no", args).fetchall()
 
-    def auxiliary_totals(self, account: str | None = None) -> list[sqlite3.Row]:
+    def auxiliary_totals(self, account: str | None = None, fiscal_year: str | None = None, period: str | None = None) -> list[sqlite3.Row]:
         return self.db.execute("""SELECT COALESCE(NULLIF(e.auxiliary,''),NULLIF(e.counterparty,''),'未注明') label,
           SUM(e.debit_cents) debit,SUM(e.credit_cents) credit,COUNT(*) n
-          FROM entries e WHERE (? IS NULL OR e.account_key=?)
-          GROUP BY label ORDER BY n DESC,label LIMIT 1000""", (account, account)).fetchall()
+          FROM entries e WHERE (? IS NULL OR e.account_key=?) AND (? IS NULL OR e.fiscal_year=?) AND (? IS NULL OR e.period=?)
+          GROUP BY label ORDER BY n DESC,label LIMIT 1000""", (account, account, fiscal_year, fiscal_year, period, period)).fetchall()
 
-    def export_entries(self, path: Path, account: str | None = None) -> int:
+    def export_entries(self, path: Path, account: str | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None) -> int:
         import csv
         query = """SELECT e.*,a.code,a.name,s.filename,s.sheet FROM entries e
             JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id"""
-        args = () if account is None else (account,)
+        where = []
+        args: list[object] = []
         if account is not None:
-            query += " WHERE e.account_key=?"
+            where.append("e.account_key=?")
+            args.append(account)
+        if fiscal_year and period:
+            where.append("e.fiscal_year=? AND e.period=?")
+            args.extend((fiscal_year, period))
+        if search:
+            where.append("(a.code LIKE ? OR a.name LIKE ? OR e.summary LIKE ? OR e.voucher_no LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
+            args.extend([f"%{search}%"] * 6)
+        if where:
+            query += " WHERE " + " AND ".join(where)
         query += " ORDER BY e.entry_date,e.id"
         cursor = self.db.execute(query, args)
         count = 0
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["日期", "凭证字", "凭证号", "科目编码", "科目名称", "摘要", "往来单位", "辅助核算", "借方金额", "贷方金额", "源文件", "工作表", "原行号"])
+            writer.writerow(["日期", "会计年度", "期间", "凭证字", "凭证号", "科目编码", "科目名称", "摘要", "往来单位", "辅助核算", "币别", "原币金额", "制单人", "借方金额", "贷方金额", "源文件", "工作表", "原行号"])
             for row in cursor:
-                writer.writerow([row["entry_date"], row["voucher_type"], row["voucher_no"], row["code"], row["name"], row["summary"], row["counterparty"], row["auxiliary"], format_money(row["debit_cents"]), format_money(row["credit_cents"]), row["filename"], row["sheet"], row["row_no"]])
+                writer.writerow([row["entry_date"], row["fiscal_year"], row["period"], row["voucher_type"], row["voucher_no"], row["code"], row["name"], row["summary"], row["counterparty"], row["auxiliary"], row["currency"], row["original_amount"], row["maker"], format_money(row["debit_cents"]), format_money(row["credit_cents"]), row["filename"], row["sheet"], row["row_no"]])
                 count += 1
         return count
