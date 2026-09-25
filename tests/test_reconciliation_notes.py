@@ -7,7 +7,7 @@ from ledger_viewer.checks import run_checks
 from ledger_viewer.importer import ImportSpec, guess_header
 from ledger_viewer.reconciliation import empty_plan, save_plan
 from ledger_viewer.store import LedgerStore
-from ledger_viewer.voucher_notes import export_marks_md, list_marks, remove_mark, save_mark, save_mark_by_key
+from ledger_viewer.voucher_notes import export_marks_md, list_marks, remove_mark, save_mark, save_mark_by_key, update_mark_note
 
 
 class ReconciliationNotesTest(unittest.TestCase):
@@ -128,8 +128,10 @@ class ReconciliationNotesTest(unittest.TestCase):
         self.entry_file.write_text(self.entry_file.read_text(encoding="utf-8").replace(",记,1,", ",记,2,"), encoding="utf-8")
         self._import(self.entry_file, "entry", replace=True)
         self.assertEqual(list_marks(self.store)[0]["status"], "未匹配")
+        update_mark_note(self.store, key, "找不到旧凭证，待核")
+        self.assertEqual(list_marks(self.store)[0]["status"], "未匹配")
         self.assertEqual(export_marks_md(self.store, target), (0, 1))
-        self.assertEqual(self.store.db.execute("SELECT note FROM voucher_marks WHERE voucher_key=?", (key,)).fetchone()[0], "原注释")
+        self.assertEqual(self.store.db.execute("SELECT note FROM voucher_marks WHERE voucher_key=?", (key,)).fetchone()[0], "找不到旧凭证，待核")
 
     def test_missing_voucher_number_marks_only_the_selected_row(self):
         path = self.base / "no_number.csv"

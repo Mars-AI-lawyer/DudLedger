@@ -55,6 +55,39 @@ class PipelineTest(unittest.TestCase):
         with self.assertRaises(Exception):
             self.store.import_sheet(ImportSpec(self.book, "序时账", 2, "entry", guess_header(self.book, "序时账", "entry")[2]))
 
+    def test_parent_account_includes_child_entries_auxiliary_and_csv(self):
+        path = self.base / "income.csv"
+        path.write_text(
+            "日期,科目编码,科目名称,摘要,辅助核算,借方金额,贷方金额\n"
+            "2026-08-01,6001,主营业务收入,父级记录,母项,0,10\n"
+            "2026-08-02,600101,服务收入,子级记录,服务,0,20\n"
+            "2026-08-03,600102,产品收入,另一子级,产品,0,30\n"
+            "2026-08-04,6002,其他业务收入,不相关,其他,0,40\n",
+            encoding="utf-8",
+        )
+        header, _, mapping = guess_header(path, "CSV", "entry")
+        self.store.import_sheet(ImportSpec(path, "CSV", header, "entry", mapping))
+        self.assertEqual(len(self.store.entries(account="C:6001")), 1)
+        rows = self.store.entries(account="C:6001", include_descendants=True)
+        self.assertEqual({row["code"] for row in rows}, {"6001", "600101", "600102"})
+        self.assertEqual(sum(row["credit_cents"] for row in rows), 6000)
+        self.assertEqual(sum(row["n"] for row in self.store.auxiliary_totals("C:6001", include_descendants=True)), 3)
+        target = self.base / "parent.csv"
+        self.assertEqual(self.store.export_entries(target, "C:6001", include_descendants=True), 3)
+        self.assertNotIn("其他业务收入", target.read_text(encoding="utf-8-sig"))
+
+    def test_delete_imported_source_preserves_original_and_other_tables(self):
+        for sheet, kind in (("序时账", "entry"), ("科目余额表", "balance")):
+            header, _, mapping = guess_header(self.book, sheet, kind)
+            self.store.import_sheet(ImportSpec(self.book, sheet, header, kind, mapping))
+        entry_source = next(row for row in self.store.sources() if row["kind"] == "entry")
+        self.assertTrue(self.store.delete_source(entry_source["id"]))
+        self.assertFalse(self.store.delete_source(entry_source["id"]))
+        self.assertTrue(self.book.exists())
+        self.assertEqual(len(self.store.sources()), 1)
+        self.assertEqual(len(self.store.entries()), 0)
+        self.assertEqual(len(self.store.summary()), 3)
+
     def test_decimal_and_transaction_rollback(self):
         self.assertEqual(money("(1,234.56)"), -123456)
         malformed = self.base / "bad.csv"

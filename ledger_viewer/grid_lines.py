@@ -9,21 +9,47 @@ from tkinter import ttk
 class DashedGrid:
     """Draw one-pixel dashed separators over visible rows and columns only."""
 
-    def __init__(self, view: ttk.Treeview, color: str = "#DCE4E5", background: str = "#FFFFFF"):
+    def __init__(self, view: ttk.Treeview, color: str = "#E4DFD7", background: str = "#FFFFFF"):
         self.view = view
         self.color = color
         self.background = background
         self.horizontal: list[tk.Canvas] = []
         self.vertical: list[tk.Canvas] = []
         self.pending = False
+        self.enabled = True
+        self.scroll_job: str | None = None
         for event in ("<Configure>", "<Map>", "<ButtonRelease-1>"):
             view.bind(event, self.schedule, add="+")
 
     def schedule(self, _event: object = None) -> None:
-        if self.pending or not self.view.winfo_exists():
+        if not self.enabled or self.pending or not self.view.winfo_exists():
             return
         self.pending = True
         self.view.after_idle(self.draw)
+
+    def schedule_scroll(self) -> None:
+        """Repaint once scrolling settles so a long table stays responsive."""
+        if not self.enabled or not self.view.winfo_exists():
+            return
+        if self.scroll_job is None:
+            self._hide_all()
+        if self.scroll_job is not None:
+            self.view.after_cancel(self.scroll_job)
+        self.scroll_job = self.view.after(75, self._finish_scroll)
+
+    def _finish_scroll(self) -> None:
+        self.scroll_job = None
+        self.schedule()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+        if not enabled:
+            if self.scroll_job is not None:
+                self.view.after_cancel(self.scroll_job)
+                self.scroll_job = None
+            self._hide_all()
+        else:
+            self.schedule()
 
     def _line(self, pool: list[tk.Canvas], index: int) -> tk.Canvas:
         while len(pool) <= index:
@@ -32,7 +58,7 @@ class DashedGrid:
 
     def draw(self) -> None:
         self.pending = False
-        if not self.view.winfo_exists():
+        if not self.enabled or not self.view.winfo_exists():
             return
         width, height = self.view.winfo_width(), self.view.winfo_height()
         first = next((self.view.identify_row(y) for y in range(1, height, 4) if self.view.identify_row(y)), "")

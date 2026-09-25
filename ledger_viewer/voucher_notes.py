@@ -83,6 +83,12 @@ def remove_mark(store: LedgerStore, key: str) -> None:
         store.db.execute("DELETE FROM voucher_marks WHERE voucher_key=?", (key,))
 
 
+def update_mark_note(store: LedgerStore, key: str, note: str) -> None:
+    """Edit a note without silently accepting a changed or missing voucher."""
+    with store.db:
+        store.db.execute("UPDATE voucher_marks SET note=?,updated_at=CURRENT_TIMESTAMP WHERE voucher_key=?", (note, key))
+
+
 def mark_for_entry(store: LedgerStore, entry_id: int):
     row = store.entry(entry_id)
     if row is None:

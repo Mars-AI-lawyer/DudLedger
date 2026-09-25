@@ -237,6 +237,26 @@ class LedgerStore:
     def sources(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM sources ORDER BY id").fetchall()
 
+    def delete_source(self, source_id: int) -> bool:
+        """Remove one imported worksheet, preserving the source file and voucher marks."""
+        with self.db:
+            source = self.db.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
+            if source is None:
+                return False
+            for table in ("entries", "balances", "report_rows"):
+                self.db.execute(f"DELETE FROM {table} WHERE source_id=?", (source_id,))
+            self.db.execute("DELETE FROM sources WHERE id=?", (source_id,))
+            self.db.execute("DELETE FROM accounts WHERE key NOT IN (SELECT account_key FROM entries UNION SELECT account_key FROM balances)")
+        return True
+
+    @staticmethod
+    def _account_clause(account: str | None, include_descendants: bool = False, alias: str = "e") -> tuple[str, list[str]]:
+        if not account:
+            return "", []
+        if include_descendants and account.startswith("C:"):
+            return f"substr({alias}.account_key,1,length(?))=?", [account, account]
+        return f"{alias}.account_key=?", [account]
+
     def report_rows(self, source_id: int) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM report_rows WHERE source_id=? ORDER BY row_no,id", (source_id,)).fetchall()
 
@@ -266,12 +286,13 @@ class LedgerStore:
           WHERE a.code LIKE ? OR a.name LIKE ? ORDER BY a.code,a.name
         """, (balance_source_id, pattern, pattern)).fetchall()
 
-    def entries(self, account: str | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None) -> list[sqlite3.Row]:
+    def entries(self, account: str | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False) -> list[sqlite3.Row]:
         where = []
         args: list[object] = []
-        if account:
-            where.append("e.account_key=?")
-            args.append(account)
+        account_sql, account_args = self._account_clause(account, include_descendants)
+        if account_sql:
+            where.append(account_sql)
+            args.extend(account_args)
         if fiscal_year and period:
             where.append("e.fiscal_year=? AND e.period=?")
             args.extend((fiscal_year, period))
@@ -307,13 +328,14 @@ class LedgerStore:
             FROM entries e JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
             WHERE """ + where + " ORDER BY e.source_id,e.row_no", args).fetchall()
 
-    def auxiliary_totals(self, account: str | None = None, fiscal_year: str | None = None, period: str | None = None) -> list[sqlite3.Row]:
+    def auxiliary_totals(self, account: str | None = None, fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False) -> list[sqlite3.Row]:
+        account_sql, account_args = self._account_clause(account, include_descendants)
         return self.db.execute("""SELECT COALESCE(NULLIF(e.auxiliary,''),NULLIF(e.counterparty,''),'未注明') label,
           SUM(e.debit_cents) debit,SUM(e.credit_cents) credit,COUNT(*) n
-          FROM entries e WHERE (? IS NULL OR e.account_key=?) AND (? IS NULL OR e.fiscal_year=?) AND (? IS NULL OR e.period=?)
-          GROUP BY label ORDER BY n DESC,label LIMIT 1000""", (account, account, fiscal_year, fiscal_year, period, period)).fetchall()
+          FROM entries e WHERE """ + (account_sql if account_sql else "1=1") + """ AND (? IS NULL OR e.fiscal_year=?) AND (? IS NULL OR e.period=?)
+          GROUP BY label ORDER BY n DESC,label LIMIT 1000""", (*account_args, fiscal_year, fiscal_year, period, period)).fetchall()
 
-    def export_entries(self, path: Path, account: str | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None) -> int:
+    def export_entries(self, path: Path, account: str | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False) -> int:
         import csv
         from .related_parties import related_party_match
 
@@ -322,9 +344,10 @@ class LedgerStore:
             JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id"""
         where = []
         args: list[object] = []
-        if account is not None:
-            where.append("e.account_key=?")
-            args.append(account)
+        account_sql, account_args = self._account_clause(account, include_descendants)
+        if account_sql:
+            where.append(account_sql)
+            args.extend(account_args)
         if fiscal_year and period:
             where.append("e.fiscal_year=? AND e.period=?")
             args.extend((fiscal_year, period))
