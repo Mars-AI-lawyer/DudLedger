@@ -6,7 +6,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .importer import ImportSpec, file_hash, format_money, normalized_rows
+from .importer import REPORT_KINDS, ImportSpec, file_hash, format_money, normalized_rows, rows, text_value
 
 
 SCHEMA = """
@@ -40,10 +40,18 @@ CREATE TABLE IF NOT EXISTS balances (
  closing_debit_cents INTEGER NOT NULL, closing_credit_cents INTEGER NOT NULL,
  raw_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS report_rows (
+ id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id),
+ row_no INTEGER NOT NULL, left_item TEXT NOT NULL,
+ left_amount_1_cents INTEGER, left_amount_2_cents INTEGER,
+ right_item TEXT NOT NULL, right_amount_1_cents INTEGER, right_amount_2_cents INTEGER,
+ raw_json TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_entries_account ON entries(account_key, entry_date, id);
 CREATE INDEX IF NOT EXISTS ix_entries_voucher ON entries(entry_date, voucher_type, voucher_no);
 CREATE INDEX IF NOT EXISTS ix_entries_search ON entries(counterparty, auxiliary);
 CREATE INDEX IF NOT EXISTS ix_balances_account ON balances(account_key);
+CREATE INDEX IF NOT EXISTS ix_report_rows_source ON report_rows(source_id,row_no);
 """
 
 
@@ -62,9 +70,9 @@ class LedgerStore:
             if existing and not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_meta'").fetchone():
                 raise ValueError("这不是本软件创建的账套文件")
             self.db.executescript(SCHEMA)
-            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v2')")
+            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v3')")
             version = self.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0]
-            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2"):
+            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3"):
                 raise ValueError("账套格式版本不兼容")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(entries)")}
             for name in ("fiscal_year", "period", "currency", "original_amount", "maker"):
@@ -72,7 +80,8 @@ class LedgerStore:
                     self.db.execute(f"ALTER TABLE entries ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
             if version == "legal-ledger-viewer-v1":
                 self.db.execute("UPDATE entries SET fiscal_year=substr(entry_date,1,4), period=CAST(CAST(substr(entry_date,6,2) AS INTEGER) AS TEXT) WHERE entry_date GLOB '????-??-??'")
-                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v2' WHERE key='format'")
+            if version != "legal-ledger-viewer-v3":
+                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v3' WHERE key='format'")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_entries_voucher_period ON entries(fiscal_year,period,voucher_type,voucher_no)")
             self.db.commit()
         except Exception:
@@ -82,9 +91,56 @@ class LedgerStore:
     def close(self) -> None:
         self.db.close()
 
+    def display_columns(self, view: str) -> list[str] | None:
+        row = self.db.execute("SELECT value FROM ledger_meta WHERE key=?", (f"display_columns:{view}",)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, list) and all(isinstance(key, str) for key in value) else None
+
+    def save_display_columns(self, view: str, columns: list[str]) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO ledger_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (f"display_columns:{view}", json.dumps(columns, ensure_ascii=False)),
+            )
+
+    def setting(self, key: str, default: str = "") -> str:
+        row = self.db.execute("SELECT value FROM ledger_meta WHERE key=?", (f"setting:{key}",)).fetchone()
+        return row[0] if row else default
+
+    def save_setting(self, key: str, value: str) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO ledger_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (f"setting:{key}", value),
+            )
+
+    def voucher_widths(self) -> dict[str, int]:
+        try:
+            value = json.loads(self.setting("voucher_widths", "{}"))
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        return {key: width for key, width in value.items() if isinstance(key, str) and type(width) is int and 65 <= width <= 2000}
+
+    def save_voucher_widths(self, widths: dict[str, int]) -> None:
+        self.save_setting("voucher_widths", json.dumps(widths, ensure_ascii=False))
+
+    def reset_voucher_widths(self) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM ledger_meta WHERE key='setting:voucher_widths'")
+
     def import_sheet(self, spec: ImportSpec, replace: bool = False) -> int:
         spec.validate()
         digest = file_hash(spec.path)
+        headers = next((line for number, line in rows(spec.path, spec.sheet) if number == spec.header_row), None)
+        if headers is None:
+            raise ValueError("找不到指定的表头行")
         with self.db:
             conflicts = self.db.execute("SELECT id FROM sources WHERE (sha256=? OR original_path=?) AND sheet=? AND kind=?", (digest, str(spec.path.resolve()), spec.sheet, spec.kind)).fetchall()
             if conflicts and not replace:
@@ -93,23 +149,32 @@ class LedgerStore:
                 for old in conflicts:
                     self.db.execute("DELETE FROM entries WHERE source_id=?", (old["id"],))
                     self.db.execute("DELETE FROM balances WHERE source_id=?", (old["id"],))
+                    self.db.execute("DELETE FROM report_rows WHERE source_id=?", (old["id"],))
                     self.db.execute("DELETE FROM sources WHERE id=?", (old["id"],))
             cur = self.db.execute(
                 "INSERT INTO sources(kind,filename,original_path,sheet,sha256,mapping_json) VALUES(?,?,?,?,?,?)",
-                (spec.kind, spec.path.name, str(spec.path.resolve()), spec.sheet, digest, json.dumps({"header_row": spec.header_row, "mapping": spec.mapping}, ensure_ascii=False)),
+                (spec.kind, spec.path.name, str(spec.path.resolve()), spec.sheet, digest, json.dumps({"header_row": spec.header_row, "mapping": spec.mapping, "headers": [text_value(value) for value in headers]}, ensure_ascii=False)),
             )
             source_id = cur.lastrowid
             count = 0
             for row_no, data in normalized_rows(spec):
-                code, name = data["account_code"], data["account_name"]
-                key = account_key(code, name)
-                self.db.execute("INSERT INTO accounts(key,code,name) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE accounts.name END", (key, code, name))
-                if spec.kind == "entry":
+                if spec.kind in REPORT_KINDS:
+                    self.db.execute(
+                        "INSERT INTO report_rows(source_id,row_no,left_item,left_amount_1_cents,left_amount_2_cents,right_item,right_amount_1_cents,right_amount_2_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (source_id, row_no, *(data[field] for field in ("left_item", "left_amount_1_cents", "left_amount_2_cents", "right_item", "right_amount_1_cents", "right_amount_2_cents", "raw_json"))),
+                    )
+                elif spec.kind == "entry":
+                    code, name = data["account_code"], data["account_name"]
+                    key = account_key(code, name)
+                    self.db.execute("INSERT INTO accounts(key,code,name) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE accounts.name END", (key, code, name))
                     self.db.execute(
                         "INSERT INTO entries(source_id,row_no,entry_date,fiscal_year,period,voucher_no,voucher_type,account_key,summary,counterparty,auxiliary,currency,original_amount,maker,debit_cents,credit_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (source_id, row_no, data["date"], data["fiscal_year"], data["period"], data["voucher_no"], data["voucher_type"], key, data["summary"], data["counterparty"], data["auxiliary"], data["currency"], data["original_amount"], data["maker"], data["debit_cents"], data["credit_cents"], data["raw_json"]),
                     )
                 else:
+                    code, name = data["account_code"], data["account_name"]
+                    key = account_key(code, name)
+                    self.db.execute("INSERT INTO accounts(key,code,name) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE accounts.name END", (key, code, name))
                     self.db.execute(
                         "INSERT INTO balances(source_id,row_no,account_key,opening_debit_cents,opening_credit_cents,period_debit_cents,period_credit_cents,closing_debit_cents,closing_credit_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (source_id, row_no, key, *(data[field + "_cents"] for field in ("opening_debit", "opening_credit", "period_debit", "period_credit", "closing_debit", "closing_credit")), data["raw_json"]),
@@ -123,6 +188,9 @@ class LedgerStore:
 
     def sources(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM sources ORDER BY id").fetchall()
+
+    def report_rows(self, source_id: int) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM report_rows WHERE source_id=? ORDER BY row_no,id", (source_id,)).fetchall()
 
     def periods(self) -> list[tuple[str, str]]:
         return [(row[0], row[1]) for row in self.db.execute("SELECT DISTINCT fiscal_year,period FROM entries WHERE fiscal_year<>'' AND period<>'' ORDER BY CAST(fiscal_year AS INTEGER),CAST(period AS INTEGER)")]

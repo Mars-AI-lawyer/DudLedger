@@ -26,7 +26,7 @@ def run_checks(store: LedgerStore) -> list[Finding]:
     if len(entry_sources) > 1:
         findings.append(Finding("提示", "覆盖范围", "多份明细", "请确认不同文件的期间及范围没有重叠；系统不自动去重。"))
     if not entry_sources:
-        findings.append(Finding("提示", "覆盖范围", "缺少明细", "只导入科目余额表时，无法穿透至分录或重建凭证。"))
+        findings.append(Finding("提示", "覆盖范围", "缺少明细", "未导入明细账或序时账，无法穿透至分录或重建凭证。"))
     if not balance_sources:
         findings.append(Finding("提示", "覆盖范围", "缺少余额表", "无法与企业提供的科目余额表核对。"))
     if len(balance_sources) > 1:

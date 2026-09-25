@@ -42,6 +42,10 @@ FIELDS = {
     "direction": ("余额方向", "借贷方向", "方向", "balance direction"),
 }
 
+REPORT_KINDS = ("balance_sheet", "income_statement")
+REPORT_ITEM_HEADERS = {"项目", "项目名称", "报表项目", "科目", "名称", "item", "description"}
+REPORT_AMOUNT_HEADERS = {"期末余额", "期初余额", "年初余额", "上年年末余额", "本期金额", "上期金额", "本年累计金额", "上年同期金额", "本年累计", "上年同期", "本期数", "上期数", "期末数", "期初数", "amount", "current", "prior"}
+
 SUBTOTAL = re.compile(r"^(?:本月|本年|本期|全年|当月)?(?:合计|累计|小计|总计)$")
 
 
@@ -159,6 +163,22 @@ def rows(path: Path, sheet: str) -> Iterator[tuple[int, list[object]]]:
 
 
 def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
+    if kind in REPORT_KINDS:
+        item_headers = {_norm(name) for name in REPORT_ITEM_HEADERS}
+        amount_headers = {_norm(name) for name in REPORT_AMOUNT_HEADERS}
+        items = [i for i, value in enumerate(headers) if _norm(value) in item_headers]
+        if not items:
+            return {}
+        mapping = {"left_item": items[0]}
+        sides = [("left", items[0], items[1] if len(items) > 1 else len(headers))]
+        if kind == "balance_sheet" and len(items) > 1:
+            mapping["right_item"] = items[1]
+            sides.append(("right", items[1], len(headers)))
+        for side, start, stop in sides:
+            candidates = [i for i in range(start + 1, stop) if _norm(headers[i]) in amount_headers]
+            for number, index in enumerate(candidates[:2], 1):
+                mapping[f"{side}_amount_{number}"] = index
+        return mapping
     mapping: dict[str, int] = {}
     fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "closing_debit", "closing_credit", "closing_balance", "direction")
     for field in fields:
@@ -190,15 +210,31 @@ class ImportSpec:
     mapping: dict[str, int]
 
     def validate(self) -> None:
-        if self.kind not in ("entry", "balance"):
-            raise ValueError("表类型必须是明细或余额")
+        if self.kind not in ("entry", "balance", *REPORT_KINDS):
+            raise ValueError("表类型无效")
         if self.header_row < 1:
             raise ValueError("表头行号必须大于 0")
-        if not ("account_code" in self.mapping or "account_name" in self.mapping):
-            raise ValueError("至少映射科目编码或科目名称")
-        needed = ("debit", "credit") if self.kind == "entry" else ("closing_debit", "closing_credit", "closing_balance")
-        if not any(field in self.mapping for field in needed):
-            raise ValueError("至少映射一个借方或贷方金额列")
+        if self.kind in REPORT_KINDS:
+            allowed = {f"{side}_{field}" for side in ("left", "right") for field in ("item", "amount_1", "amount_2")}
+            if set(self.mapping) - allowed:
+                raise ValueError("报表列映射包含未知字段")
+            if "left_item" not in self.mapping or "left_amount_1" not in self.mapping:
+                raise ValueError("请映射左侧项目与第一列金额；无法确认报表版式时不要导入")
+            if "right_item" in self.mapping:
+                if self.kind != "balance_sheet" or "right_amount_1" not in self.mapping:
+                    raise ValueError("右侧报表区域必须有项目和第一列金额，且只适用于资产负债表")
+            elif "right_amount_1" in self.mapping or "right_amount_2" in self.mapping:
+                raise ValueError("右侧金额列必须同时映射右侧项目")
+            if "left_amount_2" in self.mapping and "left_amount_1" not in self.mapping:
+                raise ValueError("第二列金额不能单独映射")
+            if "right_amount_2" in self.mapping and "right_amount_1" not in self.mapping:
+                raise ValueError("右侧第二列金额不能单独映射")
+        else:
+            if not ("account_code" in self.mapping or "account_name" in self.mapping):
+                raise ValueError("至少映射科目编码或科目名称")
+            needed = ("debit", "credit") if self.kind == "entry" else ("closing_debit", "closing_credit", "closing_balance")
+            if not any(field in self.mapping for field in needed):
+                raise ValueError("至少映射一个借方或贷方金额列")
         if self.kind == "balance" and "closing_balance" in self.mapping and "direction" not in self.mapping:
             raise ValueError("单列期末余额必须同时映射余额方向，避免猜测借贷方向")
         if self.kind == "balance" and "opening_balance" in self.mapping and "direction" not in self.mapping:
@@ -215,7 +251,36 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
     last_account_name = ""
     last_voucher = {field: "" for field in ("date", "fiscal_year", "period", "voucher_type", "voucher_no")}
     for row_no, row in rows(spec.path, spec.sheet):
+        if spec.kind in REPORT_KINDS and row_no < spec.header_row:
+            title = "  ".join(text_value(value) for value in row if value is not None and str(value).strip())
+            if title:
+                yield row_no, {"left_item": title, "left_amount_1_cents": None, "left_amount_2_cents": None,
+                               "right_item": "", "right_amount_1_cents": None, "right_amount_2_cents": None,
+                               "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False)}
+            continue
         if row_no <= spec.header_row:
+            continue
+        if spec.kind in REPORT_KINDS:
+            values = {field: row[index] if index < len(row) else None for field, index in spec.mapping.items()}
+            def report_amount(field: str) -> int | None:
+                value = values.get(field)
+                if value is None or str(value).strip() in ("", "—", "-", "–"):
+                    return None
+                try:
+                    return money(value)
+                except ValueError as exc:
+                    raise ValueError(f"第 {row_no} 行的报表金额无法识别：{value}") from exc
+            data = {
+                "left_item": text_value(values.get("left_item")),
+                "left_amount_1_cents": report_amount("left_amount_1"),
+                "left_amount_2_cents": report_amount("left_amount_2"),
+                "right_item": text_value(values.get("right_item")),
+                "right_amount_1_cents": report_amount("right_amount_1"),
+                "right_amount_2_cents": report_amount("right_amount_2"),
+                "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False),
+            }
+            if any(value is not None and value != "" for key, value in data.items() if key != "raw_json"):
+                yield row_no, data
             continue
         if not any(value is not None and str(value).strip() for value in row):
             last_voucher = {field: "" for field in last_voucher}
