@@ -7,7 +7,7 @@ name = "legal-ledger-viewer"
 version = "0.2.0"
 description = "离线法律尽调账簿浏览器"
 requires-python = ">=3.11"
-dependencies = ["openpyxl>=3.1,<4"]
+dependencies = ["openpyxl>=3.1,<4", "xlrd>=2.0.2,<3", "typesafe-sdk>=0.7.1,<1", "keyring>=25.7,<27"]
 
 [project.scripts]
 legal-ledger-viewer = "ledger_viewer.ui:main"

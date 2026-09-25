@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterator
 
 from openpyxl import load_workbook
+import xlrd
 
 
 FIELDS = {
@@ -31,12 +32,14 @@ FIELDS = {
     "currency": ("币别", "币种", "货币", "currency"),
     "original_amount": ("原币金额", "外币金额", "原币", "original amount"),
     "maker": ("制单", "制单人", "录入人", "prepared by"),
-    "opening_debit": ("期初借方", "期初借方余额", "年初借方", "opening debit"),
-    "opening_credit": ("期初贷方", "期初贷方余额", "年初贷方", "opening credit"),
-    "period_debit": ("本期借方发生额", "借方本期发生额", "本期借方", "借方发生额", "period debit"),
-    "period_credit": ("本期贷方发生额", "贷方本期发生额", "本期贷方", "贷方发生额", "period credit"),
-    "closing_debit": ("期末借方", "期末借方余额", "期末借方金额", "closing debit"),
-    "closing_credit": ("期末贷方", "期末贷方余额", "期末贷方金额", "closing credit"),
+    "opening_debit": ("期初借方", "期初余额借方", "期初借方余额", "年初借方", "opening debit"),
+    "opening_credit": ("期初贷方", "期初余额贷方", "期初贷方余额", "年初贷方", "opening credit"),
+    "period_debit": ("本期借方发生额", "借方本期发生额", "本期借方", "本期发生借方", "本期发生额借方", "借方发生额", "period debit"),
+    "period_credit": ("本期贷方发生额", "贷方本期发生额", "本期贷方", "本期发生贷方", "本期发生额贷方", "贷方发生额", "period credit"),
+    "year_debit": ("本年累计借方", "本年累计借方发生额", "本年借方累计", "year debit"),
+    "year_credit": ("本年累计贷方", "本年累计贷方发生额", "本年贷方累计", "year credit"),
+    "closing_debit": ("期末借方", "期末余额借方", "期末借方余额", "期末借方金额", "closing debit"),
+    "closing_credit": ("期末贷方", "期末余额贷方", "期末贷方余额", "期末贷方金额", "closing credit"),
     "opening_balance": ("期初余额", "年初余额", "opening balance"),
     "closing_balance": ("期末余额", "closing balance"),
     "direction": ("余额方向", "借贷方向", "方向", "balance direction"),
@@ -44,7 +47,7 @@ FIELDS = {
 
 REPORT_KINDS = ("balance_sheet", "income_statement")
 REPORT_ITEM_HEADERS = {"项目", "项目名称", "报表项目", "科目", "名称", "item", "description"}
-REPORT_AMOUNT_HEADERS = {"期末余额", "期初余额", "年初余额", "上年年末余额", "本期金额", "上期金额", "本年累计金额", "上年同期金额", "本年累计", "上年同期", "本期数", "上期数", "期末数", "期初数", "amount", "current", "prior"}
+REPORT_AMOUNT_HEADERS = {"期末余额", "期初余额", "年初余额", "上年年末余额", "本期金额", "本年金额", "上期金额", "本年累计金额", "上年同期金额", "本年累计", "上年同期", "本期数", "上期数", "期末数", "期初数", "amount", "current", "prior"}
 
 SUBTOTAL = re.compile(r"^(?:本月|本年|本期|全年|当月)?(?:合计|累计|小计|总计)$")
 
@@ -136,8 +139,14 @@ def file_hash(path: Path) -> str:
 def sheet_names(path: Path) -> list[str]:
     if path.suffix.lower() == ".csv":
         return ["CSV"]
+    if path.suffix.lower() == ".xls":
+        book = xlrd.open_workbook(str(path), on_demand=True)
+        try:
+            return book.sheet_names()
+        finally:
+            book.release_resources()
     if path.suffix.lower() not in (".xlsx", ".xlsm"):
-        raise ValueError("只支持 .xlsx、.xlsm、.csv；旧版 .xls 请先另存为 .xlsx")
+        raise ValueError("只支持 .xlsx、.xlsm、.xls、.csv")
     book = load_workbook(path, read_only=True, data_only=True)
     try:
         return list(book.sheetnames)
@@ -151,6 +160,31 @@ def rows(path: Path, sheet: str) -> Iterator[tuple[int, list[object]]]:
             reader = csv.reader(handle)
             for index, row in enumerate(reader, 1):
                 yield index, list(row)
+        return
+    if path.suffix.lower() == ".xls":
+        book = xlrd.open_workbook(str(path), on_demand=True)
+        try:
+            if sheet not in book.sheet_names():
+                raise ValueError(f"工作表不存在：{sheet}")
+            page = book.sheet_by_name(sheet)
+            for index in range(page.nrows):
+                values = []
+                for cell in page.row(index):
+                    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                        values.append(None)
+                    elif cell.ctype == xlrd.XL_CELL_DATE:
+                        values.append(xlrd.xldate.xldate_as_datetime(cell.value, book.datemode))
+                    elif cell.ctype == xlrd.XL_CELL_NUMBER and float(cell.value).is_integer():
+                        values.append(int(cell.value))
+                    elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                        values.append(bool(cell.value))
+                    elif cell.ctype == xlrd.XL_CELL_ERROR:
+                        raise ValueError(f"{sheet} 第 {index + 1} 行包含 Excel 错误单元格")
+                    else:
+                        values.append(cell.value)
+                yield index + 1, values
+        finally:
+            book.release_resources()
         return
     book = load_workbook(path, read_only=True, data_only=True)
     try:
@@ -167,6 +201,8 @@ def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
         item_headers = {_norm(name) for name in REPORT_ITEM_HEADERS}
         amount_headers = {_norm(name) for name in REPORT_AMOUNT_HEADERS}
         items = [i for i, value in enumerate(headers) if _norm(value) in item_headers]
+        structural_items = [i for i in range(len(headers) - 1) if _norm(headers[i]) and _norm(headers[i + 1]) in amount_headers and _norm(headers[i]) not in amount_headers]
+        items = sorted(set(items) | set(structural_items))
         if not items:
             return {}
         mapping = {"left_item": items[0]}
@@ -176,11 +212,11 @@ def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
             sides.append(("right", items[1], len(headers)))
         for side, start, stop in sides:
             candidates = [i for i in range(start + 1, stop) if _norm(headers[i]) in amount_headers]
-            for number, index in enumerate(candidates[:2], 1):
+            for number, index in enumerate(candidates[:3], 1):
                 mapping[f"{side}_amount_{number}"] = index
         return mapping
     mapping: dict[str, int] = {}
-    fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "closing_debit", "closing_credit", "closing_balance", "direction")
+    fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "opening_balance", "closing_balance", "direction")
     for field in fields:
         aliases = FIELDS[field]
         for index, header in enumerate(headers):
@@ -190,12 +226,49 @@ def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
     return mapping
 
 
+def _balance_header_pair(top: list[object], bottom: list[object]) -> list[str] | None:
+    if len(guess_mapping(top, "balance")) < 2 or sum(_norm(value) in ("借方", "贷方") for value in bottom) < 2:
+        return None
+    result = []
+    current_group = ""
+    for index in range(max(len(top), len(bottom))):
+        upper = text_value(top[index]) if index < len(top) else ""
+        lower = text_value(bottom[index]) if index < len(bottom) else ""
+        if upper:
+            current_group = upper
+        if _norm(lower) in ("借方", "贷方") and current_group:
+            result.append(current_group + lower)
+        else:
+            result.append(upper or lower)
+    return result
+
+
+def header_for_row(path: Path, sheet: str, row_no: int, kind: str) -> list[str]:
+    previous = None
+    for number, row in rows(path, sheet):
+        if number == row_no:
+            combined = _balance_header_pair(previous, row) if kind == "balance" and previous is not None else None
+            return combined if combined is not None else [text_value(value) for value in row]
+        previous = row
+        if number > row_no:
+            break
+    raise ValueError("找不到指定的表头行")
+
+
 def guess_header(path: Path, sheet: str, kind: str) -> tuple[int, list[str], dict[str, int]]:
     best = (0, [], {})
+    previous = None
     for row_no, row in rows(path, sheet):
-        mapping = guess_mapping(row, kind)
-        if len(mapping) > len(best[2]):
-            best = (row_no, [text_value(v) for v in row], mapping)
+        candidates = [[text_value(value) for value in row]]
+        if kind == "balance" and previous is not None:
+            combined = _balance_header_pair(previous, row)
+            if combined is not None:
+                candidates.append(combined)
+        for headers in candidates:
+            mapping = guess_mapping(headers, kind)
+            if len(mapping) > len(best[2]):
+                best = (row_no, headers, mapping)
+        previous = row
         if row_no >= 20:
             break
     return best
@@ -215,7 +288,7 @@ class ImportSpec:
         if self.header_row < 1:
             raise ValueError("表头行号必须大于 0")
         if self.kind in REPORT_KINDS:
-            allowed = {f"{side}_{field}" for side in ("left", "right") for field in ("item", "amount_1", "amount_2")}
+            allowed = {f"{side}_{field}" for side in ("left", "right") for field in ("item", "amount_1", "amount_2", "amount_3")}
             if set(self.mapping) - allowed:
                 raise ValueError("报表列映射包含未知字段")
             if "left_item" not in self.mapping or "left_amount_1" not in self.mapping:
@@ -223,12 +296,16 @@ class ImportSpec:
             if "right_item" in self.mapping:
                 if self.kind != "balance_sheet" or "right_amount_1" not in self.mapping:
                     raise ValueError("右侧报表区域必须有项目和第一列金额，且只适用于资产负债表")
-            elif "right_amount_1" in self.mapping or "right_amount_2" in self.mapping:
+            elif any(field in self.mapping for field in ("right_amount_1", "right_amount_2", "right_amount_3")):
                 raise ValueError("右侧金额列必须同时映射右侧项目")
             if "left_amount_2" in self.mapping and "left_amount_1" not in self.mapping:
                 raise ValueError("第二列金额不能单独映射")
             if "right_amount_2" in self.mapping and "right_amount_1" not in self.mapping:
                 raise ValueError("右侧第二列金额不能单独映射")
+            if "left_amount_3" in self.mapping and "left_amount_2" not in self.mapping:
+                raise ValueError("第三列金额不能跳过第二列映射")
+            if "right_amount_3" in self.mapping and "right_amount_2" not in self.mapping:
+                raise ValueError("右侧第三列金额不能跳过第二列映射")
         else:
             if not ("account_code" in self.mapping or "account_name" in self.mapping):
                 raise ValueError("至少映射科目编码或科目名称")
@@ -254,8 +331,8 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
         if spec.kind in REPORT_KINDS and row_no < spec.header_row:
             title = "  ".join(text_value(value) for value in row if value is not None and str(value).strip())
             if title:
-                yield row_no, {"left_item": title, "left_amount_1_cents": None, "left_amount_2_cents": None,
-                               "right_item": "", "right_amount_1_cents": None, "right_amount_2_cents": None,
+                yield row_no, {"left_item": title, "left_amount_1_cents": None, "left_amount_2_cents": None, "left_amount_3_cents": None,
+                               "right_item": "", "right_amount_1_cents": None, "right_amount_2_cents": None, "right_amount_3_cents": None,
                                "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False)}
             continue
         if row_no <= spec.header_row:
@@ -274,9 +351,11 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
                 "left_item": text_value(values.get("left_item")),
                 "left_amount_1_cents": report_amount("left_amount_1"),
                 "left_amount_2_cents": report_amount("left_amount_2"),
+                "left_amount_3_cents": report_amount("left_amount_3"),
                 "right_item": text_value(values.get("right_item")),
                 "right_amount_1_cents": report_amount("right_amount_1"),
                 "right_amount_2_cents": report_amount("right_amount_2"),
+                "right_amount_3_cents": report_amount("right_amount_3"),
                 "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False),
             }
             if any(value is not None and value != "" for key, value in data.items() if key != "raw_json"):
@@ -290,6 +369,9 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
         code = text_value(values.get("account_code"))
         name = text_value(values.get("account_name"))
         summary = text_value(values.get("summary"))
+        if spec.kind == "balance" and not (code or name):
+            # Dimension-only subrows repeat the parent's figures and must not inflate account totals.
+            continue
         if SUBTOTAL.match(name) or SUBTOTAL.match(summary) or summary in ("期初余额", "上年结转"):
             last_voucher = {field: "" for field in last_voucher}
             continue
@@ -344,7 +426,7 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
                 "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False),
             }
         else:
-            amounts = {field + "_cents": money(values.get(field)) for field in ("opening_debit", "opening_credit", "period_debit", "period_credit", "closing_debit", "closing_credit")}
+            amounts = {field + "_cents": money(values.get(field)) for field in ("opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit")}
             direction = text_value(values.get("direction"))
             for period in ("opening", "closing"):
                 single = money(values.get(period + "_balance"))
@@ -359,3 +441,64 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
             if not any(amounts.values()):
                 continue
             yield row_no, {"account_code": code, "account_name": name, **amounts, "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False)}
+
+
+def classify_sheet(path: Path, sheet: str) -> ImportSpec | None:
+    """Classify only layouts with a validated header; uncertain sheets stay manual."""
+    name = _norm(sheet)
+    filename = _norm(path.stem)
+    if "现金流量" in name or "现金流量" in filename:
+        return None
+    hints = (("科目余额", "balance"), ("试算平衡", "balance"), ("资产负债", "balance_sheet"),
+             ("利润表", "income_statement"), ("损益表", "income_statement"),
+             ("序时账", "entry"), ("明细账", "entry"))
+    stated = next((kind for word, kind in hints if word in name), None)
+    if stated is None and (not name or name.startswith("sheet") or name.startswith("工作表") or name == "csv"):
+        stated = next((kind for word, kind in hints if word in filename), None)
+    candidates: list[tuple[int, ImportSpec]] = []
+    kinds = (stated,) if stated else ("entry", "balance", "balance_sheet", "income_statement")
+    for kind in kinds:
+        header_row, headers, mapping = guess_header(path, sheet, kind)
+        if not headers:
+            continue
+        spec = ImportSpec(path, sheet, header_row, kind, mapping)
+        try:
+            spec.validate()
+        except ValueError:
+            continue
+        score = len(mapping)
+        header_text = " ".join(headers)
+        if kind == "balance_sheet" and ("期末余额" in header_text or "上年年末余额" in header_text):
+            score += 3
+        if kind == "income_statement" and ("本期金额" in header_text or "本年金额" in header_text):
+            score += 3
+        candidates.append((score, spec))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None
+    return candidates[0][1]
+
+
+def discover_sheets(paths: list[Path]) -> tuple[list[ImportSpec], list[str]]:
+    detected = []
+    skipped = []
+    for path in paths:
+        try:
+            names = sheet_names(path)
+        except Exception as exc:
+            skipped.append(f"{path.name}：读取失败（{exc}）")
+            continue
+        for sheet in names:
+            try:
+                spec = classify_sheet(path, sheet)
+            except Exception as exc:
+                skipped.append(f"{path.name}/{sheet}：读取失败（{exc}）")
+                continue
+            if spec is None:
+                reason = "暂不支持现金流量表" if "现金流量" in _norm(sheet) or "现金流量" in _norm(path.stem) else "类型或表头不能可靠自动确认，可单独导入"
+                skipped.append(f"{path.name}/{sheet}：{reason}")
+            else:
+                detected.append(spec)
+    return detected, skipped

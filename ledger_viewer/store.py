@@ -6,7 +6,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .importer import REPORT_KINDS, ImportSpec, file_hash, format_money, normalized_rows, rows, text_value
+from .importer import REPORT_KINDS, ImportSpec, file_hash, format_money, header_for_row, normalized_rows, text_value
 
 
 SCHEMA = """
@@ -37,15 +37,25 @@ CREATE TABLE IF NOT EXISTS balances (
  row_no INTEGER NOT NULL, account_key TEXT NOT NULL REFERENCES accounts(key),
  opening_debit_cents INTEGER NOT NULL, opening_credit_cents INTEGER NOT NULL,
  period_debit_cents INTEGER NOT NULL, period_credit_cents INTEGER NOT NULL,
+ year_debit_cents INTEGER NOT NULL DEFAULT 0, year_credit_cents INTEGER NOT NULL DEFAULT 0,
  closing_debit_cents INTEGER NOT NULL, closing_credit_cents INTEGER NOT NULL,
  raw_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS report_rows (
  id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id),
  row_no INTEGER NOT NULL, left_item TEXT NOT NULL,
- left_amount_1_cents INTEGER, left_amount_2_cents INTEGER,
- right_item TEXT NOT NULL, right_amount_1_cents INTEGER, right_amount_2_cents INTEGER,
+ left_amount_1_cents INTEGER, left_amount_2_cents INTEGER, left_amount_3_cents INTEGER,
+ right_item TEXT NOT NULL, right_amount_1_cents INTEGER, right_amount_2_cents INTEGER, right_amount_3_cents INTEGER,
  raw_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS voucher_marks (
+ voucher_key TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '',
+ signature TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS related_parties (
+ id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+ aliases_json TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_entries_account ON entries(account_key, entry_date, id);
 CREATE INDEX IF NOT EXISTS ix_entries_voucher ON entries(entry_date, voucher_type, voucher_no);
@@ -70,9 +80,9 @@ class LedgerStore:
             if existing and not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_meta'").fetchone():
                 raise ValueError("这不是本软件创建的账套文件")
             self.db.executescript(SCHEMA)
-            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v3')")
+            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v5')")
             version = self.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0]
-            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3"):
+            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3", "legal-ledger-viewer-v4", "legal-ledger-viewer-v5"):
                 raise ValueError("账套格式版本不兼容")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(entries)")}
             for name in ("fiscal_year", "period", "currency", "original_amount", "maker"):
@@ -80,8 +90,14 @@ class LedgerStore:
                     self.db.execute(f"ALTER TABLE entries ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
             if version == "legal-ledger-viewer-v1":
                 self.db.execute("UPDATE entries SET fiscal_year=substr(entry_date,1,4), period=CAST(CAST(substr(entry_date,6,2) AS INTEGER) AS TEXT) WHERE entry_date GLOB '????-??-??'")
-            if version != "legal-ledger-viewer-v3":
-                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v3' WHERE key='format'")
+            for table, additions in (("balances", ("year_debit_cents", "year_credit_cents")), ("report_rows", ("left_amount_3_cents", "right_amount_3_cents"))):
+                present = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+                for name in additions:
+                    if name not in present:
+                        default = " NOT NULL DEFAULT 0" if table == "balances" else ""
+                        self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} INTEGER{default}")
+            if version != "legal-ledger-viewer-v5":
+                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v5' WHERE key='format'")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_entries_voucher_period ON entries(fiscal_year,period,voucher_type,voucher_no)")
             self.db.commit()
         except Exception:
@@ -135,12 +151,44 @@ class LedgerStore:
         with self.db:
             self.db.execute("DELETE FROM ledger_meta WHERE key='setting:voucher_widths'")
 
+    def related_parties(self) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM related_parties ORDER BY name,id").fetchall()
+
+    def save_related_party(self, name: str, aliases: list[str], note: str = "", party_id: int | None = None) -> int:
+        from .related_parties import normalized_name
+
+        name = name.strip()
+        aliases = list(dict.fromkeys(alias.strip() for alias in aliases if alias.strip() and alias.strip() != name))
+        if not name:
+            raise ValueError("关联方名称不能为空")
+        if len(name) > 200 or any(len(alias) > 200 for alias in aliases):
+            raise ValueError("名称或别名不能超过 200 字")
+        requested = {normalized_name(item) for item in (name, *aliases)}
+        if len(requested) != 1 + len(aliases):
+            raise ValueError("名称和别名不能重复")
+        for existing in self.related_parties():
+            if existing["id"] == party_id:
+                continue
+            previous = [existing["name"], *json.loads(existing["aliases_json"])]
+            if requested & {normalized_name(item) for item in previous}:
+                raise ValueError(f'名称或别名与“{existing["name"]}”重复')
+        with self.db:
+            if party_id is None:
+                cursor = self.db.execute("INSERT INTO related_parties(name,aliases_json,note) VALUES(?,?,?)", (name, json.dumps(aliases, ensure_ascii=False), note))
+                return cursor.lastrowid
+            cursor = self.db.execute("UPDATE related_parties SET name=?,aliases_json=?,note=? WHERE id=?", (name, json.dumps(aliases, ensure_ascii=False), note, party_id))
+            if not cursor.rowcount:
+                raise ValueError("所选关联方已不存在")
+        return party_id
+
+    def delete_related_party(self, party_id: int) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM related_parties WHERE id=?", (party_id,))
+
     def import_sheet(self, spec: ImportSpec, replace: bool = False) -> int:
         spec.validate()
         digest = file_hash(spec.path)
-        headers = next((line for number, line in rows(spec.path, spec.sheet) if number == spec.header_row), None)
-        if headers is None:
-            raise ValueError("找不到指定的表头行")
+        headers = header_for_row(spec.path, spec.sheet, spec.header_row, spec.kind)
         with self.db:
             conflicts = self.db.execute("SELECT id FROM sources WHERE (sha256=? OR original_path=?) AND sheet=? AND kind=?", (digest, str(spec.path.resolve()), spec.sheet, spec.kind)).fetchall()
             if conflicts and not replace:
@@ -160,8 +208,8 @@ class LedgerStore:
             for row_no, data in normalized_rows(spec):
                 if spec.kind in REPORT_KINDS:
                     self.db.execute(
-                        "INSERT INTO report_rows(source_id,row_no,left_item,left_amount_1_cents,left_amount_2_cents,right_item,right_amount_1_cents,right_amount_2_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (source_id, row_no, *(data[field] for field in ("left_item", "left_amount_1_cents", "left_amount_2_cents", "right_item", "right_amount_1_cents", "right_amount_2_cents", "raw_json"))),
+                        "INSERT INTO report_rows(source_id,row_no,left_item,left_amount_1_cents,left_amount_2_cents,left_amount_3_cents,right_item,right_amount_1_cents,right_amount_2_cents,right_amount_3_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (source_id, row_no, *(data[field] for field in ("left_item", "left_amount_1_cents", "left_amount_2_cents", "left_amount_3_cents", "right_item", "right_amount_1_cents", "right_amount_2_cents", "right_amount_3_cents", "raw_json"))),
                     )
                 elif spec.kind == "entry":
                     code, name = data["account_code"], data["account_name"]
@@ -176,8 +224,8 @@ class LedgerStore:
                     key = account_key(code, name)
                     self.db.execute("INSERT INTO accounts(key,code,name) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE accounts.name END", (key, code, name))
                     self.db.execute(
-                        "INSERT INTO balances(source_id,row_no,account_key,opening_debit_cents,opening_credit_cents,period_debit_cents,period_credit_cents,closing_debit_cents,closing_credit_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (source_id, row_no, key, *(data[field + "_cents"] for field in ("opening_debit", "opening_credit", "period_debit", "period_credit", "closing_debit", "closing_credit")), data["raw_json"]),
+                        "INSERT INTO balances(source_id,row_no,account_key,opening_debit_cents,opening_credit_cents,period_debit_cents,period_credit_cents,year_debit_cents,year_credit_cents,closing_debit_cents,closing_credit_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (source_id, row_no, key, *(data[field + "_cents"] for field in ("opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit")), data["raw_json"]),
                     )
                 count += 1
             if count == 0:
@@ -203,12 +251,14 @@ class LedgerStore:
           SELECT a.key,a.code,a.name,
           COALESCE(b.od,0) opening_debit,COALESCE(b.oc,0) opening_credit,
           COALESCE(b.pd,0) reported_debit,COALESCE(b.pc,0) reported_credit,
+          COALESCE(b.yd,0) year_debit,COALESCE(b.yc,0) year_credit,
           COALESCE(b.cd,0) closing_debit,COALESCE(b.cc,0) closing_credit,
           COALESCE(e.debit,0) detail_debit,COALESCE(e.credit,0) detail_credit,
           COALESCE(e.n,0) detail_count, COALESCE(b.n,0) balance_count
           FROM accounts a
           LEFT JOIN (SELECT account_key,SUM(opening_debit_cents) od,SUM(opening_credit_cents) oc,
             SUM(period_debit_cents) pd,SUM(period_credit_cents) pc,
+            SUM(year_debit_cents) yd,SUM(year_credit_cents) yc,
             SUM(closing_debit_cents) cd,SUM(closing_credit_cents) cc,COUNT(*) n
             FROM balances WHERE source_id=? GROUP BY account_key) b ON b.account_key=a.key
           LEFT JOIN (SELECT account_key,SUM(debit_cents) debit,SUM(credit_cents) credit,COUNT(*) n
@@ -230,7 +280,7 @@ class LedgerStore:
             args.extend([f"%{search}%"] * 6)
         clause = " WHERE " + " AND ".join(where) if where else ""
         return self.db.execute("""
-          SELECT e.*,a.code,a.name,s.filename,s.sheet FROM entries e
+          SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path FROM entries e
           JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
         """ + clause + " ORDER BY e.entry_date,e.id LIMIT ?", (*args, limit)).fetchall()
 
@@ -249,7 +299,7 @@ class LedgerStore:
             where = "e.fiscal_year=? AND e.period=? AND e.voucher_type=? AND e.voucher_no=?"
             args = (target["fiscal_year"], target["period"], target["voucher_type"], target["voucher_no"])
         elif target["entry_date"]:
-            where = "e.entry_date=? AND e.voucher_type=? AND e.voucher_no=?"
+            where = "e.entry_date=? AND e.voucher_type=? AND e.voucher_no=? AND (e.fiscal_year='' OR e.period='')"
             args = (target["entry_date"], target["voucher_type"], target["voucher_no"])
         else:
             return [target]
@@ -265,6 +315,9 @@ class LedgerStore:
 
     def export_entries(self, path: Path, account: str | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None) -> int:
         import csv
+        from .related_parties import related_party_match
+
+        parties = self.related_parties()
         query = """SELECT e.*,a.code,a.name,s.filename,s.sheet FROM entries e
             JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id"""
         where = []
@@ -285,8 +338,8 @@ class LedgerStore:
         count = 0
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["日期", "会计年度", "期间", "凭证字", "凭证号", "科目编码", "科目名称", "摘要", "往来单位", "辅助核算", "币别", "原币金额", "制单人", "借方金额", "贷方金额", "源文件", "工作表", "原行号"])
+            writer.writerow(["日期", "会计年度", "期间", "凭证字", "凭证号", "科目编码", "科目名称", "摘要", "往来单位", "辅助核算", "币别", "原币金额", "制单人", "借方金额", "贷方金额", "源文件", "工作表", "原行号", "用户标注关联方"])
             for row in cursor:
-                writer.writerow([row["entry_date"], row["fiscal_year"], row["period"], row["voucher_type"], row["voucher_no"], row["code"], row["name"], row["summary"], row["counterparty"], row["auxiliary"], row["currency"], row["original_amount"], row["maker"], format_money(row["debit_cents"]), format_money(row["credit_cents"]), row["filename"], row["sheet"], row["row_no"]])
+                writer.writerow([row["entry_date"], row["fiscal_year"], row["period"], row["voucher_type"], row["voucher_no"], row["code"], row["name"], row["summary"], row["counterparty"], row["auxiliary"], row["currency"], row["original_amount"], row["maker"], format_money(row["debit_cents"]), format_money(row["credit_cents"]), row["filename"], row["sheet"], row["row_no"], related_party_match(row, parties)])
                 count += 1
         return count

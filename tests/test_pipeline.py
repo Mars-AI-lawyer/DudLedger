@@ -1,12 +1,13 @@
 import tempfile
 import unittest
 import sqlite3
+import json
 from pathlib import Path
 
 from openpyxl import Workbook
 
 from ledger_viewer.checks import run_checks
-from ledger_viewer.importer import ImportSpec, guess_header, money
+from ledger_viewer.importer import ImportSpec, discover_sheets, guess_header, money, sheet_names
 from ledger_viewer.store import LedgerStore
 from ledger_viewer.ui import DEFAULT_COLUMNS, visible_columns
 
@@ -139,8 +140,9 @@ class PipelineTest(unittest.TestCase):
         migrated = LedgerStore(path)
         row = migrated.db.execute("SELECT fiscal_year,period FROM entries WHERE id=1").fetchone()
         self.assertEqual(tuple(row), ("2026", "6"))
-        self.assertEqual(migrated.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], "legal-ledger-viewer-v3")
+        self.assertEqual(migrated.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], "legal-ledger-viewer-v5")
         self.assertTrue(migrated.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_rows'").fetchone())
+        self.assertTrue(migrated.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='voucher_marks'").fetchone())
         migrated.close()
 
     def test_existing_v2_book_gets_report_table(self):
@@ -151,6 +153,110 @@ class PipelineTest(unittest.TestCase):
         self.store = LedgerStore(self.base / "case.sqlite")
         self.assertEqual(self.store.setting("voucher_open_mode", "replace"), "replace")
         self.assertTrue(self.store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_rows'").fetchone())
+
+    def test_existing_v3_book_gets_voucher_marks_without_losing_entries(self):
+        header, _, mapping = guess_header(self.book, "序时账", "entry")
+        self.store.import_sheet(ImportSpec(self.book, "序时账", header, "entry", mapping))
+        before = len(self.store.entries())
+        self.store.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v3' WHERE key='format'")
+        self.store.db.execute("DROP TABLE voucher_marks")
+        self.store.db.commit()
+        self.store.close()
+        self.store = LedgerStore(self.base / "case.sqlite")
+        self.assertEqual(len(self.store.entries()), before)
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='voucher_marks'").fetchone())
+
+    def test_existing_v4_book_gets_cumulative_and_third_report_columns(self):
+        self.store.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v4' WHERE key='format'")
+        self.store.db.execute("ALTER TABLE balances DROP COLUMN year_debit_cents")
+        self.store.db.execute("ALTER TABLE balances DROP COLUMN year_credit_cents")
+        self.store.db.execute("ALTER TABLE report_rows DROP COLUMN left_amount_3_cents")
+        self.store.db.execute("ALTER TABLE report_rows DROP COLUMN right_amount_3_cents")
+        self.store.db.commit()
+        self.store.close()
+        self.store = LedgerStore(self.base / "case.sqlite")
+        self.assertEqual(self.store.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], "legal-ledger-viewer-v5")
+        self.assertIn("year_debit_cents", {row["name"] for row in self.store.db.execute("PRAGMA table_info(balances)")})
+        self.assertIn("left_amount_3_cents", {row["name"] for row in self.store.db.execute("PRAGMA table_info(report_rows)")})
+
+    def test_two_level_balance_header_keeps_period_and_ytd_separate(self):
+        path = self.base / "multi.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["期间:2026.8"])
+        sheet.append(["科目编码", "科目名称", "核算维度编码", "核算维度名称", "期初余额", None, "本期发生", None, "本年累计", None, "期末余额", None])
+        sheet.append([None, None, None, None, "借方", "贷方", "借方", "贷方", "借方", "贷方", "借方", "贷方"])
+        sheet.append(["1002", "银行存款", None, None, 100, None, 20, 5, 120, 25, 115, None])
+        sheet.append([None, None, "CUST01", "关联方明细", 100, None, 20, 5, 120, 25, 115, None])
+        book.save(path)
+        header, headers, mapping = guess_header(path, sheet.title, "balance")
+        self.assertEqual(header, 3)
+        self.assertEqual(mapping["period_debit"], 6)
+        self.assertEqual(mapping["year_credit"], 9)
+        self.assertEqual(mapping["closing_debit"], 10)
+        self.assertEqual(self.store.import_sheet(ImportSpec(path, sheet.title, header, "balance", mapping)), 1)
+        result = self.store.summary()[0]
+        self.assertEqual(result["reported_debit"], 2000)
+        self.assertEqual(result["year_credit"], 2500)
+        self.assertEqual(result["closing_debit"], 11500)
+        metadata = json.loads(self.store.sources()[0]["mapping_json"])
+        self.assertEqual(metadata["headers"][9], "本年累计贷方")
+
+    def test_report_structural_header_and_third_amount_column(self):
+        path = self.base / "monthly.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "资产负债表"
+        sheet.append(["资产负债表"])
+        sheet.append(["2026年08月31日"])
+        sheet.append(["编制单位：测试"])
+        sheet.append(["资产", "期末余额", "上年年末余额", "负债和所有者权益", "期末余额", "上年年末余额"])
+        sheet.append(["货币资金", 10, 0, "短期借款", 5, 0])
+        income = book.create_sheet("利润表")
+        income.append(["利润表"])
+        income.append(["2026年08月"])
+        income.append(["编制单位：测试"])
+        income.append(["项目名称", "本期金额", "本年金额", "上期金额"])
+        income.append(["营业收入", 10, 100, 8])
+        book.save(path)
+        header, _, mapping = guess_header(path, "资产负债表", "balance_sheet")
+        self.assertEqual(header, 4)
+        self.assertEqual(mapping["right_item"], 3)
+        self.store.import_sheet(ImportSpec(path, "资产负债表", header, "balance_sheet", mapping))
+        header, _, mapping = guess_header(path, "利润表", "income_statement")
+        self.assertEqual(mapping["left_amount_3"], 3)
+        self.store.import_sheet(ImportSpec(path, "利润表", header, "income_statement", mapping))
+        source = next(row for row in self.store.sources() if row["kind"] == "income_statement")
+        self.assertEqual(self.store.report_rows(source["id"])[-1]["left_amount_3_cents"], 800)
+
+    def test_legacy_xls_import_keeps_dates_and_amounts(self):
+        path = Path(__file__).parent / "fixtures" / "legacy.xls"
+        self.assertEqual(sheet_names(path), ["序时账"])
+        header, _, mapping = guess_header(path, "序时账", "entry")
+        self.assertEqual(self.store.import_sheet(ImportSpec(path, "序时账", header, "entry", mapping)), 2)
+        entries = self.store.entries()
+        self.assertEqual(entries[0]["entry_date"], "2026-08-01")
+        self.assertEqual(entries[0]["debit_cents"], 1250)
+        self.assertEqual(len(self.store.voucher_lines(entries[0]["id"])), 2)
+
+    def test_batch_classifies_supported_sheets_and_skips_cashflow(self):
+        monthly = self.base / "月报.xlsx"
+        book = Workbook()
+        balance = book.active
+        balance.title = "资产负债表"
+        balance.append(["资产", "期末余额", "负债和所有者权益", "期末余额"])
+        balance.append(["货币资金", 10, "应付账款", 10])
+        income = book.create_sheet("利润表")
+        income.append(["项目名称", "本期金额"])
+        income.append(["营业收入", 10])
+        cashflow = book.create_sheet("现金流量表")
+        cashflow.append(["项目名称", "本期金额"])
+        cashflow.append(["销售收到现金", 10])
+        book.save(monthly)
+        detected, skipped = discover_sheets([self.book, monthly])
+        self.assertEqual({spec.kind for spec in detected}, {"entry", "balance", "balance_sheet", "income_statement"})
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("现金流量表", skipped[0])
 
     def test_balance_sheet_both_sides_preserves_title_blank_zero_and_source_rows(self):
         path = self.base / "statements.xlsx"

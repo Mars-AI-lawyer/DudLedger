@@ -68,19 +68,12 @@ def run_checks(store: LedgerStore) -> list[Finding]:
               (CAST(substr(e.entry_date,6,2) AS INTEGER)<>CAST(e.period AS INTEGER) AND e.period<>'13'))"""):
         findings.append(Finding("提示", "期间与日期", f'{row["filename"]}:{row["row_no"]} {row["voucher_type"]}{row["voucher_no"]}', f'日期 {row["entry_date"]}，会计年度/期间 {row["fiscal_year"]}/{row["period"]}；请核对是否特殊会计期间。'))
 
-    for row in store.summary():
-        if len(balance_sources) == 1 and row["balance_count"] and row["detail_count"]:
-            mappings = [json.loads(s["mapping_json"])["mapping"] for s in balance_sources]
-            if any("period_debit" in m or "period_credit" in m for m in mappings):
-                debit_gap = row["reported_debit"] - row["detail_debit"]
-                credit_gap = row["reported_credit"] - row["detail_credit"]
-                if debit_gap or credit_gap:
-                    findings.append(Finding("待核", "余额表与明细", row["code"] or row["name"], f"本期借方差 {format_money(debit_gap)} 元、贷方差 {format_money(credit_gap)} 元；先确认文件期间、科目级次和覆盖范围一致。"))
-
     duplicates = db.execute(f"""SELECT {scope} voucher_scope,voucher_type,voucher_no,account_key,summary,debit_cents,credit_cents,
           COUNT(DISTINCT source_id) n FROM entries WHERE voucher_no<>''
           GROUP BY voucher_scope,voucher_type,voucher_no,account_key,summary,debit_cents,credit_cents
           HAVING n>1 LIMIT 100""").fetchall()
     for row in duplicates:
         findings.append(Finding("待核", "跨文件重复", f'{row["voucher_scope"]} {row["voucher_type"]}{row["voucher_no"]}', "不同导入文件出现相同分录特征；可能是重复导出，不自动删除。"))
+    from .reconciliation import run_reconciliation
+    findings.extend(run_reconciliation(store))
     return findings
