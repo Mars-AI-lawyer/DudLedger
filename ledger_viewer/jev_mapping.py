@@ -9,6 +9,7 @@ import keyring
 from typesafe_sdk import Choice, TypeSafeClient
 
 from .importer import ImportSpec, rows, text_value
+from .jev_runtime import REQUEST_SLOTS
 
 
 KEYRING_SERVICE = "DudLedger Jev"
@@ -79,20 +80,65 @@ class MappingSuggestion:
     model: str
 
 
+_SESSION_KEY = None
+_MEMORY_ONLY = False
+
+
+def _secure_backend() -> bool:
+    # Never silently accept a plaintext/file backend selected by third-party plugins.
+    try:
+        module = type(keyring.get_keyring()).__module__
+        return module in ('keyring.backends.macOS', 'keyring.backends.Windows', 'keyring.backends.SecretService', 'keyring.backends.kwallet')
+    except Exception:
+        return False
+
+
 def get_api_key() -> str:
-    return keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT) or ""
+    global _MEMORY_ONLY
+    if _SESSION_KEY is not None:
+        return _SESSION_KEY
+    try:
+        if _secure_backend():
+            value = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT) or ''
+            _MEMORY_ONLY = False
+            return value
+    except Exception:
+        pass
+    _MEMORY_ONLY = True
+    return ''
+
+
+def key_memory_only() -> bool:
+    return _MEMORY_ONLY
 
 
 def save_api_key(value: str) -> None:
+    global _SESSION_KEY, _MEMORY_ONLY
     value = value.strip()
     if not value or not value.isascii() or any(character.isspace() or ord(character) < 32 for character in value):
-        raise ValueError("API Key 不能为空，且只能包含不带空格的 ASCII 字符")
-    keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, value)
+        raise ValueError('API Key 不能为空，且只能包含不带空格的 ASCII 字符')
+    try:
+        if not _secure_backend():
+            raise RuntimeError('No secure backend')
+        keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, value)
+    except Exception:
+        _SESSION_KEY, _MEMORY_ONLY = value, True
+    else:
+        _SESSION_KEY, _MEMORY_ONLY = None, False
 
 
 def delete_api_key() -> None:
-    if get_api_key():
-        keyring.delete_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
+    global _SESSION_KEY, _MEMORY_ONLY
+    try:
+        if _secure_backend():
+            if keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT):
+                keyring.delete_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        elif _SESSION_KEY is None or not _MEMORY_ONLY:
+            raise RuntimeError('No secure backend')
+    except Exception:
+        _SESSION_KEY = ''
+        raise ValueError('本次运行已停用密钥，但无法确认系统凭据库中的旧密钥已删除；请在系统凭据管理中检查。') from None
+    _SESSION_KEY, _MEMORY_ONLY = '', False
 
 
 def preview_sheet(path: Path, sheet: str) -> dict:
@@ -121,7 +167,7 @@ def suggest_mapping(preview: dict, api_key: str, client_factory=TypeSafeClient) 
         raise ValueError("没有可分析的预览行")
     headers = {f"r{number}": f"第 {number} 行" for number in numbers}
     headers["none"] = "预览中找不到可靠的表头"
-    with client_factory(api_key=api_key, model="jev-latest", timeout=25.0) as client:
+    with REQUEST_SLOTS, client_factory(api_key=api_key, model="jev-latest", timeout=25.0) as client:
         first = client.system_one(
             state=preview,
             questions={

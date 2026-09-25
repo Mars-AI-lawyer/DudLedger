@@ -79,10 +79,11 @@ class LedgerStore:
         try:
             if existing and not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_meta'").fetchone():
                 raise ValueError("这不是本软件创建的账套文件")
-            self.db.executescript(SCHEMA)
-            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v5')")
+            from .jev_review import SCHEMA as REVIEW_SCHEMA
+            self.db.executescript(SCHEMA + REVIEW_SCHEMA)
+            self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v6')")
             version = self.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0]
-            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3", "legal-ledger-viewer-v4", "legal-ledger-viewer-v5"):
+            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3", "legal-ledger-viewer-v4", "legal-ledger-viewer-v5", "legal-ledger-viewer-v6"):
                 raise ValueError("账套格式版本不兼容")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(entries)")}
             for name in ("fiscal_year", "period", "currency", "original_amount", "maker"):
@@ -96,8 +97,8 @@ class LedgerStore:
                     if name not in present:
                         default = " NOT NULL DEFAULT 0" if table == "balances" else ""
                         self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} INTEGER{default}")
-            if version != "legal-ledger-viewer-v5":
-                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v5' WHERE key='format'")
+            if version != "legal-ledger-viewer-v6":
+                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v6' WHERE key='format'")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_entries_voucher_period ON entries(fiscal_year,period,voucher_type,voucher_no)")
             self.db.commit()
         except Exception:
@@ -195,6 +196,7 @@ class LedgerStore:
                 raise sqlite3.IntegrityError("该来源工作表已有导入记录")
             if replace:
                 for old in conflicts:
+                    self.db.execute("UPDATE jev_results SET stale=1 WHERE json_extract(local_json, '$.source_id')=?", (old["id"],))
                     self.db.execute("DELETE FROM entries WHERE source_id=?", (old["id"],))
                     self.db.execute("DELETE FROM balances WHERE source_id=?", (old["id"],))
                     self.db.execute("DELETE FROM report_rows WHERE source_id=?", (old["id"],))
@@ -243,6 +245,7 @@ class LedgerStore:
             source = self.db.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
             if source is None:
                 return False
+            self.db.execute("UPDATE jev_results SET stale=1 WHERE json_extract(local_json, '$.source_id')=?", (source_id,))
             for table in ("entries", "balances", "report_rows"):
                 self.db.execute(f"DELETE FROM {table} WHERE source_id=?", (source_id,))
             self.db.execute("DELETE FROM sources WHERE id=?", (source_id,))

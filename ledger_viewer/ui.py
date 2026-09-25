@@ -1,4 +1,4 @@
-"""Tk desktop interface; Jev networking is opt-in for column suggestions."""
+"""Tk desktop interface; Jev networking requires an explicit preview confirmation."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from . import __version__
 from .checks import run_checks
 from .grid_lines import DashedGrid
 from .importer import REPORT_KINDS, ImportSpec, classify_sheet, discover_sheets, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
-from .jev_mapping import delete_api_key, get_api_key, preview_sheet, save_api_key, suggest_mapping
+from .jev_mapping import delete_api_key, get_api_key, key_memory_only, preview_sheet, save_api_key, suggest_mapping
 from .reconciliation import empty_plan, load_plan, save_plan
 from .related_parties import related_party_match
 from .store import LedgerStore
@@ -195,7 +195,7 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(body, text="显示表格虚线（关闭后大表滚动更轻快）", variable=self.grid_lines,
                         command=lambda: parent.controller.set_grid_lines(self.grid_lines.get())).pack(anchor="w", pady=(7, 0))
         ttk.Separator(body).pack(fill="x", pady=12)
-        ttk.Label(body, text="Jev 表格识别（可选）").pack(anchor="w")
+        ttk.Label(body, text="Jev 审查与表格识别（可选）").pack(anchor="w")
         key_row = ttk.Frame(body)
         key_row.pack(fill="x", pady=(5, 0))
         self.api_key = tk.StringVar()
@@ -205,6 +205,11 @@ class SettingsDialog(tk.Toplevel):
         self.key_status = tk.StringVar()
         ttk.Label(body, textvariable=self.key_status, foreground="#555").pack(anchor="w", pady=(4, 0))
         self._refresh_key_status()
+        jev_actions = ttk.Frame(body)
+        jev_actions.pack(fill="x", pady=6)
+        from .jev_ui import launch_connection_test
+        ttk.Button(jev_actions, text="测试连接（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
+        ttk.Button(jev_actions, text="Jev 审查规则与阈值", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
         ttk.Label(body, text="从“文件”→“导入表格…”点“Jev 建议列（可选）”；确认发送范围后才联网。", foreground="#555").pack(anchor="w", pady=(7, 0))
         ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
         ttk.Button(body, text="保存并完成", command=self._finish).pack(anchor="e", pady=(12, 0))
@@ -215,9 +220,10 @@ class SettingsDialog(tk.Toplevel):
 
     def _refresh_key_status(self) -> None:
         try:
-            self.key_status.set("密钥已保存到系统钥匙串（输入框不回显）" if get_api_key() else "尚未保存密钥")
+            present = bool(get_api_key())
+            self.key_status.set(("密钥仅保留在本次运行内存，重启后需重新输入" if key_memory_only() else "密钥已保存到系统安全凭据库（输入框不回显）") if present else "尚未保存密钥")
         except Exception as exc:
-            self.key_status.set(f"无法访问系统钥匙串：{exc}")
+            self.key_status.set("无法访问系统凭据库")
 
     def _save_api_key(self) -> bool:
         try:
@@ -873,8 +879,8 @@ class App(tk.Toplevel):
 
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 4))
-        frames = [ttk.Frame(self.tabs) for _ in range(8)]
-        for frame, title in zip(frames, ("科目总览", "明细账", "资产负债表", "利润表", "往来线索", "核对提醒", "导入记录", "关注凭证")):
+        frames = [ttk.Frame(self.tabs) for _ in range(9)]
+        for frame, title in zip(frames, ("科目总览", "明细账", "资产负债表", "利润表", "往来线索", "核对提醒", "导入记录", "关注凭证", "AI 待核凭证")):
             self.tabs.add(frame, text=title)
         balance_top = ttk.Frame(frames[0], padding=5)
         balance_top.pack(fill="x")
@@ -967,6 +973,9 @@ class App(tk.Toplevel):
         self.mark_note = tk.Text(note_frame, height=4, wrap="word", undo=True, background="#FFFDFB", relief="solid", borderwidth=1)
         self.mark_note.pack(fill="x", pady=(4, 5))
         ttk.Button(note_frame, text="保存注释", command=self.edit_selected_mark).pack(anchor="e")
+        from .jev_ui import ReviewPanel
+        self.review_panel = ReviewPanel(frames[8], self)
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _event: self.review_panel.refresh() if self.tabs.index(self.tabs.select()) == 8 else None)
         ttk.Label(self, textvariable=self.status, anchor="w", padding=(12, 6)).pack(fill="x")
 
     def _build_menu(self) -> None:
@@ -986,11 +995,14 @@ class App(tk.Toplevel):
         review.add_command(label="科目总览", command=lambda: self.tabs.select(0))
         review.add_command(label="明细账", command=lambda: self.tabs.select(1))
         review.add_command(label="关注凭证", command=lambda: self.tabs.select(7))
+        review.add_command(label="AI 待核凭证", command=lambda: (self.review_panel.refresh(), self.tabs.select(8)))
+        review.add_command(label="Jev 法律尽调筛查…", command=lambda: (self.tabs.select(8), self.review_panel.new_batch()))
         review.add_command(label="关联方名单…", command=self.open_related_parties)
         review.add_command(label="核对范围…", command=self.open_reconciliation)
         menu.add_cascade(label="查看", menu=review)
         options = tk.Menu(menu, tearoff=False)
         options.add_command(label="偏好设置…", command=self.open_settings)
+        options.add_command(label="Jev 审查…", command=self.open_settings)
         menu.add_cascade(label="设置", menu=options)
         self.configure(menu=menu)
         self.bind("<Command-n>", lambda _event: self.new_book())
@@ -1018,6 +1030,13 @@ class App(tk.Toplevel):
     def open_settings(self) -> None:
         SettingsDialog(self)
 
+    def open_review_rules(self) -> None:
+        if not self.store:
+            messagebox.showinfo("请打开账套", "规则保存在当前账套，请先打开账套。", parent=self)
+            return
+        from .jev_ui import ReviewRulesDialog
+        ReviewRulesDialog(self)
+
     def open_reconciliation(self) -> None:
         if not self.store:
             messagebox.showinfo("先选择项目", "请先新建或打开本地项目。", parent=self)
@@ -1031,6 +1050,7 @@ class App(tk.Toplevel):
         RelatedPartiesDialog(self)
 
     def _close(self) -> None:
+        self.review_panel.cancel()
         for dialog in list(self.voucher_windows):
             if dialog.winfo_exists():
                 dialog.destroy()
@@ -1074,6 +1094,7 @@ class App(tk.Toplevel):
             choice.set("无报表")
         self.title(f"账簿核查 · {path.name}")
         self.refresh_all()
+        self.review_panel.refresh()
         self.tabs.select(1 if self.store.setting("home_view", "summary") == "detail" else 0)
 
     def import_file(self) -> None:
@@ -1395,13 +1416,15 @@ class App(tk.Toplevel):
         self.store.save_setting("account_expansion_mode", "custom")
         self.status.set("已记住当前展开的科目。")
 
-    def open_voucher(self, _event: object) -> None:
+    def open_voucher(self, _event: object, entry_id: int | None = None) -> None:
         if not self.store:
             return
         selection = self.detail_view.selection()
-        if not selection:
-            return
-        lines = self.store.voucher_lines(int(selection[0]))
+        if entry_id is None:
+            if not selection:
+                return
+            entry_id = int(selection[0])
+        lines = self.store.voucher_lines(entry_id)
         if not lines:
             return
         if self.store.setting("voucher_open_mode", "replace") != "multiple":
@@ -1410,7 +1433,6 @@ class App(tk.Toplevel):
                     old.destroy()
             self.voucher_windows.clear()
         target = lines[0]
-        entry_id = int(selection[0])
         existing_mark = mark_for_entry(self.store, entry_id)
         dialog = tk.Toplevel(self)
         dialog.ledger_app = self

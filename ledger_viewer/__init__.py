@@ -1,3 +1,3 @@
-"""Offline, read-only viewer for imported accounting workbooks."""
+"""Local-first ledger viewer with optional consent-based Jev screening."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

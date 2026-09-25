@@ -79,7 +79,7 @@ class JevMappingTest(unittest.TestCase):
             suggest_mapping({"sheet": "CSV", "rows": [{"row": 1, "cells": ["标题"]}]}, "test-key", UnknownClient)
 
     def test_key_is_delegated_to_system_keyring(self):
-        with patch("ledger_viewer.jev_mapping.keyring") as keyring:
+        with patch("ledger_viewer.jev_mapping._secure_backend", return_value=True), patch("ledger_viewer.jev_mapping._SESSION_KEY", None), patch("ledger_viewer.jev_mapping.keyring") as keyring:
             keyring.get_password.return_value = "test-key"
             self.assertEqual(get_api_key(), "test-key")
             save_api_key("  test-key  ")
