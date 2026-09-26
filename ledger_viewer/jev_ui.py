@@ -11,11 +11,13 @@ from threading import Thread
 from .importer import format_money
 from .jev_mapping import get_api_key
 from .jev_rules import default_rules, load_rules, save_rules
+from .related_parties import party_names
 from .jev_review import (BOUNDARY, REVIEW_STATES, SEND_FIELDS, STATUS_LABELS, ReviewJob, active_job,
     batch_counts, batch_info, discard_preview, is_uncertain, prepare_batch, preview_page, recover_interrupted,
     refresh_staleness, save_review, test_connection, voucher_results)
 
-CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、借贷金额发送至 TypeSafe 的 Jev 服务，'
+CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、往来单位、辅助核算、非零一侧的借贷金额，'
+    '以及当前账套关联方名单中的名称（不含备注），发送至 TypeSafe 的 Jev 服务，'
     '用于识别需要进一步核查的线索。\n\n'
     '这些字段可能包含客户商业信息或个人信息。请确认本次使用符合项目的保密安排，并仅选择本次审查所需的范围。'
     '原始账簿文件不会上传，具体发送内容可在下方逐页预览。\n\n'
@@ -37,13 +39,9 @@ def read_only_text(parent, text, height=12):
 
 
 def display_input(payload):
-    lines = []
-    for field, label in SEND_FIELDS.items():
-        value = payload.get(field, '')
-        if isinstance(value, dict):
-            value = f"{value['name']}；{value['basis']}"
-        lines.append(f'{label}：{value}')
-    return '\n'.join(lines)
+    # Optional fields (counterparty/auxiliary/amounts) are omitted when blank or zero.
+    lines = [f'{label}：{payload[field]}' for field, label in SEND_FIELDS.items() if payload.get(field)]
+    return '\n'.join(lines) if lines else '（无内容）'
 
 
 def launch_connection_test(parent, status):
@@ -85,7 +83,7 @@ class ReviewRulesDialog(tk.Toplevel):
         self.transient(app)
         self.version, self.rules = load_rules(self.store)
         ttk.Label(self, text=f'当前规则 v{self.version} · jev-1.13.0 · 保存生成新版本，历史结果保留原规则', padding=10).pack(anchor='w')
-        thresholds = ttk.LabelFrame(self, text='本地展示阈值（尚未经过中文账簿校准）', padding=8)
+        thresholds = ttk.LabelFrame(self, text='命中阈值（主题概率×100，尚未经过中文账簿校准）', padding=8)
         thresholds.pack(fill='x', padx=10)
         self.thresholds = {}
         for label in ('谨慎', '中', '宽松'):
@@ -93,10 +91,8 @@ class ReviewRulesDialog(tk.Toplevel):
             var = tk.StringVar(value=str(self.rules['thresholds'][label]))
             self.thresholds[label] = var
             ttk.Entry(thresholds, textvariable=var, width=7).pack(side='left', padx=(0, 16))
-        ttk.Label(self, text='必须保持：谨慎 < 中 < 宽松。分数代表核查优先级，不能解释为违法概率。', padding=10).pack(anchor='w')
-        self.paths = {'通用判断边界': ('common',), '核查优先级提问': ('priority',), '信息不足提问': ('insufficient',)}
-        for i in range(5):
-            self.paths[f'优先级 {i} 判断标准'] = ('levels', i)
+        ttk.Label(self, text='必须保持：谨慎 < 中 < 宽松。任一主题概率达到阈值，整张凭证即列为问题凭证；概率不代表违法事实已获证实。', padding=10).pack(anchor='w')
+        self.paths = {'通用判断边界': ('common',), '信息不足提问': ('insufficient',)}
         for i, topic in enumerate(self.rules['topics']):
             self.paths[f"{topic['label']} · 提问"] = ('topics', i, 'question')
             self.paths[f"{topic['label']} · 核查建议"] = ('topics', i, 'advice')
@@ -174,8 +170,12 @@ class ConsentDialog(tk.Toplevel):
             if value:
                 description.append(f'{labels[field]}：{value}')
         wrapped_label(self, text=CONSENT_TEXT, wraplength=750, padding=12).pack(fill='x')
-        wrapped_label(self, text=f'账套：{self.store.path.name}\n范围：' + ('；'.join(description) or '全部明细分录') + f'\n共 {self.total} 条分录，归为 {self.voucher_total} 张凭证／无号来源行；每张凭证精简去重后核查；超长内容分段 · 规则 v{info["rule_id"]} · {info["model"]}', padding=(12, 4), wraplength=750).pack(fill='x')
-        wrapped_label(self, text='完整发送字段：' + '、'.join(SEND_FIELDS.values()) + '\n文件名、路径、制单人、原始行及凭证标识只在本地关联，不发送。', padding=12, wraplength=750).pack(fill='x')
+        wrapped_label(self, text=f'账套：{self.store.path.name}\n范围：' + ('；'.join(description) or '全部明细分录') + f'\n共 {self.total} 条分录，归为 {self.voucher_total} 张凭证／无号来源行；每张凭证去重合并后核查（相同行合并金额并标注次数，仅发送非零一侧金额）；超长内容分段 · 规则 v{info["rule_id"]} · {info["model"]}', padding=(12, 4), wraplength=750).pack(fill='x')
+        parties = party_names(self.store.related_parties())
+        party_preview = '、'.join(parties[:12]) + (' 等' if len(parties) > 12 else '')
+        wrapped_label(self, text='完整发送字段：' + '、'.join(SEND_FIELDS.values()) + f'（空白字段与零金额不发送）'
+            + (f'\n关联方名单：共 {len(parties)} 个名称，随每张凭证一并发送（仅名称与别名，不含备注）：{party_preview}' if parties else '\n当前账套未设置关联方名单；可在「查看 → 关联方名单」中维护或批量导入。')
+            + '\n文件名、路径、制单人、原始行及凭证标识只在本地关联，不发送。', padding=12, wraplength=750).pack(fill='x')
         wrapped_label(self, text=f"已排除结转损益 {counts['skipped_vouchers']} 张；只核查其余凭证。", padding=(12, 0)).pack(fill='x')
         self.preview = read_only_text(self, '', height=13)
         bottom = ttk.Frame(self, padding=10)
@@ -259,7 +259,7 @@ class ReviewPanel(ttk.Frame):
         lanes.pack(fill='x')
         self.lane = tk.StringVar(value='candidates')
         self.lane_buttons = {}
-        for index, (label, value) in enumerate((('待核线索（含不确定／失败）', 'candidates'), ('已完成结果', 'completed'), ('优先核查', 'scored'), ('信息不足／判断不确定', 'uncertain'), ('分析失败／未分析／过期', 'unfinished'), ('全部（含低分）', 'all'))):
+        for index, (label, value) in enumerate((('待核线索（含不确定／失败）', 'candidates'), ('已完成结果', 'completed'), ('命中问题', 'scored'), ('信息不足／判断不确定', 'uncertain'), ('分析失败／未分析／过期', 'unfinished'), ('全部（含未命中）', 'all'))):
             button = ttk.Radiobutton(lanes, text=label, value=value, variable=self.lane, command=self.refresh_rows)
             button.grid(row=index // 2, column=index % 2, sticky='w', padx=(0, 14), pady=2)
             self.lane_buttons[value] = button
@@ -284,8 +284,8 @@ class ReviewPanel(ttk.Frame):
             if variable is self.period:
                 self.period_combo = combo
         ttk.Button(filters, text='筛选', command=self.refresh_rows).pack(side='left')
-        self.view = tree(self, [('voucher', '凭证', 150), ('summary', '摘要', 220), ('topics', '核查线索', 170),
-            ('score', '优先分', 75), ('analysis', '状态', 120)])
+        self.view = tree(self, [('voucher', '凭证', 150), ('summary', '摘要', 220), ('topics', '问题类别', 170),
+            ('score', '命中概率', 75), ('analysis', '状态', 120)])
         self.view.bind('<Double-1>', self.open_detail)
         bottom = ttk.Frame(self, padding=6)
         bottom.pack(side='bottom', fill='x', before=self.view.master)
@@ -451,7 +451,7 @@ class ReviewDetail(tk.Toplevel):
         self.lines = {str(r['id']): r for r in group['lines']}
         holder = ttk.Frame(self)
         holder.pack(fill='x')
-        self.view = tree(holder, [('account','科目',180),('summary','账面摘要',340),('score','优先分',85),('source','来源行',220)])
+        self.view = tree(holder, [('account','科目',180),('summary','账面摘要',340),('score','命中概率',85),('source','来源行',220)])
         self.view.configure(height=4)
         wrapped_label(self, text='新版结果按凭证整体判断；下方分录用于查阅来源，不表示每条分录分别命中。', padding=6).pack(fill='x')
         for key, r in self.lines.items():
@@ -490,10 +490,10 @@ class ReviewDetail(tk.Toplevel):
             f"借方：{format_money(local['debit_cents'])}；贷方：{format_money(local['credit_cents'])}；币种：{local['currency'] or '未注明'}；原币金额：{local['original_amount']}"]
         if row['response_json']:
             data = json.loads(row['response_json'])
-            lines += [f"判断单位：{'凭证整体' if data.get('review_unit') == 'voucher' else '分录'}；分段数：{data.get('chunks', 1)}\n实际模型：{data['model']}；优先分：{row['score']:.1f}；Score confidence：{row['confidence']:.3f}；信息不足：{row['insufficient']:.3f}",
+            lines += [f"判断单位：{'凭证整体' if data.get('review_unit') == 'voucher' else '分录'}；分段数：{data.get('chunks', 1)}\n实际模型：{data['model']}；命中概率：{row['score']:.1f}（最高主题概率，任一主题达阈值即为问题凭证，非加权平均）；信息不足：{row['insufficient']:.3f}",
                       f"同次请求用量（{data.get('shared_entries', 1)} 条分录共用，不逐行累加）：{data['usage']}；{'缓存复用，未再次请求' if row['cached'] else '本次请求'}", '']
             if data.get('chunks', 1) > 1:
-                lines += ['分段结果：优先分及各主题信号分别取片段最大值，不是整张凭证的总体概率；需人工结合全文复核。', '']
+                lines += ['分段结果：各主题信号取片段最大值，不是整张凭证的总体概率；需人工结合全文复核。', '']
             for topic in self.rules['topics']:
                 probability = data['answers'][topic['id']]['noul']
                 if probability >= 0.35:
@@ -501,11 +501,13 @@ class ReviewDetail(tk.Toplevel):
             if not row['themes']:
                 lines += ['待分类：结合摘要及科目，人工确认需补充的材料。', '']
             if is_uncertain(row):
-                lines += ['信息不足／判断不确定／已分段：请核对整张凭证的交易用途；低置信度未降低分数。', '']
+                lines += ['信息不足／判断不确定／已分段：请核对整张凭证的交易用途；不确定未降低主题概率。', '']
+            parties = party_names(self.store.related_parties())
+            lines += [f"随本凭证发送的关联方名单：{len(parties)} 个名称" + (f"（{('、'.join(parties[:15]))}{'…' if len(parties) > 15 else ''}）" if parties else "；可在「查看 → 关联方名单」维护"), '']
             lines += ['完整结构化回答：', json.dumps(data['answers'], ensure_ascii=False, indent=2), '']
         elif row['error']:
             lines += [row['error']]
-        lines += [BOUNDARY, '', '当前行的精简输入（凭证内共用字段与重复行会去重；超长摘要分段发送）：' if row['status'] != 'skipped' else '已跳过，以下字段未发送：', display_input(json.loads(row['input_json'])), '',
+        lines += [BOUNDARY, '', '当前行的精简输入（发送时与同凭证其他行合并去重：内容相同的行金额合并并标注次数；空白字段与零金额不发送）：' if row['status'] != 'skipped' else '已跳过，以下字段未发送：', display_input(json.loads(row['input_json'])), '',
                   '本地保留的原始行（不发送）：', local['raw_json']]
         self.text.configure(state='normal')
         self.text.delete('1.0', 'end')

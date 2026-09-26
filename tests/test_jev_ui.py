@@ -109,7 +109,7 @@ class ReviewUITest(unittest.TestCase):
             if state['summary'] == '等待返回':
                 waiting.set()
                 release.wait(8)
-            return response(score=0.2)
+            return response({'loan': 0.2})
         FakeClient.responder = staticmethod(respond)
         batch = prepare_batch(self.app.store, {})
         job = ReviewJob(self.app.store.path, batch, 'fake-key', FakeClient)

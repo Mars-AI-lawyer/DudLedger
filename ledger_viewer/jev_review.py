@@ -9,14 +9,16 @@ import re
 import sqlite3
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from queue import Queue
 
-from typesafe_sdk import Noul, Score, TypeSafeClient, RetryPolicy
+from typesafe_sdk import Noul, TypeSafeClient, RetryPolicy
 
 from .analysis_api import iter_entries
 from .importer import format_money
 from .jev_rules import load_rules
+from .related_parties import party_names
 from .voucher_notes import voucher_key
 from .jev_runtime import REQUEST_SLOTS
 
@@ -54,13 +56,14 @@ STATUS_LABELS = {'preview': '待确认', 'pending': '未分析', 'running': '分
                  'interrupted': '已中断', 'completed': '已完成', 'partial': '部分失败',
                  'auth_failed': '认证失败', 'stale': '已过期', 'skipped': '已跳过结转损益'}
 BOUNDARY = '账簿记载及 AI 判断均为核查线索，不代表关联关系、违法事实或最终法律结论已获证实。'
-SEND_FIELDS = {'entry_date': '日期', 'name': '科目', 'summary': '摘要',
-               'debit': '借方金额', 'credit': '贷方金额'}
-REQUEST_VERSION = 'compact-voucher-v2'
+SEND_FIELDS = {'entry_date': '日期', 'name': '科目', 'summary': '摘要', 'counterparty': '往来单位',
+               'auxiliary': '辅助核算', 'debit': '借方金额', 'credit': '贷方金额'}
+REQUEST_VERSION = 'compact-voucher-v3'
 # UTF-8 bytes are a conservative proxy, not an exact tokenizer count.
 MAX_STATE_BYTES = 6000
-MAX_REQUEST_BYTES = 48000
-MAX_CONTEXT_BYTES = 24000
+MAX_PARTY_BYTES = 16000
+MAX_REQUEST_BYTES = 64000
+MAX_CONTEXT_BYTES = 40000
 _ACTIVE = {}
 _ACTIVE_LOCK = threading.Lock()
 
@@ -74,8 +77,53 @@ def digest(value) -> str:
 
 
 def send_fields(row, parties=None) -> dict:
-    return {'entry_date': row['entry_date'], 'name': row['name'], 'summary': row['summary'],
-            'debit': format_money(row['debit_cents']), 'credit': format_money(row['credit_cents'])}
+    """Only send useful per-row fields: blanks and the zero-amount side stay local."""
+    payload = {'entry_date': row['entry_date'], 'name': row['name'], 'summary': row['summary']}
+    counterparty = (row['counterparty'] or '').strip()
+    auxiliary = (row['auxiliary'] or '').strip()
+    if counterparty:
+        payload['counterparty'] = counterparty
+    if auxiliary:
+        payload['auxiliary'] = auxiliary
+    if row['debit_cents']:
+        payload['debit'] = format_money(row['debit_cents'])
+    if row['credit_cents']:
+        payload['credit'] = format_money(row['credit_cents'])
+    return payload
+
+
+def _sum_amounts(values: list[str]) -> str:
+    # Amounts are plain two-decimal strings; summing happens in code, never in the model.
+    total = sum((Decimal(value) for value in values), Decimal(0))
+    cents = int((total * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    return format_money(cents)
+
+
+def merge_duplicate_rows(payloads):
+    """Merge rows identical apart from amounts: total each side locally and mark repeat counts."""
+    groups: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for payload in payloads:
+        base = {key: value for key, value in payload.items() if key not in ('debit', 'credit')}
+        key = (encode(base), 'debit' in payload, 'credit' in payload)
+        if key not in groups:
+            groups[key] = {'base': base, 'debit': [], 'credit': []}
+            order.append(key)
+        for side in ('debit', 'credit'):
+            if side in payload:
+                groups[key][side].append(payload[side])
+    merged = []
+    for key in order:
+        group = groups[key]
+        row = dict(group['base'])
+        for side in ('debit', 'credit'):
+            if group[side]:
+                row[side] = _sum_amounts(group[side])
+        count = len(group['debit'] or group['credit'])
+        if count > 1:
+            row['repeat'] = count
+        merged.append(row)
+    return merged
 
 
 def closing_voucher(rows) -> bool:
@@ -94,19 +142,24 @@ def closing_voucher(rows) -> bool:
     return all(re.fullmatch(pattern, re.sub(r'\s+', '', r['summary'])) for r in rows)
 
 
-def compact_state(payloads):
-    """Hoist shared fields and remove exact duplicates; retain all distinct evidence."""
-    unique = list({encode(p): p for p in payloads}.values())
-    common = {k: unique[0][k] for k in SEND_FIELDS
-              if unique and all(p[k] == unique[0][k] for p in unique)}
-    entries = [{k: v for k, v in p.items() if k not in common} for p in unique]
-    return {'common': common, 'entries': entries}
+def compact_state(payloads, parties=None):
+    """Merge repeated rows, hoist shared fields, and attach the related-party name list."""
+    merged = merge_duplicate_rows(payloads)
+    common = {}
+    for key in merged[0] if merged else ():
+        if all(row.get(key) == merged[0].get(key) for row in merged):
+            common[key] = merged[0][key]
+    entries = [{k: v for k, v in row.items() if k not in common} for row in merged]
+    state = {}
+    if parties:
+        state['related_parties'] = parties
+    state.update({'common': common, 'entries': entries})
+    return state
 
 
 def request_parts(payloads):
-    unique = list({encode(p): p for p in payloads}.values())
     pieces = []
-    for payload in unique:
+    for payload in payloads:
         summary = payload['summary']
         if len(summary.encode('utf-8')) > 2400:
             # Overlap preserves words/negations around a split; never drop a tail.
@@ -148,6 +201,7 @@ def recover_interrupted(store):
 def prepare_batch(store, scope: dict) -> int:
     """Save a complete local snapshot; never invokes the network or credentials."""
     version, rules = load_rules(store)
+    parties = party_names(store.related_parties())
     scope = {k: v for k, v in scope.items() if k in ('account', 'search', 'fiscal_year', 'period', 'include_descendants', 'source_ids')}
     hashes = []
     with store.db:
@@ -170,11 +224,12 @@ def prepare_batch(store, scope: dict) -> int:
                 store.db.executemany("UPDATE jev_results SET status='skipped',error='结转损益凭证，未发送 Jev' WHERE id=?",
                                      [(r['id'],) for r in group])
             context = [json.loads(row['input_json']) for row in group]
-            group_hash = digest([REQUEST_VERSION, context, version, rules, rules['model']])
+            group_hash = digest([REQUEST_VERSION, context, parties, version, rules, rules['model']])
             for index, row in enumerate(group):
                 cache = digest([group_hash, index])
                 store.db.execute('UPDATE jev_results SET cache_key=? WHERE id=?', (cache, row['id']))
-        store.db.execute('UPDATE jev_batches SET snapshot_hash=? WHERE id=?', (digest(hashes), batch_id))
+        store.db.execute('UPDATE jev_batches SET snapshot_hash=? WHERE id=?',
+            (digest({'entries': hashes, 'parties': parties}), batch_id))
     return batch_id
 
 
@@ -229,7 +284,6 @@ def refresh_staleness(store, batch_id):
 def questions_for(rules):
     common = rules['common'] + '\n\n'
     questions = {topic['id']: Noul(instructions=common + topic['question']) for topic in rules['topics']}
-    questions['priority'] = Score(instructions=common + rules['priority'], criteria=rules['levels'])
     questions['insufficient'] = Noul(instructions=common + rules['insufficient'])
     return questions
 
@@ -237,7 +291,8 @@ def questions_for(rules):
 def voucher_questions(payloads, rules):
     adapted = copy.deepcopy(rules)
     adapted['common'] = ('判断当前凭证片段整体是否存在该事项，而非逐条分录评分。'
-        '`common` 是各行共用字段，与 `entries` 各行合并理解；重复行已去重，不能据此计算总额。'
+        '`common` 是各行共用字段，与 `entries` 各行合并理解；内容相同仅金额不同的行已合并为一行，'
+        '金额为合并后合计、`repeat` 为行数，不能据此还原每行原始金额。'
         '片段可能不是完整凭证，不能据此判断借贷不平。\n' + adapted['common'])
     return questions_for(adapted)
 
@@ -252,31 +307,18 @@ def validate_response(data, rules):
             raise ValueError('响应数值无效')
         return value
     answers = data['answers']
-    for key in [*(topic['id'] for topic in rules['topics']), 'insufficient']:
+    keys = [*(topic['id'] for topic in rules['topics']), 'insufficient']
+    for key in keys:
         if answers[key]['type'] != 'noul':
             raise ValueError('响应类型无效')
         number(answers[key]['noul'], 1)
-    priority = answers['priority']
-    if priority['type'] != 'score':
-        raise ValueError('响应类型无效')
-    score = number(priority['score'], 4)
-    confidence = number(priority['confidence'], 1)
-    probs = priority['probabilities']
-    if {str(k) for k in probs} != {'0', '1', '2', '3', '4'}:
-        raise ValueError('响应缺少等级概率')
-    values = {int(k): number(v, 1) for k, v in probs.items()}
-    if abs(sum(values.values()) - 1) > 0.02 or abs(sum(k * v for k, v in values.items()) - score) > 0.03:
-        raise ValueError('响应概率与评分不一致')
     usage = data['usage']
     if any(type(usage[k]) is not int or usage[k] < 0 for k in ('input_tokens', 'output_tokens')):
         raise ValueError('响应用量无效')
     # Persist only documented structured fields, never arbitrary headers/error bodies.
     clean = {'model': data['model'], 'answers': {
-        key: {'type': 'noul', 'noul': answers[key]['noul']}
-        for key in [*(topic['id'] for topic in rules['topics']), 'insufficient']},
+        key: {'type': 'noul', 'noul': answers[key]['noul']} for key in keys},
         'usage': {k: usage[k] for k in ('input_tokens', 'output_tokens')}}
-    clean['answers']['priority'] = {'type': 'score', 'score': score, 'confidence': confidence,
-                                     'probabilities': probs, 'legend': dict(enumerate(rules['levels']))}
     return clean
 
 
@@ -295,7 +337,7 @@ def error_kind(exc):
     return 'error', '请求失败，请检查服务状态或规则配置'
 
 
-def _request_once(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None):
+def _request_once(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None, parties=None):
     for attempt in range(1, 4):
         if cancel.is_set():
             return {'status': 'cancelled', 'attempts': attempt - 1}
@@ -309,7 +351,7 @@ def _request_once(payload, rules, api_key, cancel, client_factory=TypeSafeClient
                 return {'status': 'interrupted', 'stale': True, 'error': '来源已变化，请重新预览', 'attempts': attempt - 1}
             with client_factory(api_key=api_key, model=rules['model'], timeout=25.0, retry=RetryPolicy(max_retries=0)) as client:
                 grouped = isinstance(payload, list)
-                response = client.system_one(state=compact_state(payload) if grouped else payload,
+                response = client.system_one(state=compact_state(payload, parties) if grouped else payload,
                     questions=voucher_questions(payload, rules) if grouped else questions_for(rules))
             raw = response.model_dump(mode='json')
             if grouped:
@@ -329,15 +371,19 @@ def _request_once(payload, rules, api_key, cancel, client_factory=TypeSafeClient
     raise AssertionError('unreachable')
 
 
-def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None):
+def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None, parties=None):
     if not isinstance(payload, list):
         return _request_once(payload, rules, api_key, cancel, client_factory, before_send)
     questions = voucher_questions(payload, rules)
     serialized = {k: q.model_dump(mode='json') for k, q in questions.items()}
     question_bytes = len(encode(serialized).encode('utf-8'))
     longest = max(len(encode(q).encode('utf-8')) for q in serialized.values())
-    if question_bytes + MAX_STATE_BYTES > MAX_REQUEST_BYTES or longest + MAX_STATE_BYTES > MAX_CONTEXT_BYTES:
-        return {'status': 'failed', 'error': '审查规则过长，请缩短自定义规则后重试', 'attempts': 0}
+    party_bytes = len(encode(parties or []).encode('utf-8'))
+    if party_bytes > MAX_PARTY_BYTES:
+        return {'status': 'failed', 'error': '关联方名单过长，请精简名单或别名后重试', 'attempts': 0}
+    if (question_bytes + MAX_STATE_BYTES + party_bytes > MAX_REQUEST_BYTES
+            or longest + MAX_STATE_BYTES + party_bytes > MAX_CONTEXT_BYTES):
+        return {'status': 'failed', 'error': '审查规则或关联方名单过长，请缩短后重试', 'attempts': 0}
     try:
         queue = list(request_parts(payload))
     except ValueError as exc:
@@ -345,7 +391,7 @@ def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClien
     results, attempts = [], 0
     while queue:
         part = queue.pop(0)
-        result = _request_once(part, rules, api_key, cancel, client_factory, before_send)
+        result = _request_once(part, rules, api_key, cancel, client_factory, before_send, parties)
         attempts += result['attempts']
         if result.get('length'):
             if len(part) > 1:
@@ -364,14 +410,14 @@ def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClien
         results.append(result['data'])
     if not results:
         return {'status': 'failed', 'error': '没有可核查内容', 'attempts': 0}
-    # Keep the highest observed priority distribution; never average away a red flag.
-    merged = copy.deepcopy(max(results, key=lambda r: r['answers']['priority']['score']))
+    # Keep each topic's maximum across chunks; never average away a hit.
+    merged = copy.deepcopy(results[0])
     for key in [t['id'] for t in rules['topics']] + ['insufficient']:
         merged['answers'][key]['noul'] = max(r['answers'][key]['noul'] for r in results)
     merged['usage'] = {k: sum(r['usage'][k] for r in results) for k in ('input_tokens', 'output_tokens')}
     merged.update(review_unit='voucher', shared_entries=len(payload), chunks=len(results),
                   needs_manual_review=len(results) > 1,
-                  request_group=digest([REQUEST_VERSION, payload, rules]))
+                  request_group=digest([REQUEST_VERSION, payload, rules, parties]))
     if len(results) > 1:
         merged['part_results'] = results
     return {'status': 'success', 'items': [merged for _ in payload], 'attempts': attempts}
@@ -379,8 +425,7 @@ def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClien
 
 def test_connection(api_key, client_factory=TypeSafeClient):
     from .jev_rules import default_rules
-    payload = {field: '' for field in SEND_FIELDS}
-    payload.update(summary='虚构样例：支付办公文具采购款', name='管理费用', debit='10.00', credit='0.00')
+    payload = {'entry_date': '2026-01-05', 'name': '管理费用', 'summary': '虚构样例：支付办公文具采购款', 'debit': '10.00'}
     return request_review(payload, default_rules(), api_key, threading.Event(), client_factory)
 
 
@@ -429,8 +474,9 @@ class ReviewJob:
                 # Lock the database while validating the scope and marking consent.
                 store.db.execute('UPDATE jev_batches SET snapshot_hash=snapshot_hash WHERE id=?', (self.batch_id,))
                 hashes = [fingerprint(row, send_fields(row)) for row in iter_entries(store, **json.loads(info['scope_json']))]
-                if digest(hashes) != info['snapshot_hash'] or store.db.execute('SELECT 1 FROM jev_results WHERE batch_id=? AND stale=1 LIMIT 1', (self.batch_id,)).fetchone():
-                    raise ValueError('分录已变化，请重新选择范围并确认')
+                snapshot = digest({'entries': hashes, 'parties': party_names(store.related_parties())})
+                if snapshot != info['snapshot_hash'] or store.db.execute('SELECT 1 FROM jev_results WHERE batch_id=? AND stale=1 LIMIT 1', (self.batch_id,)).fetchone():
+                    raise ValueError('分录或关联方名单已变化，请重新选择范围并确认')
                 current_rule, _ = load_rules(store)
                 if current_rule != info['rule_id']:
                     raise ValueError('规则已变化，请重新预览并确认')
@@ -443,10 +489,11 @@ class ReviewJob:
         with store.db:
             if result['status'] == 'success':
                 data = result['data']
-                score = data['answers']['priority']
-                store.db.execute('''UPDATE jev_results SET status='success',response_json=?,score=?,confidence=?,
+                # A voucher's headline probability is its strongest topic hit, not an average.
+                score = max(value['noul'] for key, value in data['answers'].items() if key != 'insufficient') * 100
+                store.db.execute('''UPDATE jev_results SET status='success',response_json=?,score=?,confidence=NULL,
                     insufficient=?,cached=?,attempts=?,error='',updated_at=CURRENT_TIMESTAMP WHERE id=?''',
-                    (encode(data), score['score'] / 4 * 100, score['confidence'], data['answers']['insufficient']['noul'],
+                    (encode(data), score, data['answers']['insufficient']['noul'],
                      int(cached), result.get('attempts', 0), row['id']))
             else:
                 store.db.execute('UPDATE jev_results SET status=?,error=?,attempts=?,stale=MAX(stale,?),updated_at=CURRENT_TIMESTAMP WHERE id=?',
@@ -460,6 +507,8 @@ class ReviewJob:
             store = LedgerStore(self.path)
             info = batch_info(store, self.batch_id)
             rules = json.loads(info['body_json'])
+            # Freeze the party list for the whole run so cache keys and sent content match.
+            parties = party_names(store.related_parties())
             # Queue at most four tasks, so cancellation never leaves a large request backlog.
             groups = iter_voucher_groups(store, self.batch_id)
             exhausted = False
@@ -490,7 +539,7 @@ class ReviewJob:
                             store.db.executemany("UPDATE jev_results SET status='running' WHERE id=?", [(row['id'],) for row in group])
                         payloads = [json.loads(row['input_json']) for row in group]
                         future = pool.submit(request_review, payloads, rules, self._key, self.cancel, self.client_factory,
-                            lambda snapshots=group: all(snapshot_is_current(self.path, row) for row in snapshots))
+                            lambda snapshots=group: all(snapshot_is_current(self.path, row) for row in snapshots), parties)
                         pending[future] = group
                     if self.cancel.is_set():
                         exhausted = True
@@ -544,19 +593,27 @@ def topic_labels(result, rules):
             for topic in rules['topics'] if answers[topic['id']]['noul'] >= 0.35]
 
 
+def topic_probabilities(row) -> dict:
+    if not row['response_json']:
+        return {}
+    answers = json.loads(row['response_json'])['answers']
+    return {key: float(value['noul']) for key, value in answers.items()
+            if key != 'insufficient' and isinstance(value, dict) and 'noul' in value}
+
+
+def has_topic_hit(row, threshold) -> bool:
+    """Any single topic reaching the tier threshold makes the voucher a problem voucher."""
+    return any(probability * 100 >= threshold for probability in topic_probabilities(row).values())
+
+
 def is_uncertain(row):
     data = json.loads(row['response_json']) if row['response_json'] else {}
-    return row['confidence'] < 0.5 or row['insufficient'] >= 0.5 or data.get('needs_manual_review', False)
+    legacy_confidence = row['confidence'] is not None and row['confidence'] < 0.5
+    return legacy_confidence or (row['insufficient'] or 0) >= 0.5 or data.get('needs_manual_review', False)
 
 
-def needs_review(row, threshold, tier):
-    if row['score'] >= threshold or is_uncertain(row):
-        return True
-    answers = json.loads(row['response_json'])['answers']
-    # A distributed Score can hide a meaningful high-priority tail in its mean.
-    tail = sum(float(p) for level, p in answers['priority']['probabilities'].items() if int(level) >= 2)
-    return tier == '谨慎' and (tail >= 0.35 or any(answers[t]['noul'] >= 0.65
-        for t in ('contract', 'labor', 'litigation', 'tax')))
+def needs_review(row, threshold, tier=None):
+    return has_topic_hit(row, threshold) or is_uncertain(row)
 
 
 def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', topic='', period=''):
@@ -591,7 +648,7 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', t
             elif any(r['status'] == 'failed' for r in lines):
                 hits = lines
         elif lane == 'scored':
-            hits = [r for r in successful if r['score'] >= threshold]
+            hits = [r for r in successful if has_topic_hit(r, threshold)]
         elif lane == 'uncertain':
             hits = [r for r in successful if is_uncertain(r)]
         elif lane == 'unfinished':

@@ -32,23 +32,51 @@ class EntryWorkflowTest(unittest.TestCase):
             self.assertIsNone(self.app.store)
             self.assertFalse(self.root.book_folder.exists())
             dialog.assert_not_called()
-        with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), patch('ledger_viewer.ui.BatchImportDialog') as dialog:
+        with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
+             patch('ledger_viewer.ui.filedialog.asksaveasfilename', side_effect=[str(self.base / 'books' / 'sample.sqlite'), str(self.base / 'books' / 'sample-2.sqlite')]) as save, \
+             patch('ledger_viewer.ui.BatchImportDialog') as dialog:
             self.app.import_file()
             original = self.app.store.path
-            self.assertEqual(original, self.root.book_folder / 'sample.sqlite')
+            self.assertEqual(original.resolve(), (self.root.book_folder / 'sample.sqlite').resolve())
             self.assertTrue(original.exists())
             dialog.assert_called_once_with(self.app, [self.source])
             self.app.import_file()
             self.assertEqual(self.app.store.path, original)
             second = self.root.new_window()
             second.import_file()
-            self.assertEqual(second.store.path, self.root.book_folder / 'sample-2.sqlite')
+            self.assertEqual(second.store.path.resolve(), (self.root.book_folder / 'sample-2.sqlite').resolve())
             self.assertTrue(original.exists())
+            self.assertEqual(save.call_args.kwargs['initialfile'], 'sample-2.sqlite')
         chosen = self.base / 'new-folder'
         with patch('ledger_viewer.ui.filedialog.askdirectory', return_value=str(chosen)):
             self.app.choose_book_folder()
         self.assertEqual(self.root.book_folder, chosen.resolve())
         self.assertIn(str(chosen.resolve()), self.root.preferences_path.read_text())
+
+    def test_cancel_book_location_leaves_no_book(self):
+        with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
+             patch('ledger_viewer.ui.filedialog.asksaveasfilename', return_value=''), \
+             patch('ledger_viewer.ui.BatchImportDialog') as dialog:
+            self.app.import_file()
+        self.assertIsNone(self.app.store)
+        self.assertFalse(list(self.root.book_folder.glob('*.sqlite')))
+        dialog.assert_not_called()
+
+    def test_save_dialog_can_change_book_location_without_overwriting(self):
+        destination = self.base / '客户资料' / '账套.sqlite'
+        destination.parent.mkdir()
+        destination.write_text('existing', encoding='utf-8')
+        new_book = destination.with_name('账套-新.sqlite')
+        with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
+             patch('ledger_viewer.ui.filedialog.asksaveasfilename', side_effect=[str(destination), str(new_book)]) as save, \
+             patch('ledger_viewer.ui.messagebox.showerror') as error, \
+             patch('ledger_viewer.ui.BatchImportDialog'):
+            self.app.import_file()
+        self.assertEqual(save.call_count, 2)
+        error.assert_called_once()
+        self.assertEqual(destination.read_text(encoding='utf-8'), 'existing')
+        self.assertEqual(self.app.store.path.resolve(), new_book.resolve())
+        self.assertEqual(self.root.book_folder.resolve(), destination.parent.resolve())
 
     def test_click_expand_and_collapse_does_not_open_details(self):
         self.app._use_book(self.base / 'book.sqlite')
@@ -73,6 +101,14 @@ class EntryWorkflowTest(unittest.TestCase):
         self.root.update()
         self.assertFalse(view.bbox('C:100201'))
         self.assertEqual(view.item('C:1002', 'text'), '展开')
+        self.app.toggle_account(SimpleNamespace(x=x + 55, y=y + height // 2))
+        self.root.update()
+        self.assertTrue(view.bbox('C:100201'))
+        # Rebuilding the table (search, source switch…) must keep the opened rows.
+        self.app.refresh_all()
+        self.root.update()
+        self.assertTrue(view.bbox('C:100201'))
+        self.assertEqual(view.item('C:1002', 'text'), '收起')
         self.app.set_expansion(True)
         self.assertEqual(view.item('C:1002', 'text'), '收起')
         self.app.remember_expansion()

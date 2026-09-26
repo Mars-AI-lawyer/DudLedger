@@ -8,20 +8,27 @@ import sqlite3
 from pathlib import Path
 
 
+def _needs_manual_review(prediction) -> bool:
+    try:
+        return bool(json.loads(prediction['response_json'] or '{}').get('needs_manual_review'))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
 def metrics(samples, predictions, thresholds=None):
-    thresholds = thresholds or {'谨慎': 40, '中': 65, '宽松': 85}
+    thresholds = thresholds or {'谨慎': 35, '中': 50, '宽松': 65}
     approved = [s for s in samples if s['标注状态'] == '已确认']
     for row in approved:
         if row['律师确认优先级'] not in ('0', '1', '2', '3', '4'):
             raise ValueError(f"{row['样例编号']} 缺少有效的律师优先级标注")
     report = {'样例总数': len(samples), '律师确认数': len(approved),
-              '指标口径': '人工优先级 ≥ 2 为需核查正例；各档以其展示阈值判断是否检出；仅统计律师已确认且分析成功的样例。',
+              '指标口径': '人工优先级 ≥ 2 为需核查正例；任一主题概率达到各档阈值即判为检出（不再使用加权优先分）；仅统计律师已确认且分析成功的样例。理想做法是按主题分别标注样例后逐主题统计。',
               '状态': '可计算' if approved else '待律师标注，不提供准确率或召回率结论', '分组': {}}
     for split in ('校准', '验证'):
         selected = [s for s in approved if s['数据集'] == split]
         scored = [(s, predictions[s['样例编号']]) for s in selected if s['样例编号'] in predictions]
         result = {'律师已确认': len(selected), '分析成功': len(scored), '未分析或失败': len(selected)-len(scored),
-                  '判断不确定数': sum(p['confidence'] < 0.5 or p['insufficient'] >= 0.5 for _, p in scored), '三档': {}}
+                  '判断不确定数': sum((p['insufficient'] or 0) >= 0.5 or _needs_manual_review(p) for _, p in scored), '三档': {}}
         for tier, threshold in thresholds.items():
             positive = [(s,p) for s,p in scored if int(s['律师确认优先级']) >= 2]
             negative = [(s,p) for s,p in scored if int(s['律师确认优先级']) < 2]
@@ -30,7 +37,7 @@ def metrics(samples, predictions, thresholds=None):
             result['三档'][tier] = {'阈值': threshold, '需核查正例数': len(positive), '检出正例': tp, '误报数': fp,
                 '召回率': tp / len(positive) if positive else None,
                 '误报率': fp / len(negative) if negative else None,
-                '低分漏检样例': [s['样例编号'] for s,p in positive if p['score'] < threshold]}
+                '未命中样例': [s['样例编号'] for s,p in positive if p['score'] < threshold]}
         report['分组'][split] = result
     return report
 

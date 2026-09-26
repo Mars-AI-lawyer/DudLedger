@@ -83,6 +83,13 @@ class WorkflowUITest(unittest.TestCase):
                 editor.insert("end", "，补充流水")
                 save.invoke()
                 self.assertIn("补充流水", list_marks(window.store)[0]["note"])
+                window.tabs.select(4)
+                window.refresh_marks()
+                self.assertEqual(len(window.mark_view.get_children()), 1)
+                window.mark_view.selection_set(next(iter(window.mark_view.get_children())))
+                window.open_selected_mark_voucher()
+                app.update()
+                self.assertTrue(any(w.winfo_exists() and "记1" in w.title() for w in window.voucher_windows))
                 source_id = str(window.store.sources()[0]["id"])
                 window.source_view.selection_set(source_id)
                 with patch("ledger_viewer.ui.messagebox.askyesno", return_value=True):

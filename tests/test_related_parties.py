@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from ledger_viewer.importer import ImportSpec, guess_header
-from ledger_viewer.related_parties import related_party_match
+from ledger_viewer.related_parties import party_names, parse_party_names, party_names_from_file, related_party_match
 from ledger_viewer.store import LedgerStore
 
 
@@ -49,6 +49,24 @@ class RelatedPartiesTest(unittest.TestCase):
             self.assertEqual(other.related_parties(), [])
         finally:
             other.close()
+
+    def test_party_names_flatten_aliases_without_notes_for_cloud_requests(self):
+        self.store.save_related_party("乙公司", [])
+        self.store.save_related_party("甲公司", ["甲集团", "ＡＣｏ"], "客户确认，此备注不发送")
+        self.assertEqual(party_names(self.store.related_parties()), ["乙公司", "甲公司", "甲集团", "ACo"])
+
+    def test_parse_party_names_skips_blanks_and_duplicates(self):
+        text = "甲公司\n\n  乙公司 \n甲公司\nｃｏｓｔａ\n"
+        self.assertEqual(parse_party_names(text), ["甲公司", "乙公司", "costa"])
+        self.assertEqual(parse_party_names(""), [])
+
+    def test_party_names_from_file_reads_first_nonempty_column_and_skips_header(self):
+        csv_path = self.base / "parties.csv"
+        csv_path.write_text("关联方名称,备注\n甲公司,股东\n乙公司,\n丙公司\n", encoding="utf-8")
+        self.assertEqual(party_names_from_file(csv_path), ["甲公司", "乙公司", "丙公司"])
+        txt_path = self.base / "names.txt"
+        txt_path.write_text("甲公司\n乙公司\n甲公司\n", encoding="utf-8")
+        self.assertEqual(party_names_from_file(txt_path), ["甲公司", "乙公司"])
 
 
 if __name__ == "__main__":

@@ -10,17 +10,18 @@ import tempfile
 import tkinter as tk
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Thread
+from threading import Event, Thread
 from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from .checks import run_checks
+from .deepseek_mapping import delete_api_key as deepseek_delete_api_key, get_api_key as deepseek_get_api_key, key_memory_only as deepseek_memory_only, save_api_key as deepseek_save_api_key, suggest_mapping as deepseek_suggest_mapping
 from .grid_lines import DashedGrid
 from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_sheet, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
 from .jev_mapping import delete_api_key, get_api_key, key_memory_only, preview_sheet, save_api_key, suggest_mapping
 from .reconciliation import empty_plan, load_plan, save_plan
-from .related_parties import related_party_match
+from .related_parties import parse_party_names, party_names_from_file, related_party_match
 from .store import LedgerStore
 from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_mark, save_mark, save_mark_by_key, source_account, update_mark_note, voucher_key
 
@@ -39,6 +40,15 @@ FIELD_LABELS = {
 }
 
 REPORT_LABELS = {"balance_sheet": "资产负债表", "income_statement": "利润表"}
+
+PROVIDER_LABELS = {"jev": "Jev", "deepseek": "DeepSeek"}
+
+
+def ai_tools(controller) -> tuple[str, object, object]:
+    """Return (label, suggest, get_key) for the configured column-suggestion provider."""
+    if getattr(controller, "ai_provider", "jev") == "deepseek":
+        return "DeepSeek", deepseek_suggest_mapping, deepseek_get_api_key
+    return "Jev", suggest_mapping, get_api_key
 
 VIEW_COLUMNS = {
     "balance": [("code", "科目编码", 125), ("name", "科目名称", 200), ("od", "期初借方", 115), ("oc", "期初贷方", 115), ("pd", "本期借方", 115), ("pc", "本期贷方", 115), ("yd", "本年累计借方", 125), ("yc", "本年累计贷方", 125), ("cd", "期末借方", 115), ("cc", "期末贷方", 115), ("n", "明细行数", 80)],
@@ -196,22 +206,48 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(body, text="显示表格虚线（关闭后大表滚动更轻快）", variable=self.grid_lines,
                         command=lambda: parent.controller.set_grid_lines(self.grid_lines.get())).pack(anchor="w", pady=(7, 0))
         ttk.Separator(body).pack(fill="x", pady=12)
-        ttk.Label(body, text="Jev 审查与表格识别（可选）").pack(anchor="w")
+        ttk.Label(body, text="AI 建议列模型（导入时建议表头与列，可选）").pack(anchor="w")
+        provider_row = ttk.Frame(body)
+        provider_row.pack(fill="x", pady=(5, 0))
+        self.provider = tk.StringVar(value=PROVIDER_LABELS.get(parent.controller.ai_provider, "Jev"))
+        ttk.Radiobutton(provider_row, text="Jev（TypeSafe）", variable=self.provider, value="Jev", command=self._save_provider).pack(side="left")
+        ttk.Radiobutton(provider_row, text="DeepSeek（deepseek-flash，不思考）", variable=self.provider, value="DeepSeek", command=self._save_provider).pack(side="left", padx=12)
+        ttk.Label(body, text="Jev API Key").pack(anchor="w", pady=(7, 0))
         key_row = ttk.Frame(body)
         key_row.pack(fill="x", pady=(5, 0))
-        self.api_key = tk.StringVar()
-        ttk.Entry(key_row, textvariable=self.api_key, show="•", width=29).pack(side="left", fill="x", expand=True)
+        try:
+            self.api_key = tk.StringVar(value=get_api_key())
+        except Exception:
+            self.api_key = tk.StringVar()
+        self.key_entry = ttk.Entry(key_row, textvariable=self.api_key, show="•", width=29)
+        self.key_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(key_row, text="保存密钥", command=self._save_api_key).pack(side="left", padx=5)
         ttk.Button(key_row, text="删除密钥", command=self._delete_api_key).pack(side="left")
         self.key_status = tk.StringVar()
         ttk.Label(body, textvariable=self.key_status, foreground="#555").pack(anchor="w", pady=(4, 0))
         self._refresh_key_status()
+        ttk.Label(body, text="DeepSeek API Key").pack(anchor="w", pady=(7, 0))
+        deepseek_row = ttk.Frame(body)
+        deepseek_row.pack(fill="x", pady=(5, 0))
+        try:
+            self.deepseek_key = tk.StringVar(value=deepseek_get_api_key())
+        except Exception:
+            self.deepseek_key = tk.StringVar()
+        self.deepseek_entry = ttk.Entry(deepseek_row, textvariable=self.deepseek_key, show="•", width=29)
+        self.deepseek_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(deepseek_row, text="保存密钥", command=self._save_deepseek_key).pack(side="left", padx=5)
+        ttk.Button(deepseek_row, text="删除密钥", command=self._delete_deepseek_key).pack(side="left")
+        self.deepseek_status = tk.StringVar()
+        ttk.Label(body, textvariable=self.deepseek_status, foreground="#555").pack(anchor="w", pady=(4, 0))
+        self._refresh_deepseek_status()
+        self.show_key = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="显示明文（两个密钥）", variable=self.show_key, command=self._toggle_key_visible).pack(anchor="w", pady=(2, 0))
         jev_actions = ttk.Frame(body)
         jev_actions.pack(fill="x", pady=6)
         from .jev_ui import launch_connection_test
         ttk.Button(jev_actions, text="测试连接（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
         ttk.Button(jev_actions, text="Jev 审查规则与阈值", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
-        ttk.Label(body, text="从“文件”→“导入表格…”点“Jev 建议列（可选）”；确认发送范围后才联网。", foreground="#555").pack(anchor="w", pady=(7, 0))
+        ttk.Label(body, text="批量导入默认勾选 AI 建议列；确认发送范围后才联网，也可取消勾选。", foreground="#555").pack(anchor="w", pady=(7, 0))
         ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
         ttk.Button(body, text="保存并完成", command=self._finish).pack(anchor="e", pady=(12, 0))
 
@@ -219,12 +255,28 @@ class SettingsDialog(tk.Toplevel):
         if self.parent.store:
             self.parent.store.save_setting("voucher_open_mode", self.mode.get())
 
+    def _save_provider(self) -> None:
+        provider = next((code for code, label in PROVIDER_LABELS.items() if label == self.provider.get()), "jev")
+        self.parent.controller.set_ai_provider(provider)
+
     def _refresh_key_status(self) -> None:
         try:
             present = bool(get_api_key())
-            self.key_status.set(("密钥仅保留在本次运行内存，重启后需重新输入" if key_memory_only() else "密钥已保存到系统安全凭据库（输入框不回显）") if present else "尚未保存密钥")
-        except Exception as exc:
+            self.key_status.set(("密钥仅保留在本次运行内存，重启后需重新输入" if key_memory_only() else "密钥已保存到系统安全凭据库（默认以 • 隐藏，可勾选“显示明文”查看）") if present else "尚未保存密钥")
+        except Exception:
             self.key_status.set("无法访问系统凭据库")
+
+    def _refresh_deepseek_status(self) -> None:
+        try:
+            present = bool(deepseek_get_api_key())
+            self.deepseek_status.set(("密钥仅保留在本次运行内存，重启后需重新输入" if deepseek_memory_only() else "密钥已保存到系统安全凭据库（默认以 • 隐藏，可勾选“显示明文”查看）") if present else "尚未保存密钥")
+        except Exception:
+            self.deepseek_status.set("无法访问系统凭据库")
+
+    def _toggle_key_visible(self) -> None:
+        show = "" if self.show_key.get() else "•"
+        self.key_entry.configure(show=show)
+        self.deepseek_entry.configure(show=show)
 
     def _save_api_key(self) -> bool:
         try:
@@ -232,12 +284,24 @@ class SettingsDialog(tk.Toplevel):
         except Exception as exc:
             messagebox.showerror("保存失败", str(exc), parent=self)
             return False
-        self.api_key.set("")
+        self.api_key.set(get_api_key())
         self._refresh_key_status()
         return True
 
+    def _save_deepseek_key(self) -> bool:
+        try:
+            deepseek_save_api_key(self.deepseek_key.get())
+        except Exception as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self)
+            return False
+        self.deepseek_key.set(deepseek_get_api_key())
+        self._refresh_deepseek_status()
+        return True
+
     def _finish(self) -> None:
-        if self.api_key.get() and not self._save_api_key():
+        if self.api_key.get() and self.api_key.get() != get_api_key() and not self._save_api_key():
+            return
+        if self.deepseek_key.get() and self.deepseek_key.get() != deepseek_get_api_key() and not self._save_deepseek_key():
             return
         self.destroy()
 
@@ -250,6 +314,81 @@ class SettingsDialog(tk.Toplevel):
         self.api_key.set("")
         self._refresh_key_status()
 
+    def _delete_deepseek_key(self) -> None:
+        try:
+            deepseek_delete_api_key()
+        except Exception as exc:
+            messagebox.showerror("删除失败", str(exc), parent=self)
+            return
+        self.deepseek_key.set("")
+        self._refresh_deepseek_status()
+
+
+class RelatedPartyImportDialog(tk.Toplevel):
+    """Paste names or load a spreadsheet; each first non-empty cell becomes one party."""
+
+    def __init__(self, parent: "RelatedPartiesDialog"):
+        super().__init__(parent)
+        self.dialog = parent
+        self.title("批量导入关联方")
+        self.geometry("560x470")
+        self.minsize(460, 380)
+        self.transient(parent)
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, foreground="#555", wraplength=500, text="每行一个名称，空白行与重复项自动忽略；也可从 Excel/CSV/TXT 导入（取每行第一个非空单元格，首行表头自动跳过）。与现有名单重复或无效的条目导入时跳过。").pack(anchor="w")
+        self.editor = tk.Text(body, height=12, wrap="word", undo=True)
+        self.editor.pack(fill="both", expand=True, pady=(8, 6))
+        self.status = tk.StringVar()
+        ttk.Label(body, textvariable=self.status, foreground="#555").pack(anchor="w")
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(actions, text="从文件导入…", command=self._load_file).pack(side="left")
+        ttk.Button(actions, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(actions, text="导入名单", command=self._import).pack(side="right", padx=6)
+        self.editor.bind("<KeyRelease>", lambda _e: self._refresh_count())
+        self.grab_set()
+
+    def _names(self) -> list[str]:
+        return parse_party_names(self.editor.get("1.0", "end-1c"))
+
+    def _refresh_count(self) -> None:
+        self.status.set(f"当前识别到 {len(self._names())} 个名称")
+
+    def _load_file(self) -> None:
+        path = filedialog.askopenfilename(parent=self, title="选择关联方清单文件",
+            filetypes=[("表格与文本", "*.xlsx *.xlsm *.xls *.csv *.txt"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            names = party_names_from_file(path)
+        except Exception as exc:
+            messagebox.showerror("读取失败", str(exc), parent=self)
+            return
+        if not names:
+            messagebox.showinfo("没有可导入的名称", "文件中没有读到非空内容。", parent=self)
+            return
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", "\n".join(names))
+        self._refresh_count()
+        self.status.set(f"已从文件读取 {len(names)} 个名称，可先修改再导入")
+
+    def _import(self) -> None:
+        names = self._names()
+        if not names:
+            messagebox.showinfo("没有可导入的名称", "请先粘贴名称（每行一个）或从文件读取。", parent=self)
+            return
+        added, skipped = 0, 0
+        for name in names:
+            try:
+                self.dialog.parent.store.save_related_party(name, [])
+                added += 1
+            except ValueError:
+                skipped += 1
+        self.dialog._refresh()
+        messagebox.showinfo("导入完成", f"新增 {added} 条，跳过重复或无效 {skipped} 条。", parent=self)
+        self.destroy()
+
 
 class RelatedPartiesDialog(tk.Toplevel):
     def __init__(self, parent: "App"):
@@ -260,7 +399,7 @@ class RelatedPartiesDialog(tk.Toplevel):
         self.transient(parent)
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="名单由用户指定；只对明细中的往来单位、辅助核算名称作精确匹配，不构成法律关系认定。", foreground="#555").pack(anchor="w")
+        ttk.Label(body, text="名单由用户指定；本地对往来单位、辅助核算作精确匹配。AI 审查时名称与别名（不含备注）会随每张凭证发送到 Jev 云端用于识别关联交易，不构成法律关系认定。", foreground="#555", wraplength=600).pack(anchor="w")
         self.view = ttk.Treeview(body, columns=("name", "aliases", "note"), show="headings", height=8)
         for key, title, width in (("name", "名称", 190), ("aliases", "别名", 210), ("note", "备注", 210)):
             self.view.heading(key, text=title)
@@ -282,7 +421,8 @@ class RelatedPartiesDialog(tk.Toplevel):
         buttons = ttk.Frame(body)
         buttons.pack(fill="x", pady=(10, 0))
         ttk.Button(buttons, text="新增", command=self._clear).pack(side="left")
-        ttk.Button(buttons, text="删除所选", command=self._delete).pack(side="left", padx=6)
+        ttk.Button(buttons, text="批量导入", command=lambda: RelatedPartyImportDialog(self)).pack(side="left", padx=6)
+        ttk.Button(buttons, text="删除所选", command=self._delete).pack(side="left")
         ttk.Button(buttons, text="完成", command=self.destroy).pack(side="right")
         ttk.Button(buttons, text="保存", command=self._save).pack(side="right", padx=6)
         self._refresh()
@@ -567,8 +707,8 @@ class ImportDialog(tk.Toplevel):
         self.header = tk.StringVar(value="1")
         self.columns: list[str] = []
         self.vars: dict[str, tk.StringVar] = {}
-        self._jev_queue: Queue = Queue()
-        self._jev_sheet = ""
+        self._ai_queue: Queue = Queue()
+        self._ai_sheet = ""
         self._layout()
         if spec is not None:
             self.kind.set(BatchImportDialog.LABELS[spec.kind])
@@ -604,8 +744,8 @@ class ImportDialog(tk.Toplevel):
         ttk.Label(header_actions, text="表头行号").pack(side="left")
         ttk.Entry(header_actions, textvariable=self.header, width=5).pack(side="left", padx=6)
         ttk.Button(header_actions, text="按行号读取表头", command=lambda: self.refresh_preview(manual=True)).pack(side="left", padx=5)
-        self.jev_button = ttk.Button(header_actions, text="Jev 建议列（可选）", command=self._offer_jev)
-        self.jev_button.pack(side="right")
+        self.ai_button = ttk.Button(header_actions, text="AI 建议列（可选）", command=self._offer_ai)
+        self.ai_button.pack(side="right")
         ttk.Label(top, text="先看原表，再确认每个字段对应的列。〔空〕与原表的 0 分开显示。", foreground="#555").pack(anchor="w", pady=(8, 0))
         self.preview = tk.Text(self, height=5, wrap="none", state="disabled", font="TkFixedFont")
         self.preview.pack(fill="x", padx=12, pady=8)
@@ -627,9 +767,10 @@ class ImportDialog(tk.Toplevel):
         self.map_frame.bind("<Configure>", lambda _event: self.map_canvas.configure(scrollregion=self.map_canvas.bbox("all")))
         self.map_canvas.bind("<Configure>", lambda event: self.map_canvas.itemconfigure(self.map_window, width=event.width))
 
-    def _offer_jev(self) -> None:
+    def _offer_ai(self) -> None:
+        label, suggest, get_key = ai_tools(self.parent.controller)
         try:
-            api_key = get_api_key()
+            api_key = get_key()
             if not api_key:
                 self.grab_release()
                 settings = SettingsDialog(self.parent)
@@ -639,7 +780,7 @@ class ImportDialog(tk.Toplevel):
                 if not self.winfo_exists():
                     return
                 self.grab_set()
-                api_key = get_api_key()
+                api_key = get_key()
                 if not api_key:
                     return
             sheet = self.sheet.get()
@@ -648,35 +789,35 @@ class ImportDialog(tk.Toplevel):
             messagebox.showerror("无法取得建议", str(exc), parent=self)
             return
         description = (
-            f"将工作表“{sheet}”的前 {len(preview['rows'])} 行发送给 Jev；"
+            f"将工作表“{sheet}”的前 {len(preview['rows'])} 行发送给 {label}；"
             "每行最多 20 列，每格最多 60 字。预览可能含主体名称和金额。"
             "不发送整份文件或本地路径。是否继续？"
         )
         if not messagebox.askokcancel("确认发送预览", description, parent=self):
             return
-        self._jev_sheet = sheet
-        self.jev_button.configure(state="disabled", text="Jev 正在分析…")
+        self._ai_sheet = sheet
+        self.ai_button.configure(state="disabled", text=f"{label} 正在分析…")
 
         def worker() -> None:
             try:
-                self._jev_queue.put((True, suggest_mapping(preview, api_key)))
+                self._ai_queue.put((True, suggest(preview, api_key)))
             except Exception as exc:
-                self._jev_queue.put((False, str(exc).replace(api_key, "[密钥已隐藏]")))
+                self._ai_queue.put((False, str(exc).replace(api_key, "[密钥已隐藏]")))
 
         Thread(target=worker, daemon=True).start()
-        self.after(120, self._poll_jev)
+        self.after(120, self._poll_ai)
 
-    def _poll_jev(self) -> None:
+    def _poll_ai(self) -> None:
         try:
-            success, result = self._jev_queue.get_nowait()
+            success, result = self._ai_queue.get_nowait()
         except Empty:
-            self.after(120, self._poll_jev)
+            self.after(120, self._poll_ai)
             return
-        self.jev_button.configure(state="normal", text="Jev 建议列（可选）")
+        self.ai_button.configure(state="normal", text="AI 建议列（可选）")
         if not success:
-            messagebox.showerror("Jev 建议未完成", result, parent=self)
+            messagebox.showerror("AI 建议未完成", result, parent=self)
             return
-        if self.sheet.get() != self._jev_sheet:
+        if self.sheet.get() != self._ai_sheet:
             messagebox.showinfo("工作表已切换", "刚才的建议属于原工作表，未应用到当前表。", parent=self)
             return
         self.kind.set({"entry": "明细账／序时账", "balance": "科目余额表", "balance_sheet": "资产负债表", "income_statement": "利润表"}[result.kind])
@@ -687,9 +828,9 @@ class ImportDialog(tk.Toplevel):
         for field, index in result.mapping.items():
             if field in self.vars and index < len(self.columns):
                 self.vars[field].set(self.columns[index])
-        self.import_note.configure(text="已填入 Jev 建议；请对照原表逐列确认后再导入。")
+        self.import_note.configure(text="已填入 AI 建议；请对照原表逐列确认后再导入。")
         caution = "\n".join(result.warnings[:8]) or "所有建议均需按原表核对，尤其是期间和借贷方向。"
-        messagebox.showinfo("Jev 建议已填入", f"模型：{result.model}。表类型、表头行和列映射已填入下方；请逐项核对后再保存列设置。\n{caution}", parent=self)
+        messagebox.showinfo("AI 建议已填入", f"模型：{result.model}。表类型、表头行和列映射已填入下方；请逐项核对后再保存列设置。\n{caution}", parent=self)
 
     def refresh_preview(self, manual: bool = False) -> None:
         try:
@@ -780,6 +921,11 @@ class BatchImportDialog(tk.Toplevel):
         self.parent = parent
         self.items = []
         self.skipped = []
+        self.manual = set()
+        self.ai_ready = set()
+        self.ai_queue = Queue()
+        self.ai_cancel = Event()
+        self.ai_running = False
         for path in dict.fromkeys(paths):
             try:
                 names = sheet_names(path)
@@ -803,18 +949,29 @@ class BatchImportDialog(tk.Toplevel):
         self.transient(parent)
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="勾选要导入的工作表；双击检查列，或使用 Jev 建议。", foreground="#555").pack(anchor="w")
+        ttk.Label(body, text="勾选要导入的工作表；需要时双击修改列设置。", foreground="#555").pack(anchor="w")
+        self.use_ai = tk.BooleanVar(value=True)
+        self.ai_toggle = ttk.Checkbutton(body, text="使用 AI 为所有勾选的工作表建议列（默认）", variable=self.use_ai,
+                                          command=self._toggle_ai)
+        self.ai_toggle.pack(anchor="w", pady=(9, 0))
+        self.ai_hint = ttk.Label(body, text="导入时一次确认发送范围；AI 只读取每张表的有限预览。", foreground="#555")
+        self.ai_hint.pack(anchor="w", pady=(2, 5))
+        self.ai_progress = ttk.Progressbar(body, mode="determinate")
+        self.ai_status = tk.StringVar(value="")
+        ttk.Label(body, textvariable=self.ai_status, foreground="#555").pack(anchor="w")
         footer = ttk.Frame(body)
         footer.pack(side="bottom", fill="x", pady=(12, 0))
-        ttk.Button(footer, text="取消", command=self.destroy).pack(side="right", padx=(6, 0))
-        ttk.Button(footer, text="导入选中的工作表", command=self._import_selected).pack(side="right")
-        ttk.Button(footer, text="检查列 / Jev 建议…", command=self._edit_current).pack(side="left")
+        self.cancel_button = ttk.Button(footer, text="取消", command=self._close)
+        self.cancel_button.pack(side="right", padx=(6, 0))
+        self.import_button = ttk.Button(footer, text="导入选中的工作表", command=self._import_selected)
+        self.import_button.pack(side="right")
+        self.edit_button = ttk.Button(footer, text="检查／调整列…", command=self._edit_current)
+        self.edit_button.pack(side="left")
         self.view = tree(body, [("selected", "导入", 55), ("file", "文件", 180),
             ("sheet", "工作表", 130), ("kind", "类型", 140), ("state", "列设置", 170)])
         self.selected = set()
-        for index, (_, _, spec) in enumerate(self.items):
-            if spec is not None:
-                self.selected.add(index)
+        for index, _ in enumerate(self.items):
+            self.selected.add(index)
             self._render_item(index)
         self.view.bind("<Button-1>", self._toggle_item)
         self.view.bind("<Double-1>", self._edit_current)
@@ -823,18 +980,34 @@ class BatchImportDialog(tk.Toplevel):
         if self.skipped:
             ttk.Label(body, text="读取失败：" + "；".join(self.skipped), wraplength=730).pack(fill="x")
         self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _close(self):
+        self.jev_cancel.set()
+        self.destroy()
+
+    def _toggle_ai(self):
+        if self.use_ai.get():
+            self.ai_hint.configure(text="导入时一次确认发送范围；AI 只读取每张表的有限预览。", foreground="#555")
+        else:
+            self.ai_hint.configure(text="未使用 AI，自动识别可能有误；可双击工作表手动调整列。", foreground="#995300")
+            messagebox.showinfo("请核对列设置", "未使用 AI 时，自动识别可能有误。导入前可双击工作表，手动调整表头、借贷方向和金额列。", parent=self)
 
     def _render_item(self, index):
         path, sheet, spec = self.items[index]
         values = ("☑" if index in self.selected else "☐", path.name, sheet,
             self.LABELS[spec.kind] if spec else "待确认",
-            f"表头第 {spec.header_row} 行" if spec else "双击设置列（可用 Jev）")
+            f"AI 已建议 · 表头第 {spec.header_row} 行" if index in self.ai_ready else
+            (f"手动设置 · 表头第 {spec.header_row} 行" if index in self.manual else
+             (f"表头第 {spec.header_row} 行" if spec else "待 AI 建议／手动设置")))
         if self.view.exists(str(index)):
             self.view.item(str(index), values=values)
         else:
             self.view.insert('', 'end', iid=str(index), values=values)
 
     def _toggle_item(self, event):
+        if self.ai_running:
+            return
         item = self.view.identify_row(event.y)
         if item and self.view.identify_column(event.x) == '#1':
             index = int(item)
@@ -845,6 +1018,8 @@ class BatchImportDialog(tk.Toplevel):
             self._render_item(index)
 
     def _edit_current(self, event=None):
+        if self.ai_running:
+            return
         if event is not None:
             item = self.view.identify_row(event.y)
             if not item or self.view.identify_column(event.x) == '#1':
@@ -859,6 +1034,8 @@ class BatchImportDialog(tk.Toplevel):
         def save(updated):
             self.items[index] = (path, sheet, updated)
             self.selected.add(index)
+            self.manual.add(index)
+            self.ai_ready.discard(index)
             self._render_item(index)
         editor = ImportDialog(self.parent, path, spec=spec, sheet_name=sheet, on_save=save)
         editor.transient(self)
@@ -868,8 +1045,109 @@ class BatchImportDialog(tk.Toplevel):
         editor.bind('<Destroy>', restore, add='+')
 
     def _import_selected(self) -> None:
+        if self.ai_running:
+            return
+        if not self.selected:
+            messagebox.showinfo("未选择表", "请至少勾选一个工作表。", parent=self)
+            return
+        if self.use_ai.get():
+            pending = [i for i in sorted(self.selected) if i not in self.manual | self.ai_ready]
+            if pending:
+                label, suggest, get_key = ai_tools(self.parent.controller)
+                api_key = get_key()
+                if not api_key:
+                    self.grab_release()
+                    settings = SettingsDialog(self.parent)
+                    settings.lift()
+                    settings.grab_set()
+                    self.wait_window(settings)
+                    if not self.winfo_exists():
+                        return
+                    self.grab_set()
+                    api_key = get_key()
+                    if not api_key:
+                        self.ai_status.set(f"尚未设置 {label} 密钥；可取消勾选 AI 后手动核对列。")
+                        return
+                description = (f"将 {len(pending)} 张工作表的预览发送给 {label}，用于建议表类型、表头和列。\n"
+                    "每张表最多前 20 行、每行前 20 列、每格最多 60 字；可能包含名称和金额。"
+                    "不发送整份文件或本地路径。是否继续？")
+                if not messagebox.askokcancel("确认批量发送预览", description, parent=self):
+                    return
+                self._start_ai(pending, api_key, suggest, label)
+                return
+        self._import_ready()
+
+    def _start_ai(self, pending, api_key, suggest, label):
+        self.ai_running = True
+        self.ai_cancel.clear()
+        self.import_button.configure(state="disabled")
+        self.edit_button.configure(state="disabled")
+        self.ai_toggle.configure(state="disabled")
+        self.ai_progress.configure(maximum=len(pending), value=0)
+        self.ai_progress.pack(fill="x", pady=(2, 5))
+        self.ai_status.set(f"{label} 正在建议列：0 / {len(pending)}")
+
+        def worker():
+            for index in pending:
+                if self.ai_cancel.is_set():
+                    return
+                path, sheet, _ = self.items[index]
+                try:
+                    result = suggest(preview_sheet(path, sheet), api_key)
+                    if result.kind not in self.LABELS:
+                        raise ValueError("未识别表类型")
+                    spec = ImportSpec(path, sheet, result.header_row, result.kind, result.mapping)
+                    spec.validate()
+                    headers = header_for_row(path, sheet, result.header_row, result.kind)
+                    if not headers or any(column >= len(headers) or column < 0 for column in result.mapping.values()):
+                        raise ValueError("建议列超出工作表范围")
+                    self.ai_queue.put((index, spec, result.warnings, None))
+                except Exception as exc:
+                    self.ai_queue.put((index, None, (), str(exc).replace(api_key, "[密钥已隐藏]")))
+            self.ai_queue.put((None, None, (), None))
+
+        Thread(target=worker, daemon=True).start()
+        self.after(120, self._poll_ai_batch, len(pending), 0, [], label)
+
+    def _poll_ai_batch(self, total, done, problems, label="Jev"):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                index, spec, warnings, error = self.ai_queue.get_nowait()
+                if index is None:
+                    self.ai_running = False
+                    self.import_button.configure(state="normal")
+                    self.edit_button.configure(state="normal")
+                    self.ai_toggle.configure(state="normal")
+                    self.ai_progress.pack_forget()
+                    if problems:
+                        self.ai_status.set(f"{label} 已处理 {done} 张；请检查提示后重试或手动调整。")
+                        messagebox.showwarning("列建议需要核对", "\n".join(problems[:12]), parent=self)
+                    else:
+                        self.ai_status.set(f"{label} 已完成 {done} 张工作表的列建议。")
+                        self._import_ready()
+                    return
+                done += 1
+                if error:
+                    path, sheet, _ = self.items[index]
+                    problems.append(f"{path.name}/{sheet}：{error}")
+                    self.view.set(str(index), "state", "AI 失败，需重试或手动设置")
+                else:
+                    path, sheet, _ = self.items[index]
+                    self.items[index] = (path, sheet, spec)
+                    self.ai_ready.add(index)
+                    self._render_item(index)
+                    if warnings:
+                        problems.append(f"{path.name}/{sheet}：" + "；".join(warnings[:3]))
+                self.ai_progress.configure(value=done)
+                self.ai_status.set(f"{label} 正在建议列：{done} / {total}")
+        except Empty:
+            self.after(120, self._poll_ai_batch, total, done, problems, label)
+
+    def _import_ready(self) -> None:
         if any(self.items[index][2] is None for index in self.selected):
-            messagebox.showinfo("请确认列设置", "选中的表包含未识别项，请双击设置列，或取消勾选。", parent=self)
+            messagebox.showinfo("请确认列设置", "选中的表包含未识别项，请双击手动调整列，或取消勾选。", parent=self)
             return
         selected = [self.items[index][2] for index in sorted(self.selected)]
         if not selected:
@@ -990,8 +1268,9 @@ class App(tk.Toplevel):
         self.detail_info = tk.StringVar()
         self.mark_search = tk.StringVar()
         self.mark_keys: dict[str, str] = {}
+        self.mark_entry_ids: dict[str, int | None] = {}
         self.selected_mark_key: str | None = None
-        self.status = tk.StringVar(value="从“文件”导入表格即可开始；自动新建账套，保存位置可在“设置”调整。")
+        self.status = tk.StringVar(value="从“文件”导入表格即可开始；新建账套前可选择保存位置。")
         self.column_views: dict[str, list[ttk.Treeview]] = {kind: [] for kind in VIEW_COLUMNS}
         self.voucher_windows: set[tk.Toplevel] = set()
         self._layout()
@@ -1035,7 +1314,9 @@ class App(tk.Toplevel):
         ttk.Button(summary_search_row, text="清除", command=self.clear_summary_filter).pack(side="left", padx=5)
         balance_top = ttk.Frame(frames[0], padding=5)
         balance_top.pack(fill="x")
-        ttk.Label(balance_top, text="双击科目查看明细；点击 ▸ 展开子科目。", style="Hint.TLabel").pack(side="left")
+        ttk.Label(balance_top, text="双击科目查看明细；点击“展开／收起”打开子科目。", style="Hint.TLabel").pack(side="left")
+        ttk.Button(balance_top, text="全部展开", command=lambda: self.set_expansion(True)).pack(side="left", padx=(12, 4))
+        ttk.Button(balance_top, text="全部收起", command=lambda: self.set_expansion(False)).pack(side="left")
         summary_more = ttk.Menubutton(balance_top, text="更多 ▾")
         summary_more.pack(side="right")
         summary_menu = tk.Menu(summary_more, tearoff=False)
@@ -1050,8 +1331,8 @@ class App(tk.Toplevel):
         self.summary_view.column("#0", width=120, minwidth=100, stretch=False)
         self._register_column_view("balance", self.summary_view)
         self.summary_view.bind("<Button-1>", self.toggle_account)
-        self.summary_view.bind("<<TreeviewOpen>>", lambda _e: self.after_idle(self._expansion_labels))
-        self.summary_view.bind("<<TreeviewClose>>", lambda _e: self.after_idle(self._expansion_labels))
+        self.summary_view.bind("<<TreeviewOpen>>", self._after_expansion_change)
+        self.summary_view.bind("<<TreeviewClose>>", self._after_expansion_change)
         self.summary_view.bind("<Double-1>", self.open_account)
         detail_top = ttk.Frame(frames[1], padding=5)
         detail_top.pack(fill="x")
@@ -1131,13 +1412,15 @@ class App(tk.Toplevel):
         ttk.Button(mark_search_row, text="筛选", command=self.refresh_marks).pack(side="left")
         mark_actions = ttk.Frame(mark_top)
         mark_actions.pack(fill="x", pady=(5, 0))
-        ttk.Label(mark_actions, text="选中凭证即可在下方修改注释。", style="Hint.TLabel").pack(side="left")
+        ttk.Label(mark_actions, text="双击或点“打开凭证”查看原凭证；选中后可在下方修改注释。", style="Hint.TLabel").pack(side="left")
+        ttk.Button(mark_actions, text="打开凭证", command=self.open_selected_mark_voucher).pack(side="left", padx=5)
         ttk.Button(mark_actions, text="取消关注", command=self.remove_selected_mark).pack(side="left", padx=5)
         ttk.Button(mark_actions, text="确认变更凭证", command=self.confirm_selected_mark).pack(side="left", padx=5)
         ttk.Button(mark_actions, text="另存为 MD", command=lambda: self.export_marks(as_new=True)).pack(side="right")
         ttk.Button(mark_actions, text="更新关注凭证 MD", command=self.export_marks, style="Accent.TButton").pack(side="right", padx=5)
         self.mark_view = tree(frames[6], [("status", "状态", 85), ("voucher", "凭证", 175), ("accounts", "涉及科目", 275), ("note", "注释摘要", 360)])
         self.mark_view.bind("<<TreeviewSelect>>", self._load_selected_mark)
+        self.mark_view.bind("<Double-1>", self.open_selected_mark_voucher)
         note_frame = ttk.Frame(frames[6], padding=(6, 6))
         note_frame.pack(fill="x")
         ttk.Label(note_frame, text="注释").pack(anchor="w")
@@ -1285,22 +1568,41 @@ class App(tk.Toplevel):
             if not self.store:
                 try:
                     folder = self.controller.book_folder
-                    folder.mkdir(parents=True, exist_ok=True)
+                    try:
+                        folder.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        folder = next((candidate for candidate in (folder, *folder.parents) if candidate.is_dir()), Path.home())
                     name = Path(chosen[0]).stem[:80] or "新账套"
                     index = 1
+                    while (folder / f"{name}{'' if index == 1 else '-' + str(index)}.sqlite").exists():
+                        index += 1
+                    default_name = f"{name}{'' if index == 1 else '-' + str(index)}.sqlite"
                     while True:
-                        path = folder / f"{name}{'' if index == 1 else '-' + str(index)}.sqlite"
-                        try:
-                            path.touch(exist_ok=False)
-                            break
-                        except FileExistsError:
-                            index += 1
+                        chosen_book = filedialog.asksaveasfilename(
+                            parent=self, title="新账套保存在哪里？可在此调整文件夹和名称",
+                            initialdir=str(folder), initialfile=default_name,
+                            defaultextension=".sqlite", filetypes=[("账套文件", "*.sqlite")])
+                        if not chosen_book:
+                            return
+                        path = Path(chosen_book).expanduser()
+                        if path.suffix.lower() != ".sqlite":
+                            messagebox.showerror("文件格式不对", "账套文件名请以 .sqlite 结尾。", parent=self)
+                            continue
+                        if path.exists():
+                            messagebox.showerror("账套已存在", "请选择其他文件名；已有账套请用“打开账套”。", parent=self)
+                            folder, default_name = path.parent, path.name
+                            continue
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.touch(exist_ok=False)
+                        break
                     self.controller.open_book(path, self)
                 except OSError as exc:
-                    messagebox.showerror("无法新建账套", f"{exc}\n可在“设置 → 新账套默认文件夹”调整保存位置。", parent=self)
+                    messagebox.showerror("无法新建账套", f"{exc}\n请在保存窗口选择其他位置。", parent=self)
                     return
                 if not self.store:
                     return
+                self.controller.preferences['book_folder'] = str(path.parent.resolve())
+                self.controller._save_preferences()
             BatchImportDialog(self, [Path(path) for path in chosen])
 
     def choose_book_folder(self) -> None:
@@ -1350,6 +1652,7 @@ class App(tk.Toplevel):
     def refresh_marks(self, select_key: str | None = None) -> None:
         self.mark_view.delete(*self.mark_view.get_children())
         self.mark_keys = {}
+        self.mark_entry_ids = {}
         self.selected_mark_key = None
         self.mark_note.delete("1.0", "end")
         if not self.store:
@@ -1367,11 +1670,23 @@ class App(tk.Toplevel):
                 continue
             iid = str(index)
             self.mark_keys[iid] = mark["key"]
+            self.mark_entry_ids[iid] = lines[0]["id"] if lines else None
             self.mark_view.insert("", "end", iid=iid, values=(mark["status"], label, accounts, mark["note"].replace("\n", " ")[:160]))
             if mark["key"] == select_key:
                 self.mark_view.selection_set(iid)
                 self.mark_view.see(iid)
                 self._load_selected_mark()
+
+    def open_selected_mark_voucher(self, _event: object = None) -> None:
+        selection = self.mark_view.selection()
+        if not selection:
+            messagebox.showinfo("请选择凭证", "请先在关注凭证列表中选中一张凭证。", parent=self)
+            return
+        entry_id = self.mark_entry_ids.get(selection[0])
+        if entry_id is None:
+            messagebox.showinfo("无法打开", "原凭证已无法匹配（明细可能被重新导入），请在明细账中重新关注。", parent=self)
+            return
+        self.open_voucher(None, entry_id=entry_id)
 
     def _selected_mark_key(self) -> str | None:
         selection = self.mark_view.selection()
@@ -1607,8 +1922,11 @@ class App(tk.Toplevel):
         suggestions = {"货币资金": {"库存现金", "现金", "银行存款", "其他货币资金"},
                        "营业收入": {"主营业务收入", "其他业务收入"},
                        "营业成本": {"主营业务成本", "其他业务成本"}}
-        suggested = exact or [account["key"] for account in accounts if account["name"] in suggestions.get(name, set())]
-        ReportAccountsDialog(self, label, accounts, suggested)
+        suggested = sorted(set(exact) | {account["key"] for account in accounts if account["name"] in suggestions.get(name, set())})
+        if suggested:
+            self.show_report_accounts(suggested, label)
+            return
+        ReportAccountsDialog(self, label, accounts, [])
 
     def show_report_accounts(self, keys: list[str], label: str, include_descendants: bool = True) -> None:
         self.account = keys
@@ -1664,7 +1982,26 @@ class App(tk.Toplevel):
             view.focus(item)
             view.item(item, open=not view.item(item, 'open'))
             self._expansion_labels()
+            self._save_expansion()
             return 'break'
+
+    def _after_expansion_change(self, _event: object = None) -> None:
+        self.after_idle(self._expansion_labels)
+        self.after_idle(self._save_expansion)
+
+    def _save_expansion(self) -> None:
+        """Persist which rows are open so refreshes and restarts keep the view."""
+        if not self.store:
+            return
+        expanded = []
+        def visit(parent: str = "") -> None:
+            for item in self.summary_view.get_children(parent):
+                if self.summary_view.item(item, "open"):
+                    expanded.append(item)
+                visit(item)
+        visit()
+        self.store.save_setting("expanded_accounts", json.dumps(expanded, ensure_ascii=False))
+        self.store.save_setting("account_expansion_mode", "custom")
 
     def _expansion_labels(self):
         def visit(parent=''):
@@ -1689,16 +2026,8 @@ class App(tk.Toplevel):
     def remember_expansion(self) -> None:
         if not self.store:
             return
-        expanded = []
-        def visit(parent: str = "") -> None:
-            for item in self.summary_view.get_children(parent):
-                if self.summary_view.item(item, "open"):
-                    expanded.append(item)
-                visit(item)
-        visit()
-        self.store.save_setting("expanded_accounts", json.dumps(expanded, ensure_ascii=False))
-        self.store.save_setting("account_expansion_mode", "custom")
-        self.status.set("已记住当前展开的科目。")
+        self._save_expansion()
+        self.status.set("已记住当前展开的科目；刷新或重启后仍保持。")
 
     def open_voucher(self, _event: object, entry_id: int | None = None) -> None:
         if not self.store:
@@ -1820,6 +2149,9 @@ class Application(tk.Tk):
         if self.scroll_mode not in ("system", "gentle", "quick"):
             self.scroll_mode = "system"
         self.show_grid = self.preferences.get("show_grid", True) is not False
+        self.ai_provider = self.preferences.get("ai_provider", "jev")
+        if self.ai_provider not in PROVIDER_LABELS:
+            self.ai_provider = "jev"
         self.font_size = default_size
         self.set_font_size(saved_size, persist=False)
         self.withdraw()
@@ -1878,6 +2210,13 @@ class Application(tk.Tk):
         if mode not in ("system", "gentle", "quick"):
             raise ValueError("未知滚动速度")
         self.scroll_mode = mode
+        self._save_preferences()
+
+    def set_ai_provider(self, provider: str) -> None:
+        if provider not in PROVIDER_LABELS:
+            raise ValueError("未知的 AI 建议模型")
+        self.preferences["ai_provider"] = provider
+        self.ai_provider = provider
         self._save_preferences()
 
     def set_grid_lines(self, enabled: bool) -> None:

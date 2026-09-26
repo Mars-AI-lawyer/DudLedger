@@ -36,6 +36,7 @@ class SimplifiedUITest(unittest.TestCase):
         balance.append(['资产', '期末余额', '负债和所有者权益', '期末余额'])
         balance.append(['银行存款', 102, '应付账款', 30])
         balance.append(['货币资金', 102, None, None])
+        balance.append(['无形资产', 0, None, None])
         income = book.create_sheet('利润表')
         income.append(['项目名称', '本期金额'])
         income.append(['一、主营业务收入', 72])
@@ -78,11 +79,10 @@ class SimplifiedUITest(unittest.TestCase):
         self.assertEqual(self.shown_codes(), ['6001'])
         self.assertEqual(self.app.tabs.tab(self.app.tabs.select(), 'text'), '明细账')
 
-    def test_aggregate_requires_choice_and_explicit_mapping_is_used(self):
+    def test_suggested_and_explicit_mappings_jump_directly_and_unknown_opens_picker(self):
         self.click_report('balance_sheet', 3, 'left_item')
-        picker = next(w for w in self.app.winfo_children() if isinstance(w, ReportAccountsDialog))
-        self.assertEqual(picker.chosen, {'C:1002'})
-        picker.destroy()
+        self.assertEqual(self.shown_codes(), ['1002', '100201'])
+        self.assertTrue(self.app.include_descendants)
         source_id = self.app.report_options['balance_sheet'][self.app.report_source['balance_sheet'].get()]
         self.store.save_setting('reconciliation_plan', json.dumps({'mappings': [
             {'kind': 'balance_sheet', 'source_id': source_id, 'row_no': 3, 'side': 'left', 'accounts': ['C:1002', 'C:100201']}
@@ -90,6 +90,10 @@ class SimplifiedUITest(unittest.TestCase):
         self.click_report('balance_sheet', 3, 'left_item')
         self.assertEqual(self.shown_codes(), ['1002', '100201'])
         self.assertFalse(self.app.include_descendants)
+        self.click_report('balance_sheet', 4, 'left_item')
+        picker = next(w for w in self.app.winfo_children() if isinstance(w, ReportAccountsDialog))
+        self.assertEqual(picker.chosen, set())
+        picker.destroy()
 
     def test_numeric_sort_filters_and_export_match(self):
         self.app.show_report_accounts(['C:1002', 'C:100201'], '选中科目')

@@ -22,10 +22,10 @@ class ImportDialogTest(unittest.TestCase):
                 app.set_font_size(20, persist=False)
                 dialog = ImportDialog(next(iter(app.windows)), path)
                 app.update()
-                self.assertTrue(dialog.jev_button.winfo_ismapped())
-                self.assertLess(dialog.jev_button.winfo_rooty(), dialog.map_canvas.winfo_rooty())
+                self.assertTrue(dialog.ai_button.winfo_ismapped())
+                self.assertLess(dialog.ai_button.winfo_rooty(), dialog.map_canvas.winfo_rooty())
                 self.assertLess(
-                    dialog.jev_button.winfo_rooty() + dialog.jev_button.winfo_height(),
+                    dialog.ai_button.winfo_rooty() + dialog.ai_button.winfo_height(),
                     app.winfo_screenheight() - 20,
                 )
                 buttons = [
@@ -49,29 +49,30 @@ class ImportDialogTest(unittest.TestCase):
             unknown.write_text('编号,名称,增加,减少\n2241,其他应付款,0,10\n', encoding='utf-8')
             app = Application()
             window = next(iter(app.windows))
+            app.ai_provider = 'jev'
             try:
                 window._use_book(base / 'book.sqlite')
                 with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(known), str(unknown))):
                     window.import_file()
                 dialog = next(w for w in window.winfo_children() if isinstance(w, BatchImportDialog))
                 self.assertEqual(len(dialog.items), 2)
-                self.assertEqual(dialog.selected, {0})
+                self.assertEqual(dialog.selected, {0, 1})
                 dialog.view.selection_set('1')
                 dialog._edit_current()
                 editor = next(w for w in window.winfo_children() if isinstance(w, ImportDialog))
                 app.update()
-                self.assertTrue(editor.jev_button.winfo_ismapped())
+                self.assertTrue(editor.ai_button.winfo_ismapped())
                 suggestion = SimpleNamespace(kind='entry', header_row=1,
                     mapping={'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3}, warnings=[], model='fake')
                 with patch('ledger_viewer.ui.get_api_key', return_value='fake-key'), \
                      patch('ledger_viewer.ui.messagebox.askokcancel', return_value=True), \
                      patch('ledger_viewer.ui.suggest_mapping', return_value=suggestion) as suggest, \
                      patch('ledger_viewer.ui.messagebox.showinfo'):
-                    editor._offer_jev()
+                    editor._offer_ai()
                     # Wait for the simulated response without sending any data.
                     import time
                     deadline = time.monotonic() + 3
-                    while str(editor.jev_button['state']) == 'disabled' and time.monotonic() < deadline:
+                    while str(editor.ai_button['state']) == 'disabled' and time.monotonic() < deadline:
                         app.update()
                         time.sleep(0.02)
                     suggest.assert_called_once()
@@ -84,11 +85,114 @@ class ImportDialogTest(unittest.TestCase):
                 editor = next(w for w in window.winfo_children() if isinstance(w, ImportDialog))
                 self.assertEqual(editor.vars['credit'].get(), editor.columns[3])
                 editor.destroy()
-                with patch('ledger_viewer.ui.messagebox.showinfo'):
+                with patch('ledger_viewer.ui.messagebox.showinfo'), patch('ledger_viewer.ui.suggest_mapping') as suggest:
+                    dialog.use_ai.set(False)
                     dialog._import_selected()
+                    suggest.assert_not_called()
                 self.assertEqual(len(window.store.sources()), 2)
                 rows = window.store.db.execute('SELECT debit_cents,credit_cents FROM entries ORDER BY id').fetchall()
                 self.assertEqual([tuple(row) for row in rows], [(1000, 0), (0, 1000)])
+            finally:
+                window._close()
+
+    def test_default_jev_applies_to_every_sheet_after_one_confirmation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            first = base / '一.csv'
+            second = base / '二.csv'
+            first.write_text('编号,名称,增加,减少\n1002,银行存款,10,0\n', encoding='utf-8')
+            second.write_text('编号,名称,增加,减少\n2241,其他应付款,0,10\n', encoding='utf-8')
+            app = Application()
+            window = next(iter(app.windows))
+            app.ai_provider = 'jev'
+            try:
+                window._use_book(base / 'book.sqlite')
+                dialog = BatchImportDialog(window, [first, second])
+                self.assertTrue(dialog.use_ai.get())
+                self.assertEqual(dialog.selected, {0, 1})
+                suggestion = SimpleNamespace(kind='entry', header_row=1,
+                    mapping={'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3}, warnings=[], model='fake')
+                with patch('ledger_viewer.ui.get_api_key', return_value='fake-key'), \
+                     patch('ledger_viewer.ui.messagebox.askokcancel', return_value=True) as consent, \
+                     patch('ledger_viewer.ui.suggest_mapping', return_value=suggestion) as suggest, \
+                     patch('ledger_viewer.ui.messagebox.showinfo'):
+                    dialog._import_selected()
+                    import time
+                    deadline = time.monotonic() + 5
+                    while dialog.winfo_exists() and time.monotonic() < deadline:
+                        app.update()
+                        time.sleep(0.02)
+                self.assertFalse(dialog.winfo_exists())
+                consent.assert_called_once()
+                self.assertEqual(suggest.call_count, 2)
+                self.assertEqual(len(window.store.sources()), 2)
+                self.assertEqual(window.store.db.execute('SELECT COUNT(*) FROM entries').fetchone()[0], 2)
+            finally:
+                window._close()
+
+    def test_jev_warning_pauses_import_for_review(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source = base / '账.csv'
+            source.write_text('编号,名称,增加,减少\n1002,银行存款,10,0\n', encoding='utf-8')
+            app = Application()
+            window = next(iter(app.windows))
+            app.ai_provider = 'jev'
+            try:
+                window._use_book(base / 'book.sqlite')
+                dialog = BatchImportDialog(window, [source])
+                suggestion = SimpleNamespace(kind='entry', header_row=1,
+                    mapping={'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3},
+                    warnings=('借贷列请重点核对',), model='fake')
+                with patch('ledger_viewer.ui.get_api_key', return_value='fake-key'), \
+                     patch('ledger_viewer.ui.messagebox.askokcancel', return_value=True), \
+                     patch('ledger_viewer.ui.suggest_mapping', return_value=suggestion) as suggest, \
+                     patch('ledger_viewer.ui.messagebox.showwarning') as warning, \
+                     patch('ledger_viewer.ui.messagebox.showinfo'):
+                    dialog._import_selected()
+                    import time
+                    deadline = time.monotonic() + 5
+                    while dialog.ai_running and time.monotonic() < deadline:
+                        app.update()
+                        time.sleep(0.02)
+                    self.assertEqual(window.store.sources(), [])
+                    warning.assert_called_once()
+                    dialog._import_selected()
+                suggest.assert_called_once()
+                self.assertFalse(dialog.winfo_exists())
+                self.assertEqual(len(window.store.sources()), 1)
+            finally:
+                window._close()
+
+    def test_deepseek_provider_is_used_when_selected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source = base / '账.csv'
+            source.write_text('编号,名称,增加,减少\n1002,银行存款,10,0\n', encoding='utf-8')
+            app = Application()
+            window = next(iter(app.windows))
+            try:
+                app.ai_provider = 'deepseek'
+                window._use_book(base / 'book.sqlite')
+                dialog = BatchImportDialog(window, [source])
+                suggestion = SimpleNamespace(kind='entry', header_row=1,
+                    mapping={'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3}, warnings=[], model='deepseek-flash')
+                with patch('ledger_viewer.ui.deepseek_get_api_key', return_value='sk-fake'), \
+                     patch('ledger_viewer.ui.deepseek_suggest_mapping', return_value=suggestion) as suggest, \
+                     patch('ledger_viewer.ui.messagebox.askokcancel', return_value=True) as consent, \
+                     patch('ledger_viewer.ui.messagebox.showinfo'):
+                    dialog._import_selected()
+                    import time
+                    deadline = time.monotonic() + 5
+                    while dialog.winfo_exists() and time.monotonic() < deadline:
+                        app.update()
+                        time.sleep(0.02)
+                self.assertFalse(dialog.winfo_exists())
+                consent.assert_called_once()
+                self.assertIn('DeepSeek', consent.call_args.args[1])
+                suggest.assert_called_once()
+                self.assertEqual(len(window.store.sources()), 1)
+                self.assertEqual(window.store.db.execute('SELECT COUNT(*) FROM entries').fetchone()[0], 1)
             finally:
                 window._close()
 
