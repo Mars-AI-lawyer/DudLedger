@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import tkinter as tk
@@ -16,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import __version__
 from .checks import run_checks
 from .grid_lines import DashedGrid
-from .importer import REPORT_KINDS, ImportSpec, classify_sheet, discover_sheets, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
+from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_sheet, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
 from .jev_mapping import delete_api_key, get_api_key, key_memory_only, preview_sheet, save_api_key, suggest_mapping
 from .reconciliation import empty_plan, load_plan, save_plan
 from .related_parties import related_party_match
@@ -46,8 +47,8 @@ VIEW_COLUMNS = {
 }
 
 DEFAULT_COLUMNS = {
-    "balance": [key for key, _, _ in VIEW_COLUMNS["balance"]],
-    "detail": ["marked", "date", "period", "voucher", "code", "name", "summary", "counterparty", "related", "debit", "credit", "source"],
+    "balance": ["code", "name", "pd", "pc", "cd", "cc", "n"],
+    "detail": ["marked", "date", "voucher", "name", "summary", "counterparty", "debit", "credit"],
     "voucher": ["code", "name", "summary", "debit", "credit", "source"],
 }
 
@@ -550,17 +551,18 @@ class ReconciliationDialog(tk.Toplevel):
 
 
 class ImportDialog(tk.Toplevel):
-    def __init__(self, parent: "App", path: Path):
+    def __init__(self, parent: "App", path: Path, *, spec=None, sheet_name=None, on_save=None):
         super().__init__(parent)
         self.parent = parent
         self.path = path
+        self.on_save = on_save
         self.title("导入资料 · 核对每列含义")
         width = min(960, max(600, self.winfo_screenwidth() - 80))
         height = min(780, max(500, self.winfo_screenheight() - 150))
         self.geometry(f"{width}x{height}")
         self.transient(parent)
         self.grab_set()
-        self.sheet = tk.StringVar(value=sheet_names(path)[0])
+        self.sheet = tk.StringVar(value=sheet_name or sheet_names(path)[0])
         self.kind = tk.StringVar(value="明细账／序时账")
         self.header = tk.StringVar(value="1")
         self.columns: list[str] = []
@@ -568,8 +570,15 @@ class ImportDialog(tk.Toplevel):
         self._jev_queue: Queue = Queue()
         self._jev_sheet = ""
         self._layout()
-        self._auto_kind_for_sheet()
-        self.refresh_preview()
+        if spec is not None:
+            self.kind.set(BatchImportDialog.LABELS[spec.kind])
+            self.header.set(str(spec.header_row))
+            self.refresh_preview(manual=True)
+            for field, variable in self.vars.items():
+                variable.set(self.columns[spec.mapping[field]] if field in spec.mapping else "不导入")
+        else:
+            self._auto_kind_for_sheet()
+            self.refresh_preview(manual=on_save is not None)
 
     def _auto_kind_for_sheet(self) -> None:
         spec = classify_sheet(self.path, self.sheet.get())
@@ -583,7 +592,7 @@ class ImportDialog(tk.Toplevel):
         row = ttk.Frame(top)
         row.pack(fill="x")
         ttk.Label(row, text="工作表").pack(side="left")
-        sheet = ttk.Combobox(row, textvariable=self.sheet, values=sheet_names(self.path), state="readonly", width=25)
+        sheet = ttk.Combobox(row, textvariable=self.sheet, values=sheet_names(self.path), state="disabled" if self.on_save else "readonly", width=25)
         sheet.pack(side="left", padx=(6, 18))
         sheet.bind("<<ComboboxSelected>>", lambda _e: (self._auto_kind_for_sheet(), self.refresh_preview()))
         ttk.Label(row, text="表类型").pack(side="left")
@@ -605,7 +614,7 @@ class ImportDialog(tk.Toplevel):
         self.import_note = ttk.Label(bottom, text="账簿空白/小计行会跳过；请确认借贷列不是余额列。", foreground="#995300")
         self.import_note.pack(side="left")
         ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right", padx=4)
-        ttk.Button(bottom, text="确认并导入", command=self.import_now).pack(side="right", padx=4)
+        ttk.Button(bottom, text="保存列设置" if self.on_save else "确认并导入", command=self.import_now).pack(side="right", padx=4)
         map_holder = ttk.Frame(self)
         map_holder.pack(fill="both", expand=True, padx=12, pady=4)
         self.map_canvas = tk.Canvas(map_holder, highlightthickness=0, background="#F7F5F1")
@@ -680,7 +689,7 @@ class ImportDialog(tk.Toplevel):
                 self.vars[field].set(self.columns[index])
         self.import_note.configure(text="已填入 Jev 建议；请对照原表逐列确认后再导入。")
         caution = "\n".join(result.warnings[:8]) or "所有建议均需按原表核对，尤其是期间和借贷方向。"
-        messagebox.showinfo("Jev 建议已填入", f"模型：{result.model}。表类型、表头行和列映射已填入下方；请逐项核对后再点“确认并导入”。\n{caution}", parent=self)
+        messagebox.showinfo("Jev 建议已填入", f"模型：{result.model}。表类型、表头行和列映射已填入下方；请逐项核对后再保存列设置。\n{caution}", parent=self)
 
     def refresh_preview(self, manual: bool = False) -> None:
         try:
@@ -739,6 +748,11 @@ class ImportDialog(tk.Toplevel):
         try:
             mapping = {field: self.columns.index(var.get()) for field, var in self.vars.items() if var.get() != "不导入"}
             spec = ImportSpec(self.path, self.sheet.get(), int(self.header.get()), self.kind_code(), mapping)
+            spec.validate()
+            if self.on_save:
+                self.on_save(spec)
+                self.destroy()
+                return
             count = self.parent.store.import_sheet(spec)
         except sqlite3.IntegrityError:
             if not messagebox.askyesno("重新导入", "同一来源工作表已有导入记录。是否用当前列映射替换旧导入记录？原始 Excel 不会修改。", parent=self):
@@ -754,7 +768,7 @@ class ImportDialog(tk.Toplevel):
         self.destroy()
         self.parent.refresh_all()
         differences = sum(item.level == "差异" for item in run_checks(self.parent.store))
-        tail = f"发现 {differences} 项差异，请查看“核对提醒”页。" if differences else "没有发现已确认口径下的金额差异；待核事项请查看“核对提醒”页。"
+        tail = f"发现 {differences} 项差异，请从顶部“查看”菜单打开“核对提醒”。" if differences else "没有发现已确认口径下的金额差异；待核事项请从顶部“查看”菜单打开“核对提醒”。"
         messagebox.showinfo("导入完成", f"成功导入 {count} 行；{tail}", parent=self.parent)
 
 
@@ -764,34 +778,102 @@ class BatchImportDialog(tk.Toplevel):
     def __init__(self, parent: "App", paths: list[Path]):
         super().__init__(parent)
         self.parent = parent
-        self.specs, self.skipped = discover_sheets(paths)
-        self.title("批量导入 · 确认自动分类")
-        self.geometry("760x470")
+        self.items = []
+        self.skipped = []
+        for path in dict.fromkeys(paths):
+            try:
+                names = sheet_names(path)
+            except Exception as exc:
+                self.skipped.append(f"{path.name}：{exc}")
+                continue
+            for sheet in names:
+                try:
+                    if is_cashflow_sheet(path, sheet):
+                        continue
+                    spec = classify_sheet(path, sheet)
+                except Exception:
+                    spec = None
+                self.items.append((path, sheet, spec))
+        if not self.items and not self.skipped:
+            self.destroy()
+            return
+        self.title("导入表格 · 可选择一个或多个文件")
+        self.geometry("820x520")
+        self.minsize(650, 420)
         self.transient(parent)
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="已按工作表名称和表头自动分类。点击条目可取消或重新选择；未确认的表不会自动导入。", foreground="#555").pack(anchor="w")
-        self.listbox = tk.Listbox(body, selectmode="multiple", exportselection=False, height=11)
-        self.listbox.pack(fill="both", expand=True, pady=(8, 0))
-        for index, spec in enumerate(self.specs):
-            self.listbox.insert("end", f'{self.LABELS[spec.kind]}  ·  {spec.path.name}/{spec.sheet}  ·  表头第 {spec.header_row} 行')
-            self.listbox.selection_set(index)
-        if self.skipped:
-            ttk.Label(body, text="待单独核对（不自动导入）：", foreground="#995300").pack(anchor="w", pady=(10, 0))
-            skipped_view = tk.Text(body, height=min(5, len(self.skipped)), wrap="word", font="TkTextFont")
-            skipped_view.pack(fill="x")
-            skipped_view.insert("1.0", "\n".join(self.skipped))
-            skipped_view.configure(state="disabled")
+        ttk.Label(body, text="勾选要导入的工作表；双击检查列，或使用 Jev 建议。", foreground="#555").pack(anchor="w")
         footer = ttk.Frame(body)
-        footer.pack(fill="x", pady=(12, 0))
+        footer.pack(side="bottom", fill="x", pady=(12, 0))
         ttk.Button(footer, text="取消", command=self.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(footer, text="导入选中的工作表", command=self._import_selected).pack(side="right")
+        ttk.Button(footer, text="检查列 / Jev 建议…", command=self._edit_current).pack(side="left")
+        self.view = tree(body, [("selected", "导入", 55), ("file", "文件", 180),
+            ("sheet", "工作表", 130), ("kind", "类型", 140), ("state", "列设置", 170)])
+        self.selected = set()
+        for index, (_, _, spec) in enumerate(self.items):
+            if spec is not None:
+                self.selected.add(index)
+            self._render_item(index)
+        self.view.bind("<Button-1>", self._toggle_item)
+        self.view.bind("<Double-1>", self._edit_current)
+        if self.items:
+            self.view.selection_set('0')
+        if self.skipped:
+            ttk.Label(body, text="读取失败：" + "；".join(self.skipped), wraplength=730).pack(fill="x")
         self.grab_set()
 
+    def _render_item(self, index):
+        path, sheet, spec = self.items[index]
+        values = ("☑" if index in self.selected else "☐", path.name, sheet,
+            self.LABELS[spec.kind] if spec else "待确认",
+            f"表头第 {spec.header_row} 行" if spec else "双击设置列（可用 Jev）")
+        if self.view.exists(str(index)):
+            self.view.item(str(index), values=values)
+        else:
+            self.view.insert('', 'end', iid=str(index), values=values)
+
+    def _toggle_item(self, event):
+        item = self.view.identify_row(event.y)
+        if item and self.view.identify_column(event.x) == '#1':
+            index = int(item)
+            if index in self.selected:
+                self.selected.remove(index)
+            else:
+                self.selected.add(index)
+            self._render_item(index)
+
+    def _edit_current(self, event=None):
+        if event is not None:
+            item = self.view.identify_row(event.y)
+            if not item or self.view.identify_column(event.x) == '#1':
+                return
+        else:
+            selection = self.view.selection()
+            item = selection[0] if selection else None
+        if item is None:
+            return
+        index = int(item)
+        path, sheet, spec = self.items[index]
+        def save(updated):
+            self.items[index] = (path, sheet, updated)
+            self.selected.add(index)
+            self._render_item(index)
+        editor = ImportDialog(self.parent, path, spec=spec, sheet_name=sheet, on_save=save)
+        editor.transient(self)
+        def restore(event):
+            if event.widget is editor and self.winfo_exists():
+                self.grab_set()
+        editor.bind('<Destroy>', restore, add='+')
+
     def _import_selected(self) -> None:
-        selected = [self.specs[index] for index in self.listbox.curselection()]
+        if any(self.items[index][2] is None for index in self.selected):
+            messagebox.showinfo("请确认列设置", "选中的表包含未识别项，请双击设置列，或取消勾选。", parent=self)
+            return
+        selected = [self.items[index][2] for index in sorted(self.selected)]
         if not selected:
-            messagebox.showinfo("未选择表", "请至少选择一个已分类的工作表。", parent=self)
+            messagebox.showinfo("未选择表", "请至少勾选一个工作表。", parent=self)
             return
         old_sources = self.parent.store.sources()
         duplicate = set()
@@ -827,8 +909,60 @@ class BatchImportDialog(tk.Toplevel):
         if failures:
             summary += "\n失败项：\n" + "\n".join(failures)
         if self.skipped:
-            summary += f"\n另有 {len(self.skipped)} 个工作表未自动分类，可单独导入。"
-        messagebox.showinfo("批量导入结果", summary, parent=self.parent)
+            summary += f"\n另有 {len(self.skipped)} 个文件读取失败。"
+        messagebox.showinfo("导入结果", summary, parent=self.parent)
+
+
+class ReportAccountsDialog(tk.Toplevel):
+    """Let the reviewer choose a browsing scope without changing reconciliation."""
+
+    def __init__(self, parent: "App", label: str, accounts: list, suggested: list[str]):
+        super().__init__(parent)
+        self.title(f"选择明细科目 · {label}")
+        self.geometry("560x480")
+        self.transient(parent)
+        self.grab_set()
+        self.accounts = accounts
+        self.chosen = set(suggested)
+        self.search = tk.StringVar()
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"“{label}”可能涉及多个科目，请勾选查看范围。", wraplength=510).pack(anchor="w")
+        ttk.Label(body, text="包含子科目；仅用于浏览，不改变报表核对口径。", style="Hint.TLabel").pack(anchor="w", pady=5)
+        query = ttk.Entry(body, textvariable=self.search)
+        query.pack(fill="x", pady=5)
+        self.search.trace_add("write", lambda *_: self.refresh())
+        footer = ttk.Frame(body)
+        footer.pack(side="bottom", fill="x", pady=(8, 0))
+        ttk.Button(footer, text="取消", command=self.destroy).pack(side="right")
+        def confirm():
+            if not self.chosen:
+                messagebox.showinfo("请选择科目", "请至少勾选一个科目。", parent=self)
+                return
+            parent.show_report_accounts(sorted(self.chosen), label)
+            self.destroy()
+        ttk.Button(footer, text="查看明细", command=confirm).pack(side="right", padx=6)
+        self.view = tree(body, [("selected", "选择", 55), ("code", "科目编码", 120), ("name", "科目名称", 300)])
+        self.view.bind("<ButtonRelease-1>", self.toggle)
+        self.refresh()
+
+    def refresh(self):
+        self.view.delete(*self.view.get_children())
+        query = self.search.get().strip()
+        for account in self.accounts:
+            if query and query not in account["code"] and query not in account["name"]:
+                continue
+            self.view.insert("", "end", iid=account["key"], values=("☑" if account["key"] in self.chosen else "☐", account["code"], account["name"]))
+
+    def toggle(self, event):
+        key = self.view.identify_row(event.y)
+        if not key:
+            return
+        if key in self.chosen:
+            self.chosen.remove(key)
+        else:
+            self.chosen.add(key)
+        self.view.set(key, "selected", "☑" if key in self.chosen else "☐")
 
 
 class App(tk.Toplevel):
@@ -840,7 +974,7 @@ class App(tk.Toplevel):
         self.minsize(820, 520)
         self.resizable(True, True)
         self.store: LedgerStore | None = None
-        self.account: str | None = None
+        self.account: str | list[str] | None = None
         self.include_descendants = False
         self.account_label = tk.StringVar(value="全部科目")
         self.period_filter = tk.StringVar(value="全部期间")
@@ -850,6 +984,10 @@ class App(tk.Toplevel):
         self.report_source = {kind: tk.StringVar(value="无报表") for kind in REPORT_KINDS}
         self.report_options: dict[str, dict[str, int]] = {kind: {} for kind in REPORT_KINDS}
         self.search = tk.StringVar()
+        self.summary_search = tk.StringVar()
+        self.detail_sort = "date"
+        self.detail_descending = False
+        self.detail_info = tk.StringVar()
         self.mark_search = tk.StringVar()
         self.mark_keys: dict[str, str] = {}
         self.selected_mark_key: str | None = None
@@ -866,29 +1004,46 @@ class App(tk.Toplevel):
         heading = ttk.Frame(toolbar)
         heading.pack(fill="x")
         ttk.Label(heading, text="账簿核查", style="Intro.TLabel").pack(side="left")
-        ttk.Label(heading, text="  科目 · 分录 · 凭证", style="Hint.TLabel").pack(side="left", padx=(8, 0))
-        ttk.Button(heading, text="偏好设置", command=self.open_settings).pack(side="right")
-        search_row = ttk.Frame(toolbar)
-        search_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(search_row, text="查找科目或分录").pack(side="left", padx=(0, 8))
-        entry = ttk.Entry(search_row, textvariable=self.search)
-        entry.pack(side="left", fill="x", expand=True)
-        entry.bind("<Return>", lambda _e: self.refresh_all())
-        ttk.Button(search_row, text="查找", command=self.refresh_all, style="Accent.TButton").pack(side="left", padx=(8, 5))
-        ttk.Button(search_row, text="清除", command=self.clear_filter).pack(side="left")
-
+        ttk.Label(heading, text="先看报表或科目，再查明细、看凭证、记关注。", style="Hint.TLabel").pack(side="left", padx=12)
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 4))
-        frames = [ttk.Frame(self.tabs) for _ in range(9)]
-        for frame, title in zip(frames, ("科目总览", "明细账", "资产负债表", "利润表", "往来线索", "核对提醒", "导入记录", "关注凭证", "AI 待核凭证")):
-            self.tabs.add(frame, text=title)
+        self.utility_windows = {}
+        frames = []
+        for title in ("科目总览", "明细账", "资产负债表", "利润表", "核对提醒", "导入记录", "关注凭证", "AI 待核凭证"):
+            if title in ("核对提醒", "导入记录"):
+                dialog = tk.Toplevel(self)
+                dialog.withdraw()
+                dialog.title(title)
+                dialog.geometry("1000x580")
+                dialog.minsize(700, 420)
+                dialog.transient(self)
+                dialog.protocol("WM_DELETE_WINDOW", dialog.withdraw)
+                self.utility_windows[title] = dialog
+                frame = ttk.Frame(dialog)
+                frame.pack(fill="both", expand=True)
+            else:
+                frame = ttk.Frame(self.tabs)
+                self.tabs.add(frame, text=title)
+            frames.append(frame)
+        summary_search_row = ttk.Frame(frames[0], padding=5)
+        summary_search_row.pack(fill="x")
+        ttk.Label(summary_search_row, text="查找科目").pack(side="left")
+        summary_entry = ttk.Entry(summary_search_row, textvariable=self.summary_search)
+        summary_entry.pack(side="left", fill="x", expand=True, padx=6)
+        summary_entry.bind("<Return>", lambda _e: self.refresh_all())
+        ttk.Button(summary_search_row, text="查找", command=self.refresh_all).pack(side="left")
+        ttk.Button(summary_search_row, text="清除", command=self.clear_summary_filter).pack(side="left", padx=5)
         balance_top = ttk.Frame(frames[0], padding=5)
         balance_top.pack(fill="x")
         ttk.Label(balance_top, text="双击科目查看明细；点击 ▸ 展开子科目。", style="Hint.TLabel").pack(side="left")
-        ttk.Button(balance_top, text="记住当前展开", command=self.remember_expansion).pack(side="right", padx=(5, 0))
-        ttk.Button(balance_top, text="全部收起", command=lambda: self.set_expansion(False)).pack(side="right", padx=(5, 0))
-        ttk.Button(balance_top, text="全部展开", command=lambda: self.set_expansion(True)).pack(side="right", padx=(5, 0))
-        ttk.Button(balance_top, text="选择显示列", command=lambda: self._open_columns(self, "balance")).pack(side="right", padx=(8, 10))
+        summary_more = ttk.Menubutton(balance_top, text="更多 ▾")
+        summary_more.pack(side="right")
+        summary_menu = tk.Menu(summary_more, tearoff=False)
+        summary_menu.add_command(label="选择显示列…", command=lambda: self._open_columns(self, "balance"))
+        summary_menu.add_command(label="全部展开", command=lambda: self.set_expansion(True))
+        summary_menu.add_command(label="全部收起", command=lambda: self.set_expansion(False))
+        summary_menu.add_command(label="记住当前展开", command=self.remember_expansion)
+        summary_more.configure(menu=summary_menu)
         self.summary_view = tree(frames[0], VIEW_COLUMNS["balance"])
         self.summary_view.configure(show="tree headings")
         self.summary_view.heading("#0", text="")
@@ -897,20 +1052,34 @@ class App(tk.Toplevel):
         self.summary_view.bind("<Double-1>", self.open_account)
         detail_top = ttk.Frame(frames[1], padding=5)
         detail_top.pack(fill="x")
-        ttk.Label(detail_top, textvariable=self.account_label).pack(side="left")
+        ttk.Label(detail_top, textvariable=self.account_label, wraplength=330, justify="left").pack(side="left")
         ttk.Button(detail_top, text="显示全部科目", command=self.show_all_entries).pack(side="left", padx=10)
-        ttk.Button(detail_top, text="选择显示列", command=lambda: self._open_columns(self, "detail")).pack(side="right")
-        ttk.Button(detail_top, text="查看凭证与注释", command=self.mark_selected_entry, style="Accent.TButton").pack(side="right", padx=6)
-        detail_controls = ttk.Frame(frames[1], padding=(5, 0, 5, 5))
-        detail_controls.pack(fill="x")
-        ttk.Button(detail_controls, text="导出明细 CSV", command=self.export_csv).pack(side="left")
-        self.period_combo = ttk.Combobox(detail_controls, textvariable=self.period_filter, values=("全部期间",), state="readonly", width=17)
-        self.period_combo.pack(side="right", padx=(5, 0))
+        self.detail_more = ttk.Menubutton(detail_top, text="更多 ▾")
+        self.detail_more.pack(side="right")
+        detail_menu = tk.Menu(self.detail_more, tearoff=False)
+        detail_menu.add_command(label="选择显示列…", command=lambda: self._open_columns(self, "detail"))
+        detail_menu.add_command(label="导出当前明细 CSV…", command=self.export_csv)
+        detail_menu.add_command(label="恢复日期顺序", command=self.reset_detail_sort)
+        self.detail_more.configure(menu=detail_menu)
+        ttk.Button(detail_top, text="查看凭证 / 写注释", command=self.mark_selected_entry).pack(side="right", padx=6)
+        self.detail_controls = ttk.Frame(frames[1], padding=(5, 0, 5, 5))
+        self.detail_controls.pack(fill="x")
+        ttk.Label(self.detail_controls, text="关键词").pack(side="left")
+        detail_entry = ttk.Entry(self.detail_controls, textvariable=self.search, width=16)
+        detail_entry.pack(side="left", fill="x", expand=True, padx=6)
+        detail_entry.bind("<Return>", lambda _e: self.refresh_details())
+        ttk.Label(self.detail_controls, text="期间").pack(side="left")
+        self.period_combo = ttk.Combobox(self.detail_controls, textvariable=self.period_filter, values=("全部期间",), state="readonly", width=14)
+        self.period_combo.pack(side="left", padx=6)
         self.period_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
-        ttk.Label(detail_controls, text="期间").pack(side="right")
+        ttk.Button(self.detail_controls, text="查找", command=self.refresh_details, style="Accent.TButton").pack(side="left")
+        ttk.Button(self.detail_controls, text="重置筛选", command=self.clear_filter).pack(side="left", padx=(6, 0))
+        ttk.Label(frames[1], textvariable=self.detail_info, style="Hint.TLabel", padding=(6, 2)).pack(fill="x")
         self.detail_view = tree(frames[1], VIEW_COLUMNS["detail"])
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
+        for key in ("date", "voucher", "code", "name", "summary", "debit", "credit"):
+            self.detail_view.heading(key, command=lambda column=key: self.sort_details(column))
         self.report_views: dict[str, ttk.Treeview] = {}
         self.report_info: dict[str, tk.StringVar] = {}
         self.report_combos: dict[str, ttk.Combobox] = {}
@@ -924,32 +1093,31 @@ class App(tk.Toplevel):
             combo.bind("<<ComboboxSelected>>", lambda _e, report_kind=kind: self.refresh_report(report_kind))
             info = tk.StringVar(value="尚未导入报表。")
             self.report_info[kind] = info
-            ttk.Label(frame, textvariable=info, padding=(8, 3), foreground="#555").pack(fill="x")
+            ttk.Label(frame, textvariable=info, padding=(8, 3), foreground="#555", wraplength=760, justify="left").pack(fill="x")
             columns = [("left_item", "项目", 230), ("left_a", "金额 1", 125), ("left_b", "金额 2", 125), ("left_c", "金额 3", 125)]
             if kind == "balance_sheet":
                 columns += [("right_item", "右侧项目", 230), ("right_a", "右侧金额 1", 125), ("right_b", "右侧金额 2", 125), ("right_c", "右侧金额 3", 125)]
             columns += [("source", "来源行", 260)]
             self.report_views[kind] = tree(frame, columns)
-        self.aux_view = tree(frames[4], [("label", "辅助项/往来单位", 280), ("debit", "借方合计", 150), ("credit", "贷方合计", 150), ("n", "行数", 90)])
-        check_top = ttk.Frame(frames[5], padding=5)
+            self.report_views[kind].bind("<ButtonRelease-1>", lambda event, report_kind=kind: self.open_report_account(report_kind, event))
+        check_top = ttk.Frame(frames[4], padding=5)
         check_top.pack(fill="x")
         ttk.Label(check_top, text="这里只列需要核对的线索；金额差异不影响查看原始分录。", style="Hint.TLabel").pack(side="left")
         ttk.Button(check_top, text="设置核对范围", command=self.open_reconciliation).pack(side="right")
-        self.check_view = tree(frames[5], [("level", "级别", 70), ("category", "类别", 130), ("subject", "对象", 250), ("detail", "说明", 650)])
-        source_top = ttk.Frame(frames[6], padding=5)
+        self.check_view = tree(frames[4], [("level", "级别", 70), ("category", "类别", 130), ("subject", "对象", 250), ("detail", "说明", 650)])
+        source_top = ttk.Frame(frames[5], padding=5)
         source_top.pack(fill="x")
         ttk.Button(source_top, text="添加表格", command=self.import_file, style="Accent.TButton").pack(side="left")
-        ttk.Button(source_top, text="批量添加", command=self.import_files).pack(side="left", padx=6)
         ttk.Button(source_top, text="移除所选导入", command=self.delete_selected_source).pack(side="left")
-        source_choice = ttk.Frame(frames[6], padding=(5, 2, 5, 6))
+        source_choice = ttk.Frame(frames[5], padding=(5, 2, 5, 6))
         source_choice.pack(fill="x")
         ttk.Label(source_choice, text="总览使用的科目余额表").pack(side="left")
         self.balance_combo = ttk.Combobox(source_choice, textvariable=self.balance_source, values=("无余额表",), state="readonly", width=45)
         self.balance_combo.pack(side="left", padx=8)
         self.balance_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_all())
         ttk.Label(source_choice, text="切换来源只影响显示，不会合并不同期间。", style="Hint.TLabel").pack(side="left")
-        self.source_view = tree(frames[6], [("file", "文件", 220), ("sheet", "工作表", 130), ("kind", "类型", 85), ("rows", "有效行", 80), ("hash", "SHA-256", 220), ("path", "原始路径", 430)])
-        mark_top = ttk.Frame(frames[7], padding=5)
+        self.source_view = tree(frames[5], [("file", "文件", 220), ("sheet", "工作表", 130), ("kind", "类型", 85), ("rows", "有效行", 80), ("hash", "SHA-256", 220), ("path", "原始路径", 430)])
+        mark_top = ttk.Frame(frames[6], padding=5)
         mark_top.pack(fill="x")
         mark_search_row = ttk.Frame(mark_top)
         mark_search_row.pack(fill="x")
@@ -965,17 +1133,17 @@ class App(tk.Toplevel):
         ttk.Button(mark_actions, text="确认变更凭证", command=self.confirm_selected_mark).pack(side="left", padx=5)
         ttk.Button(mark_actions, text="另存为 MD", command=lambda: self.export_marks(as_new=True)).pack(side="right")
         ttk.Button(mark_actions, text="更新关注凭证 MD", command=self.export_marks, style="Accent.TButton").pack(side="right", padx=5)
-        self.mark_view = tree(frames[7], [("status", "状态", 85), ("voucher", "凭证", 175), ("accounts", "涉及科目", 275), ("note", "注释摘要", 360)])
+        self.mark_view = tree(frames[6], [("status", "状态", 85), ("voucher", "凭证", 175), ("accounts", "涉及科目", 275), ("note", "注释摘要", 360)])
         self.mark_view.bind("<<TreeviewSelect>>", self._load_selected_mark)
-        note_frame = ttk.Frame(frames[7], padding=(6, 6))
+        note_frame = ttk.Frame(frames[6], padding=(6, 6))
         note_frame.pack(fill="x")
         ttk.Label(note_frame, text="注释").pack(anchor="w")
         self.mark_note = tk.Text(note_frame, height=4, wrap="word", undo=True, background="#FFFDFB", relief="solid", borderwidth=1)
         self.mark_note.pack(fill="x", pady=(4, 5))
         ttk.Button(note_frame, text="保存注释", command=self.edit_selected_mark).pack(anchor="e")
         from .jev_ui import ReviewPanel
-        self.review_panel = ReviewPanel(frames[8], self)
-        self.tabs.bind("<<NotebookTabChanged>>", lambda _event: self.review_panel.refresh() if self.tabs.index(self.tabs.select()) == 8 else None)
+        self.review_panel = ReviewPanel(frames[7], self)
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _event: self.review_panel.refresh() if self.tabs.index(self.tabs.select()) == 5 else None)
         ttk.Label(self, textvariable=self.status, anchor="w", padding=(12, 6)).pack(fill="x")
 
     def _build_menu(self) -> None:
@@ -985,19 +1153,22 @@ class App(tk.Toplevel):
         files.add_command(label="打开账套…", command=self.open_book, accelerator="⌘O")
         files.add_separator()
         files.add_command(label="导入表格…", command=self.import_file)
-        files.add_command(label="批量导入…", command=self.import_files)
-        files.add_command(label="查看导入记录", command=lambda: self.tabs.select(6))
         files.add_separator()
         files.add_command(label="导出当前明细 CSV…", command=self.export_csv)
         files.add_command(label="更新关注凭证 MD…", command=self.export_marks)
         menu.add_cascade(label="文件", menu=files)
+        imports = tk.Menu(menu, tearoff=False)
+        imports.add_command(label="导入表格…", command=self.import_file)
+        imports.add_command(label="查看导入记录", command=lambda: self.open_utility("导入记录"))
+        menu.add_cascade(label="导入", menu=imports)
         review = tk.Menu(menu, tearoff=False)
         review.add_command(label="科目总览", command=lambda: self.tabs.select(0))
         review.add_command(label="明细账", command=lambda: self.tabs.select(1))
-        review.add_command(label="关注凭证", command=lambda: self.tabs.select(7))
-        review.add_command(label="AI 待核凭证", command=lambda: (self.review_panel.refresh(), self.tabs.select(8)))
-        review.add_command(label="Jev 法律尽调筛查…", command=lambda: (self.tabs.select(8), self.review_panel.new_batch()))
+        review.add_command(label="关注凭证", command=lambda: self.tabs.select(4))
+        review.add_command(label="AI 待核凭证", command=lambda: (self.review_panel.refresh(), self.tabs.select(5)))
+        review.add_command(label="核查全部凭证…", command=lambda: (self.tabs.select(5), self.review_panel.new_batch()))
         review.add_command(label="关联方名单…", command=self.open_related_parties)
+        review.add_command(label="核对提醒…", command=lambda: self.open_utility("核对提醒"))
         review.add_command(label="核对范围…", command=self.open_reconciliation)
         menu.add_cascade(label="查看", menu=review)
         options = tk.Menu(menu, tearoff=False)
@@ -1005,8 +1176,15 @@ class App(tk.Toplevel):
         options.add_command(label="Jev 审查…", command=self.open_settings)
         menu.add_cascade(label="设置", menu=options)
         self.configure(menu=menu)
+        for dialog in self.utility_windows.values():
+            dialog.configure(menu=menu)
         self.bind("<Command-n>", lambda _event: self.new_book())
         self.bind("<Command-o>", lambda _event: self.open_book())
+
+    def open_utility(self, title: str) -> None:
+        dialog = self.utility_windows[title]
+        dialog.deiconify()
+        dialog.lift()
 
     def _register_column_view(self, kind: str, view: ttk.Treeview) -> None:
         self.column_views[kind].append(view)
@@ -1089,6 +1267,9 @@ class App(tk.Toplevel):
         self.account = None
         self.account_label.set("全部科目")
         self.period_filter.set("全部期间")
+        self.search.set("")
+        self.summary_search.set("")
+        self.include_descendants = False
         self.balance_source.set("无余额表")
         for choice in self.report_source.values():
             choice.set("无报表")
@@ -1101,18 +1282,7 @@ class App(tk.Toplevel):
         if not self.store:
             messagebox.showinfo("先选择项目", "请先新建或打开本地项目。", parent=self)
             return
-        chosen = filedialog.askopenfilename(parent=self, title="选择企业账簿", filetypes=[("Excel/CSV", "*.xlsx *.xlsm *.xls *.csv"), ("所有文件", "*")])
-        if chosen:
-            try:
-                ImportDialog(self, Path(chosen))
-            except Exception as exc:
-                messagebox.showerror("读取失败", str(exc), parent=self)
-
-    def import_files(self) -> None:
-        if not self.store:
-            messagebox.showinfo("先选择项目", "请先新建或打开本地项目。", parent=self)
-            return
-        chosen = filedialog.askopenfilenames(parent=self, title="选择要一起导入的表格文件", filetypes=[("Excel/CSV", "*.xlsx *.xlsm *.xls *.csv"), ("所有文件", "*")])
+        chosen = filedialog.askopenfilenames(parent=self, title="选择表格（可多选文件）", filetypes=[("Excel/CSV", "*.xlsx *.xlsm *.xls *.csv"), ("所有文件", "*")])
         if chosen:
             BatchImportDialog(self, [Path(path) for path in chosen])
 
@@ -1139,7 +1309,7 @@ class App(tk.Toplevel):
         if chosen:
             try:
                 year, period = self._selected_period()
-                count = self.store.export_entries(Path(chosen), self.account, self.search.get().strip(), year, period, self.include_descendants)
+                count = self.store.export_entries(Path(chosen), self.account, self.search.get().strip(), year, period, self.include_descendants, self.detail_sort, self.detail_descending)
                 messagebox.showinfo("导出完成", f"已导出 {count} 行。", parent=self)
             except Exception as exc:
                 messagebox.showerror("导出失败", str(exc), parent=self)
@@ -1239,34 +1409,39 @@ class App(tk.Toplevel):
         except Exception as exc:
             messagebox.showerror("导出失败", f"原 MD 文件已保留。\n{exc}", parent=self)
 
+    def clear_summary_filter(self) -> None:
+        self.summary_search.set("")
+        self.refresh_all()
+
     def clear_filter(self) -> None:
         self.search.set("")
-        self.refresh_all()
+        self.period_filter.set("全部期间")
+        self.refresh_details()
+
+    def reset_detail_sort(self) -> None:
+        self.detail_sort = "date"
+        self.detail_descending = False
+        self.refresh_details()
+
+    def sort_details(self, column: str) -> None:
+        self.detail_descending = not self.detail_descending if column == self.detail_sort else False
+        self.detail_sort = column
+        self.refresh_details()
 
     def show_all_entries(self) -> None:
         self.account = None
         self.include_descendants = False
         self.account_label.set("全部科目")
         self.refresh_details()
-        self._refresh_aux()
 
     def _selected_period(self) -> tuple[str | None, str | None]:
         return self.period_options.get(self.period_filter.get(), (None, None))
 
     def _period_changed(self) -> None:
         self.refresh_details()
-        self._refresh_aux()
-
-    def _refresh_aux(self) -> None:
-        self.aux_view.delete(*self.aux_view.get_children())
-        if not self.store:
-            return
-        year, period = self._selected_period()
-        for row in self.store.auxiliary_totals(self.account, year, period, include_descendants=self.include_descendants):
-            self.aux_view.insert("", "end", values=(row["label"], amount(row["debit"]), amount(row["credit"]), row["n"]))
 
     def refresh_all(self) -> None:
-        for view in (self.summary_view, self.detail_view, self.aux_view, self.check_view, self.source_view, self.mark_view):
+        for view in (self.summary_view, self.detail_view, self.check_view, self.source_view, self.mark_view):
             view.delete(*view.get_children())
         for view in self.report_views.values():
             view.delete(*view.get_children())
@@ -1282,7 +1457,7 @@ class App(tk.Toplevel):
         if self.balance_source.get() not in self.balance_options:
             self.balance_source.set(next(reversed(self.balance_options)) if self.balance_options else "无余额表")
         selected_balance = self.balance_options.get(self.balance_source.get())
-        summary_rows = self.store.summary(self.search.get().strip(), selected_balance)
+        summary_rows = self.store.summary(self.summary_search.get().strip(), selected_balance)
         by_code = {row["code"]: row for row in summary_rows if row["code"]}
         parent_keys = {}
         counts = {row["key"]: row["detail_count"] for row in summary_rows}
@@ -1306,7 +1481,6 @@ class App(tk.Toplevel):
             self.summary_view.insert(parent_keys[row["key"]], "end", iid=row["key"], open=expansion_mode == "all" or row["key"] in expanded,
                                      values=(row["code"], row["name"], amount(row["opening_debit"]), amount(row["opening_credit"]), amount(pd), amount(pc), amount(row["year_debit"]), amount(row["year_credit"]), amount(row["closing_debit"]), amount(row["closing_credit"]), counts[row["key"]]), tags=tags)
         self.refresh_details()
-        self._refresh_aux()
         for kind in REPORT_KINDS:
             report_sources = [source for source in self.store.sources() if source["kind"] == kind]
             self.report_options[kind] = {f'{source["id"]}: {source["filename"]} / {source["sheet"]}': source["id"] for source in report_sources}
@@ -1357,39 +1531,102 @@ class App(tk.Toplevel):
                 display.append("right_c")
         display.append("source")
         view.configure(displaycolumns=display)
-        self.report_info[kind].set(f'来源：{source["original_path"]}  ·  工作表：{source["sheet"]}  ·  共 {source["row_count"]} 行；空白金额留空，零值显示 0.00')
+        self.report_info[kind].set(f'{source["filename"]} · {source["sheet"]} · {source["row_count"]} 行 · 点击项目名称查看明细（全部期间）')
         for row in self.store.report_rows(source_id):
             values = [row["left_item"], report_amount(row["left_amount_1_cents"]), report_amount(row["left_amount_2_cents"]), report_amount(row["left_amount_3_cents"])]
             if kind == "balance_sheet":
                 values.extend((row["right_item"], report_amount(row["right_amount_1_cents"]), report_amount(row["right_amount_2_cents"]), report_amount(row["right_amount_3_cents"])))
             values.append(f'{source["filename"]}/{source["sheet"]}:{row["row_no"]}')
-            view.insert("", "end", values=values)
+            view.insert("", "end", iid=str(row["row_no"]), values=values)
+
+    @staticmethod
+    def _report_item_name(value: str) -> str:
+        name = re.sub(r"\s+", "", value)
+        name = re.sub(r"^[一二三四五六七八九十百\d]+[、.．：:]", "", name)
+        name = re.sub(r"^(?:其中|加|减)[：:]", "", name)
+        return name
+
+    def open_report_account(self, kind: str, event) -> None:
+        if not self.store:
+            return
+        view = self.report_views[kind]
+        item = view.identify_row(event.y)
+        column = view.identify_column(event.x)
+        if not item or not column or column == "#0":
+            return
+        # identify_column uses the displayed order, including hidden amount columns.
+        displayed = view.cget("displaycolumns")
+        index = int(column[1:]) - 1
+        if index >= len(displayed) or displayed[index] not in ("left_item", "right_item"):
+            return
+        side = "left" if displayed[index] == "left_item" else "right"
+        source_id = self.report_options[kind].get(self.report_source[kind].get())
+        row = next((row for row in self.store.report_rows(source_id) if str(row["row_no"]) == item), None)
+        if row is None or not row[f"{side}_item"].strip():
+            return
+        label = row[f"{side}_item"]
+        accounts = self.store.db.execute("SELECT key,code,name FROM accounts ORDER BY code,name").fetchall()
+        existing = {account["key"] for account in accounts}
+        mappings = [mapping for mapping in load_plan(self.store)["mappings"]
+                    if mapping.get("kind") == kind and mapping.get("source_id") == source_id
+                    and mapping.get("row_no") == row["row_no"] and mapping.get("side") == side]
+        keys = sorted({key for mapping in mappings for key in mapping.get("accounts", [])})
+        if keys and set(keys) <= existing:
+            self.show_report_accounts(keys, label, include_descendants=False)
+            return
+        name = self._report_item_name(label)
+        exact = [account["key"] for account in accounts if self._report_item_name(account["name"]) == name]
+        if len(exact) == 1:
+            self.show_report_accounts(exact, label)
+            return
+        suggestions = {"货币资金": {"库存现金", "现金", "银行存款", "其他货币资金"},
+                       "营业收入": {"主营业务收入", "其他业务收入"},
+                       "营业成本": {"主营业务成本", "其他业务成本"}}
+        suggested = exact or [account["key"] for account in accounts if account["name"] in suggestions.get(name, set())]
+        ReportAccountsDialog(self, label, accounts, suggested)
+
+    def show_report_accounts(self, keys: list[str], label: str, include_descendants: bool = True) -> None:
+        self.account = keys
+        self.include_descendants = include_descendants
+        names = [row["name"] for row in self.store.db.execute("SELECT key,name FROM accounts") if row["key"] in keys]
+        scope = "、".join(names)
+        if len(scope) > 30:
+            scope = scope[:30] + f"…（{len(keys)} 个科目）"
+        self.account_label.set(f"{label} → {scope}" + (" · 含子科目" if include_descendants else ""))
+        self.search.set("")
+        self.period_filter.set("全部期间")
+        self.refresh_details()
+        self.tabs.select(1)
 
     def refresh_details(self) -> None:
         self.detail_view.delete(*self.detail_view.get_children())
         if not self.store:
             return
         year, period = self._selected_period()
-        rows_found = self.store.entries(account=self.account, search=self.search.get().strip(), fiscal_year=year, period=period, include_descendants=self.include_descendants)
+        rows_found = self.store.entries(account=self.account, search=self.search.get().strip(), fiscal_year=year, period=period, include_descendants=self.include_descendants, sort_by=self.detail_sort, descending=self.detail_descending)
         marked_keys = {row["voucher_key"] for row in self.store.db.execute("SELECT voucher_key FROM voucher_marks")}
         parties = self.store.related_parties()
         for row in rows_found:
             side_tag = "debit_row" if row["debit_cents"] and not row["credit_cents"] else "credit_row" if row["credit_cents"] and not row["debit_cents"] else ""
             marked = voucher_key(row) in marked_keys
             self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], related_party_match(row, parties), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
-        if len(rows_found) == 3000:
-            self.status.set("明细仅显示前 3000 行；请按科目或关键词缩小范围。")
+        for key, title, _ in VIEW_COLUMNS["detail"]:
+            arrow = (" ↓" if self.detail_descending else " ↑") if key == self.detail_sort else ""
+            self.detail_view.heading(key, text=title + arrow)
+        count_label = "已显示前 3000 条，请缩小范围；导出包含全部匹配项" if len(rows_found) == 3000 else f"{len(rows_found)} 条明细"
+        self.detail_info.set(f"{count_label} · {self.period_filter.get()} · 点击日期、科目、凭证或借贷表头排序；双击一行看凭证")
 
     def open_account(self, _event: object) -> None:
         selection = self.summary_view.selection()
         if not selection:
             return
         self.account = selection[0]
-        self.include_descendants = bool(self.summary_view.get_children(selection[0]))
+        self.include_descendants = self.account.startswith("C:")
+        self.search.set("")
+        self.period_filter.set("全部期间")
         values = self.summary_view.item(selection[0], "values")
         self.account_label.set(f"{values[0]} {values[1]}".strip() + (" · 含子科目" if self.include_descendants else ""))
         self.refresh_details()
-        self._refresh_aux()
         self.tabs.select(1)
 
     def set_expansion(self, expanded: bool) -> None:

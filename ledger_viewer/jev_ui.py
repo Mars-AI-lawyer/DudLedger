@@ -153,40 +153,6 @@ class ReviewRulesDialog(tk.Toplevel):
         self.destroy()
 
 
-class ScopeDialog(tk.Toplevel):
-    def __init__(self, panel):
-        super().__init__(panel)
-        self.panel = panel
-        self.app = panel.app
-        self.title('选择 Jev 筛查范围')
-        self.transient(self.app)
-        self.choice = tk.StringVar(value='current')
-        body = ttk.Frame(self, padding=16)
-        body.pack(fill='both', expand=True)
-        ttk.Radiobutton(body, text='当前明细筛选范围（包含全部匹配行，不限于屏幕显示行）', variable=self.choice, value='current').pack(anchor='w')
-        ttk.Radiobutton(body, text='整个账套的已导入明细分录', variable=self.choice, value='all').pack(anchor='w', pady=6)
-        current = panel.current_scope()
-        ttk.Label(body, text=f"当前：{self.app.account_label.get()}；{self.app.period_filter.get()}；关键词：{current['search'] or '无'}", wraplength=550).pack(anchor='w', pady=6)
-        ttk.Label(body, text='可再限定一个来源工作表：').pack(anchor='w')
-        self.source = tk.StringVar(value='全部明细来源')
-        self.sources = {'全部明细来源': None}
-        for row in self.app.store.sources():
-            if row['kind'] == 'entry':
-                self.sources[f"#{row['id']} {row['filename']} / {row['sheet']}"] = row['id']
-        ttk.Combobox(body, textvariable=self.source, values=list(self.sources), state='readonly', width=62).pack(fill='x', pady=8)
-        ttk.Button(body, text='生成发送预览', command=self._preview).pack(side='right', pady=8)
-        ttk.Button(body, text='取消', command=self.destroy).pack(side='right', padx=8)
-        self.grab_set()
-
-    def _preview(self):
-        scope = self.panel.current_scope() if self.choice.get() == 'current' else {}
-        source_id = self.sources[self.source.get()]
-        if source_id is not None:
-            scope['source_ids'] = [source_id]
-        self.destroy()
-        self.panel.prepare(scope)
-
-
 class ConsentDialog(tk.Toplevel):
     def __init__(self, panel, batch_id):
         super().__init__(panel)
@@ -249,6 +215,10 @@ class ConsentDialog(tk.Toplevel):
             return
         self.panel.batch_id = self.batch_id
         self.panel.job = job
+        self.panel.lane.set('completed')
+        self.panel.account.set('')
+        self.panel.topic.set('全部主题')
+        self.panel.period.set('全部期间')
         self.panel.refresh()
         self.destroy()
 
@@ -265,28 +235,34 @@ class ReviewPanel(ttk.Frame):
         self.pack(fill='both', expand=True)
         actions = ttk.Frame(self, padding=6)
         actions.pack(fill='x')
-        ttk.Button(actions, text='Jev 法律尽调筛查', command=self.new_batch).pack(side='left')
-        ttk.Button(actions, text='重试／恢复此范围', command=self.retry).pack(side='left', padx=5)
-        ttk.Button(actions, text='取消当前审查', command=self.cancel).pack(side='left')
-        ttk.Button(actions, text='刷新', command=self.refresh).pack(side='right')
-        ttk.Button(actions, text='审查规则', command=app.open_review_rules).pack(side='right', padx=5)
-        batch_row = ttk.Frame(self, padding=(6, 0))
+        self.start_button = ttk.Button(actions, text='核查全部凭证', command=self.new_batch, style='Accent.TButton')
+        self.start_button.pack(side='left')
+        self.cancel_button = ttk.Button(actions, text='停止', command=self.cancel, state='disabled')
+        self.cancel_button.pack(side='left', padx=5)
+        self.more_button = ttk.Button(actions, text='更多选项', command=self._toggle_options)
+        self.more_button.pack(side='right')
+        self.progress = tk.StringVar(value='核查当前账套的全部凭证，完成一张即显示一张。')
+        wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050).pack(fill='x')
+        self.progress_bar = ttk.Progressbar(self, mode='determinate', maximum=1, value=0)
+        self.progress_bar.pack(fill='x', padx=8, pady=(0, 7))
+        self.options = ttk.Frame(self)
+        batch_row = ttk.Frame(self.options, padding=(6, 0))
         batch_row.pack(fill='x')
+        ttk.Label(batch_row, text='历史核查').pack(side='left', padx=(0, 5))
+        ttk.Button(batch_row, text='审查规则', command=app.open_review_rules).pack(side='right', padx=5)
         self.batch = tk.StringVar()
         self.batch_combo = ttk.Combobox(batch_row, textvariable=self.batch, state='readonly')
         self.batch_combo.pack(fill='x', expand=True)
         self.batch_combo.bind('<<ComboboxSelected>>', self._select_batch)
-        self.progress = tk.StringVar(value='选择审查范围并确认后才会联网。')
-        wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050).pack(fill='x')
-        lanes = ttk.Frame(self, padding=(6, 0))
+        lanes = ttk.Frame(self.options, padding=(6, 0))
         lanes.pack(fill='x')
-        self.lane = tk.StringVar(value='scored')
+        self.lane = tk.StringVar(value='completed')
         self.lane_buttons = {}
-        for index, (label, value) in enumerate((('优先核查', 'scored'), ('信息不足／判断不确定', 'uncertain'), ('分析失败／未分析／过期', 'unfinished'), ('全部（含低分）', 'all'))):
+        for index, (label, value) in enumerate((('已完成结果', 'completed'), ('优先核查', 'scored'), ('信息不足／判断不确定', 'uncertain'), ('分析失败／未分析／过期', 'unfinished'), ('全部（含低分）', 'all'))):
             button = ttk.Radiobutton(lanes, text=label, value=value, variable=self.lane, command=self.refresh_rows)
             button.grid(row=index // 2, column=index % 2, sticky='w', padx=(0, 14), pady=2)
             self.lane_buttons[value] = button
-        filters = ttk.Frame(self, padding=6)
+        filters = ttk.Frame(self.options, padding=6)
         filters.pack(fill='x')
         self.tier, self.account, self.topic, self.period = (tk.StringVar(value=v) for v in ('谨慎', '', '全部主题', '全部期间'))
         ttk.Label(filters, text='范围').pack(side='left')
@@ -307,14 +283,14 @@ class ReviewPanel(ttk.Frame):
             if variable is self.period:
                 self.period_combo = combo
         ttk.Button(filters, text='筛选', command=self.refresh_rows).pack(side='left')
-        self.view = tree(self, [('voucher', '凭证', 180), ('summary', '命中摘要', 240), ('topics', '待核主题', 240),
-            ('score', '核查优先分', 100), ('amount', '命中分录金额', 185), ('analysis', '分析状态', 185), ('review', '人工复核', 120)])
+        self.view = tree(self, [('voucher', '凭证', 150), ('summary', '摘要', 220), ('topics', '核查线索', 170),
+            ('score', '优先分', 75), ('analysis', '状态', 120)])
         self.view.bind('<Double-1>', self.open_detail)
         bottom = ttk.Frame(self, padding=6)
         bottom.pack(side='bottom', fill='x', before=self.view.master)
         self.count_label = tk.StringVar()
         wrapped_label(bottom, textvariable=self.count_label).pack(side='left', fill='x', expand=True)
-        ttk.Button(bottom, text='查看分录、来源与复核', command=self.open_detail).pack(side='right')
+        ttk.Button(bottom, text='查看详情', command=self.open_detail).pack(side='right')
         self._poll_id = self.after(200, self._poll)
         self.bind("<Destroy>", self._destroyed, add="+")
 
@@ -323,10 +299,13 @@ class ReviewPanel(ttk.Frame):
             self.after_cancel(self._poll_id)
             self._poll_id = None
 
-    def current_scope(self):
-        year, period = self.app._selected_period()
-        return dict(account=self.app.account, search=self.app.search.get(), fiscal_year=year,
-                    period=period, include_descendants=self.app.include_descendants)
+    def _toggle_options(self):
+        if self.options.winfo_manager():
+            self.options.pack_forget()
+            self.more_button.configure(text='更多选项')
+        else:
+            self.options.pack(fill='x', before=self.view.master)
+            self.more_button.configure(text='收起选项')
 
     def new_batch(self):
         if not self.app.store:
@@ -335,7 +314,7 @@ class ReviewPanel(ttk.Frame):
         if active_job(self.app.store.path):
             messagebox.showinfo('审查正在运行', '当前账套同一时间只运行一个批次。', parent=self)
             return
-        ScopeDialog(self)
+        self.prepare({})
 
     def prepare(self, scope):
         try:
@@ -344,17 +323,6 @@ class ReviewPanel(ttk.Frame):
             messagebox.showerror('无法生成预览', str(exc), parent=self)
             return
         ConsentDialog(self, batch_id)
-
-    def retry(self):
-        if not self.app.store or self.batch_id is None:
-            return
-        if active_job(self.app.store.path):
-            messagebox.showinfo('审查正在运行', '请等待当前批次结束。', parent=self)
-            return
-        # A new, fully previewed batch uses the current contents of the previous scope.
-        # Exact completed inputs reuse the local cache; changed inputs require fresh calls.
-        info = batch_info(self.app.store, self.batch_id)
-        self.prepare(json.loads(info['scope_json']))
 
     def cancel(self):
         if self.app.store:
@@ -391,35 +359,50 @@ class ReviewPanel(ttk.Frame):
 
     def _counts(self):
         counts = batch_counts(self.app.store, self.batch_id)
-        states = '；'.join(f'{STATUS_LABELS.get(k,k)} {v}' for k, v in counts.items() if k not in ('total', 'uncertain', 'stale', 'cached', 'vouchers'))
         info = batch_info(self.app.store, self.batch_id)
-        self.progress.set(f"本批次 {counts['total']} 条分录／{counts['vouchers']} 张凭证：{states}；缓存复用 {counts['cached']}；已过期 {counts['stale']}。批次：{STATUS_LABELS.get(info['status'], info['status'])}")
+        running = active_job(self.app.store.path) is not None
+        self.start_button.configure(state='disabled' if running else 'normal')
+        self.cancel_button.configure(state='normal' if running else 'disabled')
+        total = counts['vouchers']
+        done = counts['finished_vouchers']
+        self.progress_bar.configure(maximum=max(1, total), value=done)
+        percent = done / total * 100 if total else 0
+        status = STATUS_LABELS.get(info['status'], info['status'])
+        self.progress.set(f"{status} · 已处理 {done}/{total} 张（{percent:.0f}%） · 成功 {counts['successful_vouchers']} · 失败 {counts['failed_vouchers']}")
         self.lane_buttons['uncertain'].configure(text=f"信息不足／判断不确定（{counts['uncertain']}）")
         unfinished = counts['total'] - counts.get('success', 0)
         self.lane_buttons['unfinished'].configure(text=f"失败／未分析（{unfinished}）／过期（{counts['stale']}）")
 
     def refresh_rows(self):
-        self.view.delete(*self.view.get_children())
+        old_items = set(self.view.get_children())
         self.rows = {}
         if not self.app.store or self.batch_id is None:
-            self.count_label.set('尚无结果；未进行筛查不能视为无异常。')
+            self.view.delete(*old_items)
+            self.progress_bar.configure(maximum=1, value=0)
+            self.count_label.set('尚无结果，点击“核查全部凭证”开始。')
             return
         groups = voucher_results(self.app.store, self.batch_id, self.tier.get(), self.lane.get(), self.account.get().strip(),
             self.topic_options.get(self.topic.get(), ''), '' if self.period.get() == '全部期间' else self.period.get())
         periods = [r[0] for r in self.app.store.db.execute("SELECT DISTINCT json_extract(local_json,'$.fiscal_year') || '/' || json_extract(local_json,'$.period') FROM jev_results WHERE batch_id=?", (self.batch_id,))]
         self.period_combo.configure(values=['全部期间', *sorted(periods)])
         for index, group in enumerate(groups):
-            self.rows[str(index)] = group
+            item = group['key']
+            self.rows[item] = group
             row = group['hits'][0]['local']
             voucher = f"{row['fiscal_year']}/{row['period']} {row['voucher_type']}{row['voucher_no']}" if row['voucher_no'] else f"无凭证号 · {row['filename']}:{row['row_no']}"
             states = list(dict.fromkeys('已过期' if r['stale'] else STATUS_LABELS[r['status']] for r in group['lines']))
             if group['partial']:
                 states.append('仅覆盖部分分录')
-            self.view.insert('', 'end', iid=str(index), values=(voucher, '；'.join(dict.fromkeys(r['local']['summary'] for r in group['hits'])),
-                '、'.join(group['themes']), f"{group['score']:.1f}" if group['score'] is not None else '—',
-                '；'.join(f'{currency} {format_money(value, comma=True)}' for currency, value in group['amounts'].items()),
-                '、'.join(states), group['review']['status']))
-        self.count_label.set(f'{len(groups)} 张凭证／来源行。双击查看；金额取命中分录最大单边绝对值。')
+            values = (voucher, '；'.join(dict.fromkeys(r['local']['summary'] for r in group['hits'])),
+                '、'.join(group['themes']), f"{group['score']:.1f}" if group['score'] is not None else '—', '、'.join(states))
+            if item in old_items:
+                self.view.item(item, values=values)
+                old_items.remove(item)
+            else:
+                self.view.insert('', 'end', iid=item, values=values)
+            self.view.move(item, '', index)
+        self.view.delete(*old_items)
+        self.count_label.set(f'显示 {len(groups)} 张 · 双击查看分录和来源。AI 结果仅供复核。')
 
     def open_detail(self, _event=None):
         selected = self.view.selection()
@@ -446,6 +429,7 @@ class ReviewPanel(ttk.Frame):
                     self.refresh()
                 elif changed and self.batch_id == job.batch_id:
                     self._counts()
+                    self.refresh_rows()
         self._poll_id = self.after(250, self._poll)
 
 

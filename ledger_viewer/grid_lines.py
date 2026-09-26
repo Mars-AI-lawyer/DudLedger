@@ -16,8 +16,10 @@ class DashedGrid:
         self.horizontal: list[tk.Canvas] = []
         self.vertical: list[tk.Canvas] = []
         self.pending = False
+        self.draw_job: str | None = None
         self.enabled = True
         self.scroll_job: str | None = None
+        view.bind("<Destroy>", self._destroy, add="+")
         for event in ("<Configure>", "<Map>", "<ButtonRelease-1>"):
             view.bind(event, self.schedule, add="+")
 
@@ -25,7 +27,17 @@ class DashedGrid:
         if not self.enabled or self.pending or not self.view.winfo_exists():
             return
         self.pending = True
-        self.view.after_idle(self.draw)
+        self.draw_job = self.view.after_idle(self.draw)
+
+    def _destroy(self, event) -> None:
+        if event.widget is not self.view:
+            return
+        for job in (self.scroll_job, self.draw_job):
+            if job is not None:
+                self.view.after_cancel(job)
+        self.scroll_job = self.draw_job = None
+        self.pending = False
+        self.enabled = False
 
     def schedule_scroll(self) -> None:
         """Repaint once scrolling settles so a long table stays responsive."""
@@ -57,6 +69,7 @@ class DashedGrid:
         return pool[index]
 
     def draw(self) -> None:
+        self.draw_job = None
         self.pending = False
         if not self.enabled or not self.view.winfo_exists():
             return

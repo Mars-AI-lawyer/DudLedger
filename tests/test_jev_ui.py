@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import gc
 import tkinter as tk
 from tkinter import ttk
@@ -9,7 +11,7 @@ from unittest.mock import patch
 from ledger_viewer.importer import ImportSpec, guess_header
 from ledger_viewer.jev_review import ReviewJob, batch_counts, prepare_batch, batch_info
 from ledger_viewer.jev_rules import load_rules
-from ledger_viewer.jev_ui import ConsentDialog, ReviewDetail, ReviewRulesDialog, ScopeDialog
+from ledger_viewer.jev_ui import ConsentDialog, ReviewDetail, ReviewRulesDialog
 from ledger_viewer.ui import Application
 from test_jev_review import FakeClient, response
 
@@ -67,14 +69,16 @@ class ReviewUITest(unittest.TestCase):
         self.assertTrue(rules['common'].endswith('仅为线索。'))
 
     def test_minimum_window_keeps_main_review_actions_visible(self):
-        self.app.tabs.select(8)
+        self.app.tabs.select(5)
         self.app.geometry('820x600')
         self.root.update()
         def walk(widget):
             for child in widget.winfo_children():
                 yield child
                 yield from walk(child)
-        buttons = [w for w in walk(self.panel) if isinstance(w, (ttk.Button, ttk.Radiobutton))]
+        self.assertFalse(self.panel.options.winfo_ismapped())
+        self.assertTrue(self.panel.progress_bar.winfo_ismapped())
+        buttons = [w for w in walk(self.panel) if isinstance(w, ttk.Button) and w.winfo_ismapped()]
         self.assertTrue(buttons)
         for button in buttons:
             self.assertTrue(button.winfo_ismapped(), button.cget('text'))
@@ -85,6 +89,59 @@ class ReviewUITest(unittest.TestCase):
         self.assertTrue(preview.confirm.winfo_ismapped())
         self.assertGreater(preview.preview.winfo_height(), 50)
         preview._cancel()
+
+    def test_all_scope_ignores_detail_filters(self):
+        self.app.account = 'C:2241'
+        self.app.search.set('不存在的关键词')
+        with patch.object(self.panel, 'prepare') as prepare:
+            self.panel.new_batch()
+        prepare.assert_called_once_with({})
+
+    def test_progress_and_low_score_result_visible_before_all_done(self):
+        extra = self.base / '第二张.csv'
+        extra.write_text('日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n'
+                         '2026-01-01,2,1002,银行存款,等待返回,10,0\n', encoding='utf-8')
+        header, _, mapping = guess_header(extra, 'CSV', 'entry')
+        self.app.store.import_sheet(ImportSpec(extra, 'CSV', header, 'entry', mapping))
+        release = threading.Event()
+        waiting = threading.Event()
+        def respond(state):
+            if state['summary'] == '等待返回':
+                waiting.set()
+                release.wait(8)
+            return response(score=0.2)
+        FakeClient.responder = staticmethod(respond)
+        batch = prepare_batch(self.app.store, {})
+        job = ReviewJob(self.app.store.path, batch, 'fake-key', FakeClient)
+        self.panel.batch_id = batch
+        self.panel.job = job
+        try:
+            job.start(self.app.store)
+            self.panel.refresh()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not self.panel.view.get_children():
+                self.root.update()
+                time.sleep(0.02)
+            self.assertTrue(waiting.is_set())
+            self.assertTrue(job.thread.is_alive())
+            self.assertEqual(len(self.panel.view.get_children()), 1)
+            self.assertEqual(float(self.panel.progress_bar['value']), 1)
+            self.assertEqual(float(self.panel.progress_bar['maximum']), 2)
+            self.assertIn('50%', self.panel.progress.get())
+            item = self.panel.view.get_children()[0]
+            self.panel.view.selection_set(item)
+            self.panel.refresh_rows()
+            self.assertEqual(self.panel.view.selection(), (item,))
+        finally:
+            release.set()
+            job.thread.join(5)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(self.panel.view.get_children()) < 2:
+            self.root.update()
+            time.sleep(0.02)
+        self.assertEqual(len(self.panel.view.get_children()), 2)
+        self.assertEqual(float(self.panel.progress_bar['value']), 2)
+        self.assertEqual(batch_counts(self.app.store, batch)['successful_vouchers'], 2)
 
     def test_confirm_results_detail_review_and_open_unlisted_voucher(self):
         batch = prepare_batch(self.app.store, {'account': 'C:2241'})

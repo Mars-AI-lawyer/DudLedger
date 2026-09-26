@@ -152,6 +152,14 @@ def batch_counts(store, batch_id) -> dict:
         AND stale=0 AND (confidence<0.5 OR insufficient>=0.5)''', (batch_id,)).fetchone()[0]
     counts['stale'] = store.db.execute('SELECT COUNT(*) FROM jev_results WHERE batch_id=? AND stale=1', (batch_id,)).fetchone()[0]
     counts['vouchers'] = store.db.execute('SELECT COUNT(DISTINCT voucher_key) FROM jev_results WHERE batch_id=?', (batch_id,)).fetchone()[0]
+    groups = store.db.execute('''SELECT
+        MIN(status IN ('success','failed')) finished,
+        MIN(status='success') successful,
+        MAX(status='failed') failed
+        FROM jev_results WHERE batch_id=? GROUP BY voucher_key''', (batch_id,)).fetchall()
+    counts['finished_vouchers'] = sum(row['finished'] for row in groups)
+    counts['successful_vouchers'] = sum(row['successful'] for row in groups)
+    counts['failed_vouchers'] = sum(row['finished'] and row['failed'] for row in groups)
     counts['cached'] = store.db.execute('SELECT COUNT(*) FROM jev_results WHERE batch_id=? AND cached=1', (batch_id,)).fetchone()[0]
     return counts
 
@@ -383,11 +391,13 @@ class ReviewJob:
                             for row in group:
                                 self._save(store, row, {'status': 'interrupted', 'stale': True,
                                     'error': '本凭证的选定分录或名单已变化，请重新预览'})
+                            self.events.put(('progress', None))
                             continue
                         cached = [store.db.execute("SELECT response_json FROM jev_results WHERE cache_key=? AND status='success' AND stale=0 AND id<>? ORDER BY id DESC LIMIT 1", (row['cache_key'], row['id'])).fetchone() for row in group]
                         if all(cached):
                             for row, previous in zip(group, cached):
                                 self._save(store, row, {'status': 'success', 'data': json.loads(previous['response_json'])}, cached=True)
+                            self.events.put(('progress', None))
                             continue
                         with store.db:
                             store.db.executemany("UPDATE jev_results SET status='running' WHERE id=?", [(row['id'],) for row in group])
@@ -407,7 +417,7 @@ class ReviewJob:
                                 entry_result = {'status': 'success', 'data': result['items'][index], 'attempts': result['attempts']} if result['status'] == 'success' else result
                                 self._save(store, row, entry_result)
                         if done:
-                            self.events.put(('progress', batch_counts(store, self.batch_id)))
+                            self.events.put(('progress', None))
             with store.db:
                 if self.cancel.is_set():
                     store.db.execute("UPDATE jev_results SET status='cancelled' WHERE batch_id=? AND status IN ('pending','running')", (self.batch_id,))
@@ -470,7 +480,9 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', t
     for key, lines in groups.items():
         successful = [r for r in lines if r['status'] == 'success' and not r['stale']]
         max_score = max((r['score'] for r in successful), default=None)
-        if lane == 'scored':
+        if lane == 'completed':
+            hits = lines if all(r['status'] in ('success', 'failed') for r in lines) else []
+        elif lane == 'scored':
             hits = [r for r in successful if r['score'] >= threshold]
         elif lane == 'uncertain':
             hits = [r for r in successful if r['confidence'] < 0.5 or r['insufficient'] >= 0.5]

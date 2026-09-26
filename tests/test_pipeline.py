@@ -288,8 +288,7 @@ class PipelineTest(unittest.TestCase):
         book.save(monthly)
         detected, skipped = discover_sheets([self.book, monthly])
         self.assertEqual({spec.kind for spec in detected}, {"entry", "balance", "balance_sheet", "income_statement"})
-        self.assertEqual(len(skipped), 1)
-        self.assertIn("现金流量表", skipped[0])
+        self.assertEqual(skipped, [])
 
     def test_balance_sheet_both_sides_preserves_title_blank_zero_and_source_rows(self):
         path = self.base / "statements.xlsx"

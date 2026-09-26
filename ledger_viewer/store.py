@@ -253,9 +253,18 @@ class LedgerStore:
         return True
 
     @staticmethod
-    def _account_clause(account: str | None, include_descendants: bool = False, alias: str = "e") -> tuple[str, list[str]]:
-        if not account:
+    def _account_clause(account: str | list[str] | None, include_descendants: bool = False, alias: str = "e") -> tuple[str, list[str]]:
+        if account is None or account == "":
             return "", []
+        if isinstance(account, list):
+            if not account:
+                return "0=1", []
+            clauses, args = [], []
+            for key in account:
+                clause, values = LedgerStore._account_clause(key, include_descendants, alias)
+                clauses.append(clause)
+                args.extend(values)
+            return "(" + " OR ".join(clauses) + ")", args
         if include_descendants and account.startswith("C:"):
             return f"substr({alias}.account_key,1,length(?))=?", [account, account]
         return f"{alias}.account_key=?", [account]
@@ -289,7 +298,7 @@ class LedgerStore:
           WHERE a.code LIKE ? OR a.name LIKE ? ORDER BY a.code,a.name
         """, (balance_source_id, pattern, pattern)).fetchall()
 
-    def entries(self, account: str | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False) -> list[sqlite3.Row]:
+    def entries(self, account: str | list[str] | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> list[sqlite3.Row]:
         where = []
         args: list[object] = []
         account_sql, account_args = self._account_clause(account, include_descendants)
@@ -306,7 +315,15 @@ class LedgerStore:
         return self.db.execute("""
           SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path FROM entries e
           JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
-        """ + clause + " ORDER BY e.entry_date,e.id LIMIT ?", (*args, limit)).fetchall()
+        """ + clause + " ORDER BY " + self._entry_order(sort_by, descending) + " LIMIT ?", (*args, limit)).fetchall()
+
+    @staticmethod
+    def _entry_order(sort_by: str, descending: bool) -> str:
+        columns = {"date": "e.entry_date", "voucher": "e.voucher_type,CAST(e.voucher_no AS INTEGER),e.voucher_no",
+                   "code": "a.code", "name": "a.name", "summary": "e.summary",
+                   "debit": "e.debit_cents", "credit": "e.credit_cents"}
+        direction = " DESC" if descending else " ASC"
+        return ",".join(column + direction for column in columns.get(sort_by, "e.entry_date").split(",")) + ",e.id"
 
     def entry(self, entry_id: int) -> sqlite3.Row | None:
         return self.db.execute("""SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path
@@ -331,14 +348,14 @@ class LedgerStore:
             FROM entries e JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
             WHERE """ + where + " ORDER BY e.source_id,e.row_no", args).fetchall()
 
-    def auxiliary_totals(self, account: str | None = None, fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False) -> list[sqlite3.Row]:
+    def auxiliary_totals(self, account: str | list[str] | None = None, fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False) -> list[sqlite3.Row]:
         account_sql, account_args = self._account_clause(account, include_descendants)
         return self.db.execute("""SELECT COALESCE(NULLIF(e.auxiliary,''),NULLIF(e.counterparty,''),'未注明') label,
           SUM(e.debit_cents) debit,SUM(e.credit_cents) credit,COUNT(*) n
           FROM entries e WHERE """ + (account_sql if account_sql else "1=1") + """ AND (? IS NULL OR e.fiscal_year=?) AND (? IS NULL OR e.period=?)
           GROUP BY label ORDER BY n DESC,label LIMIT 1000""", (*account_args, fiscal_year, fiscal_year, period, period)).fetchall()
 
-    def export_entries(self, path: Path, account: str | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False) -> int:
+    def export_entries(self, path: Path, account: str | list[str] | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> int:
         import csv
         from .related_parties import related_party_match
 
@@ -359,7 +376,7 @@ class LedgerStore:
             args.extend([f"%{search}%"] * 6)
         if where:
             query += " WHERE " + " AND ".join(where)
-        query += " ORDER BY e.entry_date,e.id"
+        query += " ORDER BY " + self._entry_order(sort_by, descending)
         cursor = self.db.execute(query, args)
         count = 0
         with path.open("w", encoding="utf-8-sig", newline="") as handle:

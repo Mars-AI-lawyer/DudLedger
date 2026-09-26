@@ -443,11 +443,33 @@ def normalized_rows(spec: ImportSpec) -> Iterator[tuple[int, dict[str, object]]]
             yield row_no, {"account_code": code, "account_name": name, **amounts, "raw_json": json.dumps([text_value(v) for v in row], ensure_ascii=False)}
 
 
+def is_cashflow_sheet(path: Path, sheet: str) -> bool:
+    """Identify excluded cash-flow reports from sheet names, file names or titles."""
+    name, filename = _norm(sheet), _norm(path.stem)
+    if "现金流量" in name or "cashflow" in name:
+        return True
+    generic = not name or name.startswith(("sheet", "工作表")) or name == "csv"
+    if generic and ("现金流量" in filename or "cashflow" in filename):
+        return True
+    iterator = rows(path, sheet)
+    try:
+        for row_no, values in iterator:
+            if row_no > 8:
+                break
+            # Only inspect title rows; a ledger memo mentioning the report is data.
+            populated = [_norm(value) for value in values if text_value(value)]
+            if len(populated) <= 2 and any(value in ("现金流量表", "cashflowstatement", "statementofcashflows") for value in populated):
+                return True
+    finally:
+        iterator.close()
+    return False
+
+
 def classify_sheet(path: Path, sheet: str) -> ImportSpec | None:
     """Classify only layouts with a validated header; uncertain sheets stay manual."""
     name = _norm(sheet)
     filename = _norm(path.stem)
-    if "现金流量" in name or "现金流量" in filename:
+    if is_cashflow_sheet(path, sheet):
         return None
     hints = (("科目余额", "balance"), ("试算平衡", "balance"), ("资产负债", "balance_sheet"),
              ("利润表", "income_statement"), ("损益表", "income_statement"),
@@ -492,12 +514,14 @@ def discover_sheets(paths: list[Path]) -> tuple[list[ImportSpec], list[str]]:
             continue
         for sheet in names:
             try:
+                if is_cashflow_sheet(path, sheet):
+                    continue
                 spec = classify_sheet(path, sheet)
             except Exception as exc:
                 skipped.append(f"{path.name}/{sheet}：读取失败（{exc}）")
                 continue
             if spec is None:
-                reason = "暂不支持现金流量表" if "现金流量" in _norm(sheet) or "现金流量" in _norm(path.stem) else "类型或表头不能可靠自动确认，可单独导入"
+                reason = "类型或表头不能可靠自动确认，请在导入列表中设置列"
                 skipped.append(f"{path.name}/{sheet}：{reason}")
             else:
                 detected.append(spec)
