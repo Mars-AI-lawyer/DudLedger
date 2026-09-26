@@ -114,6 +114,7 @@ class ReviewUITest(unittest.TestCase):
         batch = prepare_batch(self.app.store, {})
         job = ReviewJob(self.app.store.path, batch, 'fake-key', FakeClient)
         self.panel.batch_id = batch
+        self.panel.lane.set('completed')
         self.panel.job = job
         try:
             job.start(self.app.store)

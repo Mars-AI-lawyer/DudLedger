@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import copy
+import re
 import sqlite3
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -15,7 +17,6 @@ from typesafe_sdk import Noul, Score, TypeSafeClient, RetryPolicy
 from .analysis_api import iter_entries
 from .importer import format_money
 from .jev_rules import load_rules
-from .related_parties import related_party_match
 from .voucher_notes import voucher_key
 from .jev_runtime import REQUEST_SLOTS
 
@@ -51,13 +52,15 @@ REVIEW_STATES = ('待核', '需补材料', '已核查无异常', '继续关注')
 STATUS_LABELS = {'preview': '待确认', 'pending': '未分析', 'running': '分析中',
                  'success': '已分析', 'failed': '分析失败', 'cancelled': '已取消',
                  'interrupted': '已中断', 'completed': '已完成', 'partial': '部分失败',
-                 'auth_failed': '认证失败', 'stale': '已过期'}
+                 'auth_failed': '认证失败', 'stale': '已过期', 'skipped': '已跳过结转损益'}
 BOUNDARY = '账簿记载及 AI 判断均为核查线索，不代表关联关系、违法事实或最终法律结论已获证实。'
-SEND_FIELDS = {'entry_date': '日期', 'fiscal_year': '会计年度', 'period': '期间',
-               'code': '科目编码', 'name': '科目名称', 'summary': '摘要',
-               'counterparty': '往来单位', 'auxiliary': '辅助核算', 'currency': '币种',
-               'original_amount': '原币金额', 'debit': '借方金额', 'credit': '贷方金额',
-               'related_party': '用户维护关联方名单匹配状态'}
+SEND_FIELDS = {'entry_date': '日期', 'name': '科目', 'summary': '摘要',
+               'debit': '借方金额', 'credit': '贷方金额'}
+REQUEST_VERSION = 'compact-voucher-v2'
+# UTF-8 bytes are a conservative proxy, not an exact tokenizer count.
+MAX_STATE_BYTES = 6000
+MAX_REQUEST_BYTES = 48000
+MAX_CONTEXT_BYTES = 24000
 _ACTIVE = {}
 _ACTIVE_LOCK = threading.Lock()
 
@@ -70,14 +73,57 @@ def digest(value) -> str:
     return hashlib.sha256(encode(value).encode('utf-8')).hexdigest()
 
 
-def send_fields(row, parties) -> dict:
-    data = {field: row[field] for field in SEND_FIELDS if field not in ('debit', 'credit', 'related_party')}
-    data['debit'] = format_money(row['debit_cents'])
-    data['credit'] = format_money(row['credit_cents'])
-    match = related_party_match(row, parties)
-    data['related_party'] = {'matched': bool(match), 'name': match,
-        'basis': '用户维护名单命中，关系未经本功能核实' if match else '名单未匹配，不等于不存在关联关系'}
-    return data
+def send_fields(row, parties=None) -> dict:
+    return {'entry_date': row['entry_date'], 'name': row['name'], 'summary': row['summary'],
+            'debit': format_money(row['debit_cents']), 'credit': format_money(row['credit_cents'])}
+
+
+def closing_voucher(rows) -> bool:
+    """Only skip an entire unambiguous profit/loss closing voucher."""
+    names = [re.sub(r'\s+', '', r['name']) for r in rows]
+    if '本年利润' not in names or not any(n != '本年利润' for n in names):
+        return False
+    if sum(r['debit_cents'] for r in rows) != sum(r['credit_cents'] for r in rows):
+        return False
+    if not all(n == '本年利润' or n.startswith(('主营业务收入', '其他业务收入', '营业外收入',
+            '主营业务成本', '其他业务成本', '营业外支出', '管理费用', '销售费用', '财务费用',
+            '研发费用', '税金及附加', '营业税金及附加', '所得税费用', '投资收益', '公允价值变动损益',
+            '资产减值损失', '信用减值损失', '资产处置收益', '其他收益')) for n in names):
+        return False
+    pattern = r'(?:[0-9年月期末本当度\-/.]*)(?:自动)?(?:(?:结转|结平)(?:本期|本月|本年|年度|当期|期末|年末)?(?:损益|利润|收入|成本|费用|成本费用|本年利润)|(?:损益|利润)结转)[。；; ]*'
+    return all(re.fullmatch(pattern, re.sub(r'\s+', '', r['summary'])) for r in rows)
+
+
+def compact_state(payloads):
+    """Hoist shared fields and remove exact duplicates; retain all distinct evidence."""
+    unique = list({encode(p): p for p in payloads}.values())
+    common = {k: unique[0][k] for k in SEND_FIELDS
+              if unique and all(p[k] == unique[0][k] for p in unique)}
+    entries = [{k: v for k, v in p.items() if k not in common} for p in unique]
+    return {'common': common, 'entries': entries}
+
+
+def request_parts(payloads):
+    unique = list({encode(p): p for p in payloads}.values())
+    pieces = []
+    for payload in unique:
+        summary = payload['summary']
+        if len(summary.encode('utf-8')) > 2400:
+            # Overlap preserves words/negations around a split; never drop a tail.
+            for start in range(0, len(summary), 520):
+                pieces.append({**payload, 'summary': summary[start:start + 600]})
+        else:
+            pieces.append(payload)
+    chunk = []
+    for piece in pieces:
+        if len(encode(compact_state([piece])).encode('utf-8')) > MAX_STATE_BYTES:
+            raise ValueError('科目或日期字段过长，请核对导入列映射后重试；未截断分析')
+        if chunk and len(encode(compact_state(chunk + [piece])).encode('utf-8')) > MAX_STATE_BYTES:
+            yield chunk
+            chunk = []
+        chunk.append(piece)
+    if chunk:
+        yield chunk
 
 
 def fingerprint(row, payload) -> str:
@@ -102,14 +148,13 @@ def recover_interrupted(store):
 def prepare_batch(store, scope: dict) -> int:
     """Save a complete local snapshot; never invokes the network or credentials."""
     version, rules = load_rules(store)
-    parties = store.related_parties()
     scope = {k: v for k, v in scope.items() if k in ('account', 'search', 'fiscal_year', 'period', 'include_descendants', 'source_ids')}
     hashes = []
     with store.db:
         batch_id = store.db.execute('INSERT INTO jev_batches(rule_id,model,scope_json,snapshot_hash) VALUES(?,?,?,?)',
             (version, rules['model'], encode(scope), '')).lastrowid
         for row in iter_entries(store, **scope):
-            payload = send_fields(row, parties)
+            payload = send_fields(row)
             fp = fingerprint(row, payload)
             hashes.append(fp)
             cache = ''
@@ -117,9 +162,15 @@ def prepare_batch(store, scope: dict) -> int:
                 VALUES(?,?,?,?,?,?,?)''', (batch_id, row['id'], voucher_key(row), encode(row), encode(payload), fp, cache))
         if not hashes:
             raise ValueError('选定范围没有分录')
+        all_groups = {}
+        for row in iter_entries(store):
+            all_groups.setdefault(voucher_key(row), []).append(row)
         for group in iter_voucher_groups(store, batch_id):
+            if closing_voucher(all_groups[group[0]['voucher_key']]):
+                store.db.executemany("UPDATE jev_results SET status='skipped',error='结转损益凭证，未发送 Jev' WHERE id=?",
+                                     [(r['id'],) for r in group])
             context = [json.loads(row['input_json']) for row in group]
-            group_hash = digest(['voucher-request-v1', context, version, rules, rules['model']])
+            group_hash = digest([REQUEST_VERSION, context, version, rules, rules['model']])
             for index, row in enumerate(group):
                 cache = digest([group_hash, index])
                 store.db.execute('UPDATE jev_results SET cache_key=? WHERE id=?', (cache, row['id']))
@@ -135,7 +186,7 @@ def discard_preview(store, batch_id):
 
 
 def preview_page(store, batch_id, page=0, page_size=20):
-    return store.db.execute('SELECT id,input_json FROM jev_results WHERE batch_id=? ORDER BY id LIMIT ? OFFSET ?',
+    return store.db.execute('SELECT id,input_json,status FROM jev_results WHERE batch_id=? ORDER BY id LIMIT ? OFFSET ?',
                             (batch_id, page_size, page * page_size)).fetchall()
 
 
@@ -149,24 +200,24 @@ def batch_counts(store, batch_id) -> dict:
         'SELECT status,COUNT(*) n FROM jev_results WHERE batch_id=? GROUP BY status', (batch_id,))}
     counts['total'] = sum(counts.values())
     counts['uncertain'] = store.db.execute('''SELECT COUNT(*) FROM jev_results WHERE batch_id=? AND status='success'
-        AND stale=0 AND (confidence<0.5 OR insufficient>=0.5)''', (batch_id,)).fetchone()[0]
+        AND stale=0 AND (confidence<0.5 OR insufficient>=0.5 OR json_extract(response_json,'$.needs_manual_review')=1)''', (batch_id,)).fetchone()[0]
     counts['stale'] = store.db.execute('SELECT COUNT(*) FROM jev_results WHERE batch_id=? AND stale=1', (batch_id,)).fetchone()[0]
     counts['vouchers'] = store.db.execute('SELECT COUNT(DISTINCT voucher_key) FROM jev_results WHERE batch_id=?', (batch_id,)).fetchone()[0]
     groups = store.db.execute('''SELECT
-        MIN(status IN ('success','failed')) finished,
+        MIN(status IN ('success','failed','skipped')) finished,
         MIN(status='success') successful,
         MAX(status='failed') failed
         FROM jev_results WHERE batch_id=? GROUP BY voucher_key''', (batch_id,)).fetchall()
     counts['finished_vouchers'] = sum(row['finished'] for row in groups)
     counts['successful_vouchers'] = sum(row['successful'] for row in groups)
     counts['failed_vouchers'] = sum(row['finished'] and row['failed'] for row in groups)
+    counts['skipped_vouchers'] = store.db.execute("SELECT COUNT(DISTINCT voucher_key) FROM jev_results WHERE batch_id=? AND status='skipped'", (batch_id,)).fetchone()[0]
     counts['cached'] = store.db.execute('SELECT COUNT(*) FROM jev_results WHERE batch_id=? AND cached=1', (batch_id,)).fetchone()[0]
     return counts
 
 
 def refresh_staleness(store, batch_id):
-    parties = store.related_parties()
-    current = {row['id']: fingerprint(row, send_fields(row, parties)) for row in iter_entries(store)}
+    current = {row['id']: fingerprint(row, send_fields(row)) for row in iter_entries(store)}
     with store.db:
         for result in store.db.execute('SELECT id,entry_id,fingerprint,stale FROM jev_results WHERE batch_id=?', (batch_id,)).fetchall():
             stale = int(current.get(result['entry_id']) != result['fingerprint'])
@@ -184,26 +235,11 @@ def questions_for(rules):
 
 
 def voucher_questions(payloads, rules):
-    questions = {}
-    for index, _payload in enumerate(payloads):
-        prefix = (f"本问题仅判断 `entries[{index}]` 这一条选定分录。"
-                  "其他分录一并发送是为合并同一凭证的请求，不能把其他行独有的事项算作本行命中。\n\n")
-        for key, question in questions_for(rules).items():
-            instructions = prefix + question.instructions
-            questions[f'entry_{index}_{key}'] = Score(instructions=instructions, criteria=rules['levels']) if key == 'priority' else Noul(instructions=instructions)
-    return questions
-
-
-def decode_voucher_response(raw, payloads, rules):
-    items = []
-    keys = [t['id'] for t in rules['topics']] + ['priority', 'insufficient']
-    for index, _payload in enumerate(payloads):
-        data = validate_response({'model': raw['model'], 'usage': raw['usage'],
-            'answers': {key: raw['answers'][f'entry_{index}_{key}'] for key in keys}}, rules)
-        data['shared_entries'] = len(payloads)
-        data['request_group'] = digest(['voucher-request-v1', payloads, rules])
-        items.append(data)
-    return items
+    adapted = copy.deepcopy(rules)
+    adapted['common'] = ('判断当前凭证片段整体是否存在该事项，而非逐条分录评分。'
+        '`common` 是各行共用字段，与 `entries` 各行合并理解；重复行已去重，不能据此计算总额。'
+        '片段可能不是完整凭证，不能据此判断借贷不平。\n' + adapted['common'])
+    return questions_for(adapted)
 
 
 def validate_response(data, rules):
@@ -249,6 +285,8 @@ def error_kind(exc):
     status = getattr(exc, 'status_code', None)
     if status in (401, 403) or name in ('TypeSafeAuthenticationError', 'TypeSafePermissionDeniedError'):
         return 'auth', '认证失败，请检查或替换 API Key'
+    if status == 413 or (status in (400, 422) and any(word in str(exc).lower() for word in ('context length', 'context_length', 'too many tokens', 'token limit', 'context window', 'maximum context'))):
+        return 'length', '请求内容超出模型限制'
     if status in (408, 429) or (isinstance(status, int) and 500 <= status < 600) or name in (
         'TypeSafeRateLimitError', 'TypeSafeAPIConnectionError', 'TypeSafeAPITimeoutError', 'TimeoutError', 'ConnectionError'):
         return 'retry', '网络、限流或服务暂时异常'
@@ -257,7 +295,7 @@ def error_kind(exc):
     return 'error', '请求失败，请检查服务状态或规则配置'
 
 
-def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None):
+def _request_once(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None):
     for attempt in range(1, 4):
         if cancel.is_set():
             return {'status': 'cancelled', 'attempts': attempt - 1}
@@ -268,15 +306,15 @@ def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClien
             if cancel.is_set():
                 return {'status': 'cancelled', 'attempts': attempt - 1}
             if before_send is not None and not before_send():
-                return {'status': 'interrupted', 'stale': True, 'error': '来源或名单已变化，请重新预览', 'attempts': attempt - 1}
+                return {'status': 'interrupted', 'stale': True, 'error': '来源已变化，请重新预览', 'attempts': attempt - 1}
             with client_factory(api_key=api_key, model=rules['model'], timeout=25.0, retry=RetryPolicy(max_retries=0)) as client:
                 grouped = isinstance(payload, list)
-                response = client.system_one(state={'entries': payload} if grouped else payload,
+                response = client.system_one(state=compact_state(payload) if grouped else payload,
                     questions=voucher_questions(payload, rules) if grouped else questions_for(rules))
             raw = response.model_dump(mode='json')
             if grouped:
-                items = decode_voucher_response(raw, payload, rules)
-                return {'status': 'success', 'items': items, 'attempts': attempt}
+                data = validate_response(raw, rules)
+                return {'status': 'success', 'data': data, 'attempts': attempt}
             data = validate_response(raw, rules)
             return {'status': 'success', 'data': data, 'attempts': attempt}
         except Exception as exc:
@@ -284,18 +322,65 @@ def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClien
             if kind == 'auth':
                 cancel.set()
             if kind != 'retry' or attempt == 3:
-                return {'status': 'failed', 'error': message, 'auth': kind == 'auth', 'attempts': attempt}
+                return {'status': 'failed', 'error': message, 'auth': kind == 'auth', 'length': kind == 'length', 'attempts': attempt}
         finally:
             REQUEST_SLOTS.release()
         cancel.wait(min(2 ** (attempt - 1), 4))
     raise AssertionError('unreachable')
 
 
+def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None):
+    if not isinstance(payload, list):
+        return _request_once(payload, rules, api_key, cancel, client_factory, before_send)
+    questions = voucher_questions(payload, rules)
+    serialized = {k: q.model_dump(mode='json') for k, q in questions.items()}
+    question_bytes = len(encode(serialized).encode('utf-8'))
+    longest = max(len(encode(q).encode('utf-8')) for q in serialized.values())
+    if question_bytes + MAX_STATE_BYTES > MAX_REQUEST_BYTES or longest + MAX_STATE_BYTES > MAX_CONTEXT_BYTES:
+        return {'status': 'failed', 'error': '审查规则过长，请缩短自定义规则后重试', 'attempts': 0}
+    try:
+        queue = list(request_parts(payload))
+    except ValueError as exc:
+        return {'status': 'failed', 'error': str(exc), 'attempts': 0}
+    results, attempts = [], 0
+    while queue:
+        part = queue.pop(0)
+        result = _request_once(part, rules, api_key, cancel, client_factory, before_send)
+        attempts += result['attempts']
+        if result.get('length'):
+            if len(part) > 1:
+                middle = len(part) // 2
+                queue[:0] = [part[:middle], part[middle:]]
+                continue
+            summary = part[0]['summary']
+            if len(summary) > 160:
+                middle = len(summary) // 2
+                queue[:0] = [[{**part[0], 'summary': summary[:middle + 30]}],
+                             [{**part[0], 'summary': summary[middle - 30:]}]]
+                continue
+            result['error'] = '精简后仍超过服务限制，请缩短规则或检查导入字段；未认定为低风险'
+        if result['status'] != 'success':
+            return {**result, 'attempts': attempts}
+        results.append(result['data'])
+    if not results:
+        return {'status': 'failed', 'error': '没有可核查内容', 'attempts': 0}
+    # Keep the highest observed priority distribution; never average away a red flag.
+    merged = copy.deepcopy(max(results, key=lambda r: r['answers']['priority']['score']))
+    for key in [t['id'] for t in rules['topics']] + ['insufficient']:
+        merged['answers'][key]['noul'] = max(r['answers'][key]['noul'] for r in results)
+    merged['usage'] = {k: sum(r['usage'][k] for r in results) for k in ('input_tokens', 'output_tokens')}
+    merged.update(review_unit='voucher', shared_entries=len(payload), chunks=len(results),
+                  needs_manual_review=len(results) > 1,
+                  request_group=digest([REQUEST_VERSION, payload, rules]))
+    if len(results) > 1:
+        merged['part_results'] = results
+    return {'status': 'success', 'items': [merged for _ in payload], 'attempts': attempts}
+
+
 def test_connection(api_key, client_factory=TypeSafeClient):
     from .jev_rules import default_rules
     payload = {field: '' for field in SEND_FIELDS}
-    payload.update(summary='虚构样例：支付办公文具采购款', name='管理费用', debit='10.00', credit='0.00',
-                   related_party={'matched': False, 'name': '', 'basis': '虚构测试，不含账套信息'})
+    payload.update(summary='虚构样例：支付办公文具采购款', name='管理费用', debit='10.00', credit='0.00')
     return request_review(payload, default_rules(), api_key, threading.Event(), client_factory)
 
 
@@ -307,7 +392,7 @@ def snapshot_is_current(path, snapshot):
         row = db.execute("""SELECT e.*,a.code,a.name,s.sha256,s.original_path,s.sheet FROM entries e
             JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id WHERE e.id=?""", (snapshot['entry_id'],)).fetchone()
         stale = db.execute('SELECT stale FROM jev_results WHERE id=?', (snapshot['id'],)).fetchone()
-        return bool(row and stale and not stale[0] and fingerprint(row, send_fields(row, db.execute('SELECT * FROM related_parties').fetchall())) == snapshot['fingerprint'])
+        return bool(row and stale and not stale[0] and fingerprint(row, send_fields(row)) == snapshot['fingerprint'])
     finally:
         db.close()
 
@@ -343,10 +428,9 @@ class ReviewJob:
                     raise ValueError('批次已确认或失效，请重新预览')
                 # Lock the database while validating the scope and marking consent.
                 store.db.execute('UPDATE jev_batches SET snapshot_hash=snapshot_hash WHERE id=?', (self.batch_id,))
-                parties = store.related_parties()
-                hashes = [fingerprint(row, send_fields(row, parties)) for row in iter_entries(store, **json.loads(info['scope_json']))]
+                hashes = [fingerprint(row, send_fields(row)) for row in iter_entries(store, **json.loads(info['scope_json']))]
                 if digest(hashes) != info['snapshot_hash'] or store.db.execute('SELECT 1 FROM jev_results WHERE batch_id=? AND stale=1 LIMIT 1', (self.batch_id,)).fetchone():
-                    raise ValueError('分录或关联方信息已变化，请重新选择范围并确认')
+                    raise ValueError('分录已变化，请重新选择范围并确认')
                 current_rule, _ = load_rules(store)
                 if current_rule != info['rule_id']:
                     raise ValueError('规则已变化，请重新预览并确认')
@@ -387,10 +471,13 @@ class ReviewJob:
                         if group is None:
                             exhausted = True
                             break
+                        if all(row['status'] == 'skipped' for row in group):
+                            self.events.put(('progress', None))
+                            continue
                         if not all(snapshot_is_current(self.path, row) for row in group):
                             for row in group:
                                 self._save(store, row, {'status': 'interrupted', 'stale': True,
-                                    'error': '本凭证的选定分录或名单已变化，请重新预览'})
+                                    'error': '本凭证的选定分录已变化，请重新预览'})
                             self.events.put(('progress', None))
                             continue
                         cached = [store.db.execute("SELECT response_json FROM jev_results WHERE cache_key=? AND status='success' AND stale=0 AND id<>? ORDER BY id DESC LIMIT 1", (row['cache_key'], row['id'])).fetchone() for row in group]
@@ -422,7 +509,7 @@ class ReviewJob:
                 if self.cancel.is_set():
                     store.db.execute("UPDATE jev_results SET status='cancelled' WHERE batch_id=? AND status IN ('pending','running')", (self.batch_id,))
                 counts = batch_counts(store, self.batch_id)
-                status = 'auth_failed' if auth_failed else 'cancelled' if self.cancel.is_set() else 'completed' if counts.get('success', 0) == counts['total'] else 'partial'
+                status = 'auth_failed' if auth_failed else 'cancelled' if self.cancel.is_set() else 'completed' if counts.get('success', 0) + counts.get('skipped', 0) == counts['total'] else 'partial'
                 store.db.execute('UPDATE jev_batches SET status=?,finished_at=CURRENT_TIMESTAMP WHERE id=?', (status, self.batch_id))
             refresh_staleness(store, self.batch_id)
         except Exception:
@@ -457,6 +544,21 @@ def topic_labels(result, rules):
             for topic in rules['topics'] if answers[topic['id']]['noul'] >= 0.35]
 
 
+def is_uncertain(row):
+    data = json.loads(row['response_json']) if row['response_json'] else {}
+    return row['confidence'] < 0.5 or row['insufficient'] >= 0.5 or data.get('needs_manual_review', False)
+
+
+def needs_review(row, threshold, tier):
+    if row['score'] >= threshold or is_uncertain(row):
+        return True
+    answers = json.loads(row['response_json'])['answers']
+    # A distributed Score can hide a meaningful high-priority tail in its mean.
+    tail = sum(float(p) for level, p in answers['priority']['probabilities'].items() if int(level) >= 2)
+    return tier == '谨慎' and (tail >= 0.35 or any(answers[t]['noul'] >= 0.65
+        for t in ('contract', 'labor', 'litigation', 'tax')))
+
+
 def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', topic='', period=''):
     info = batch_info(store, batch_id)
     if not info:
@@ -481,13 +583,19 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', t
         successful = [r for r in lines if r['status'] == 'success' and not r['stale']]
         max_score = max((r['score'] for r in successful), default=None)
         if lane == 'completed':
-            hits = lines if all(r['status'] in ('success', 'failed') for r in lines) else []
+            hits = lines if all(r['status'] in ('success', 'failed', 'skipped') for r in lines) else []
+        elif lane == 'candidates':
+            hits = [r for r in successful if needs_review(r, threshold, tier)]
+            if any(r['status'] not in ('success', 'failed', 'skipped') for r in lines):
+                hits = []
+            elif any(r['status'] == 'failed' for r in lines):
+                hits = lines
         elif lane == 'scored':
             hits = [r for r in successful if r['score'] >= threshold]
         elif lane == 'uncertain':
-            hits = [r for r in successful if r['confidence'] < 0.5 or r['insufficient'] >= 0.5]
+            hits = [r for r in successful if is_uncertain(r)]
         elif lane == 'unfinished':
-            hits = [r for r in lines if r['status'] != 'success' or r['stale']]
+            hits = [r for r in lines if r['status'] not in ('success', 'skipped') or r['stale']]
         else:
             hits = lines
         if not hits:
@@ -510,7 +618,7 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', t
             'themes': list(dict.fromkeys(label for r in hits for _, label in r['themes'])) or ['待分类'],
             'amounts': amounts, 'sort_currency': currencies,
             'sort_amount': amounts[currencies[0]] if len(currencies) == 1 else 0,
-            'partial': len(successful) < max(totals.get(key, 0), len(lines)),
+            'partial': len(successful) + sum(r['status'] == 'skipped' for r in lines) < max(totals.get(key, 0), len(lines)),
             'local_total': totals.get(key, 0), 'review': notes.get(key, {'status': '待核', 'note': ''})})
     # Group currency before amounts; no numeric comparison across different currencies.
     return sorted(result, key=lambda g: (-(g['score'] if g['score'] is not None else -1), g['sort_currency'], -g['sort_amount'], g['key']))

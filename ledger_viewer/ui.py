@@ -991,7 +991,7 @@ class App(tk.Toplevel):
         self.mark_search = tk.StringVar()
         self.mark_keys: dict[str, str] = {}
         self.selected_mark_key: str | None = None
-        self.status = tk.StringVar(value="请从顶部“文件”菜单新建或打开账套。")
+        self.status = tk.StringVar(value="从“文件”导入表格即可开始；自动新建账套，保存位置可在“设置”调整。")
         self.column_views: dict[str, list[ttk.Treeview]] = {kind: [] for kind in VIEW_COLUMNS}
         self.voucher_windows: set[tk.Toplevel] = set()
         self._layout()
@@ -1046,9 +1046,12 @@ class App(tk.Toplevel):
         summary_more.configure(menu=summary_menu)
         self.summary_view = tree(frames[0], VIEW_COLUMNS["balance"])
         self.summary_view.configure(show="tree headings")
-        self.summary_view.heading("#0", text="")
-        self.summary_view.column("#0", width=84, minwidth=50, stretch=False)
+        self.summary_view.heading("#0", text="展开 / 收起")
+        self.summary_view.column("#0", width=120, minwidth=100, stretch=False)
         self._register_column_view("balance", self.summary_view)
+        self.summary_view.bind("<Button-1>", self.toggle_account)
+        self.summary_view.bind("<<TreeviewOpen>>", lambda _e: self.after_idle(self._expansion_labels))
+        self.summary_view.bind("<<TreeviewClose>>", lambda _e: self.after_idle(self._expansion_labels))
         self.summary_view.bind("<Double-1>", self.open_account)
         detail_top = ttk.Frame(frames[1], padding=5)
         detail_top.pack(fill="x")
@@ -1149,18 +1152,15 @@ class App(tk.Toplevel):
     def _build_menu(self) -> None:
         menu = tk.Menu(self)
         files = tk.Menu(menu, tearoff=False)
-        files.add_command(label="新建账套…", command=self.new_book, accelerator="⌘N")
+        files.add_command(label="（批量）导入表格…", command=self.import_file, accelerator="⌘I")
         files.add_command(label="打开账套…", command=self.open_book, accelerator="⌘O")
         files.add_separator()
-        files.add_command(label="导入表格…", command=self.import_file)
+        files.add_command(label="在新账套中导入…", command=lambda: self.controller.new_window().import_file())
+        files.add_command(label="导入记录…", command=lambda: self.open_utility("导入记录"))
         files.add_separator()
         files.add_command(label="导出当前明细 CSV…", command=self.export_csv)
         files.add_command(label="更新关注凭证 MD…", command=self.export_marks)
         menu.add_cascade(label="文件", menu=files)
-        imports = tk.Menu(menu, tearoff=False)
-        imports.add_command(label="导入表格…", command=self.import_file)
-        imports.add_command(label="查看导入记录", command=lambda: self.open_utility("导入记录"))
-        menu.add_cascade(label="导入", menu=imports)
         review = tk.Menu(menu, tearoff=False)
         review.add_command(label="科目总览", command=lambda: self.tabs.select(0))
         review.add_command(label="明细账", command=lambda: self.tabs.select(1))
@@ -1173,12 +1173,13 @@ class App(tk.Toplevel):
         menu.add_cascade(label="查看", menu=review)
         options = tk.Menu(menu, tearoff=False)
         options.add_command(label="偏好设置…", command=self.open_settings)
+        options.add_command(label="新账套默认文件夹…", command=self.choose_book_folder)
         options.add_command(label="Jev 审查…", command=self.open_settings)
         menu.add_cascade(label="设置", menu=options)
         self.configure(menu=menu)
         for dialog in self.utility_windows.values():
             dialog.configure(menu=menu)
-        self.bind("<Command-n>", lambda _event: self.new_book())
+        self.bind("<Command-i>", lambda _event: self.import_file())
         self.bind("<Command-o>", lambda _event: self.open_book())
 
     def open_utility(self, title: str) -> None:
@@ -1279,12 +1280,35 @@ class App(tk.Toplevel):
         self.tabs.select(1 if self.store.setting("home_view", "summary") == "detail" else 0)
 
     def import_file(self) -> None:
-        if not self.store:
-            messagebox.showinfo("先选择项目", "请先新建或打开本地项目。", parent=self)
-            return
         chosen = filedialog.askopenfilenames(parent=self, title="选择表格（可多选文件）", filetypes=[("Excel/CSV", "*.xlsx *.xlsm *.xls *.csv"), ("所有文件", "*")])
         if chosen:
+            if not self.store:
+                try:
+                    folder = self.controller.book_folder
+                    folder.mkdir(parents=True, exist_ok=True)
+                    name = Path(chosen[0]).stem[:80] or "新账套"
+                    index = 1
+                    while True:
+                        path = folder / f"{name}{'' if index == 1 else '-' + str(index)}.sqlite"
+                        try:
+                            path.touch(exist_ok=False)
+                            break
+                        except FileExistsError:
+                            index += 1
+                    self.controller.open_book(path, self)
+                except OSError as exc:
+                    messagebox.showerror("无法新建账套", f"{exc}\n可在“设置 → 新账套默认文件夹”调整保存位置。", parent=self)
+                    return
+                if not self.store:
+                    return
             BatchImportDialog(self, [Path(path) for path in chosen])
+
+    def choose_book_folder(self) -> None:
+        chosen = filedialog.askdirectory(parent=self, title="选择新账套默认保存文件夹", initialdir=str(self.controller.book_folder))
+        if chosen:
+            self.controller.preferences['book_folder'] = str(Path(chosen).resolve())
+            self.controller._save_preferences()
+            self.status.set(f"新账套将保存在：{self.controller.book_folder}")
 
     def delete_selected_source(self) -> None:
         if not self.store or not self.source_view.selection():
@@ -1480,6 +1504,7 @@ class App(tk.Toplevel):
             tags = tuple(filter(None, ("account_parent" if counts[row["key"]] > row["detail_count"] else "", side_tag)))
             self.summary_view.insert(parent_keys[row["key"]], "end", iid=row["key"], open=expansion_mode == "all" or row["key"] in expanded,
                                      values=(row["code"], row["name"], amount(row["opening_debit"]), amount(row["opening_credit"]), amount(pd), amount(pc), amount(row["year_debit"]), amount(row["year_credit"]), amount(row["closing_debit"]), amount(row["closing_credit"]), counts[row["key"]]), tags=tags)
+        self._expansion_labels()
         self.refresh_details()
         for kind in REPORT_KINDS:
             report_sources = [source for source in self.store.sources() if source["kind"] == kind]
@@ -1617,6 +1642,8 @@ class App(tk.Toplevel):
         self.detail_info.set(f"{count_label} · {self.period_filter.get()} · 点击日期、科目、凭证或借贷表头排序；双击一行看凭证")
 
     def open_account(self, _event: object) -> None:
+        if _event is not None and self.summary_view.identify_column(_event.x) == '#0':
+            return 'break'
         selection = self.summary_view.selection()
         if not selection:
             return
@@ -1629,6 +1656,25 @@ class App(tk.Toplevel):
         self.refresh_details()
         self.tabs.select(1)
 
+    def toggle_account(self, event):
+        view = self.summary_view
+        item = view.identify_row(event.y)
+        if item and view.identify_column(event.x) == '#0' and view.get_children(item):
+            view.selection_set(item)
+            view.focus(item)
+            view.item(item, open=not view.item(item, 'open'))
+            self._expansion_labels()
+            return 'break'
+
+    def _expansion_labels(self):
+        def visit(parent=''):
+            for item in self.summary_view.get_children(parent):
+                children = self.summary_view.get_children(item)
+                self.summary_view.item(item, text=('收起' if self.summary_view.item(item, 'open') else '展开') if children else '')
+                visit(item)
+        visit()
+        self.summary_view.dashed_grid.schedule()
+
     def set_expansion(self, expanded: bool) -> None:
         if not self.store:
             return
@@ -1637,6 +1683,7 @@ class App(tk.Toplevel):
                 self.summary_view.item(item, open=expanded)
                 visit(item)
         visit()
+        self._expansion_labels()
         self.store.save_setting("account_expansion_mode", "all" if expanded else "none")
 
     def remember_expansion(self) -> None:
@@ -1750,6 +1797,11 @@ class App(tk.Toplevel):
 
 
 class Application(tk.Tk):
+    @property
+    def book_folder(self) -> Path:
+        saved = self.preferences.get('book_folder')
+        return Path(saved).expanduser() if isinstance(saved, str) and saved else Path.home() / 'Documents' / 'DudLedger' / '账套'
+
     def __init__(self):
         super().__init__()
         self._configure_theme()

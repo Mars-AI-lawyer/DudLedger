@@ -51,11 +51,8 @@ class FakeClient:
         with self.lock:
             self.calls.append((state, questions))
         if 'entries' in state:
-            parts = [self.responder(entry) for entry in state['entries']]
-            data = {'model': 'jev-1.13.0',
-                    'answers': {f'entry_{i}_{key}': answer for i, part in enumerate(parts) for key, answer in part['answers'].items()},
-                    'usage': {'input_tokens': sum(p['usage']['input_tokens'] for p in parts),
-                              'output_tokens': sum(p['usage']['output_tokens'] for p in parts)}}
+            parts = [self.responder({**state['common'], **entry}) for entry in state['entries']]
+            data = max(parts, key=lambda r: r['answers']['priority']['score'])
         else:
             data = self.responder(state)
         return SimpleNamespace(model_dump=lambda **_kwargs: data)
@@ -113,7 +110,8 @@ class JevReviewTest(unittest.TestCase):
         self.assertEqual(set(payload), set(SEND_FIELDS))
         self.assertEqual(payload['debit'], '-100.25')
         self.assertEqual(payload['credit'], '0.00')
-        self.assertTrue(payload['related_party']['matched'])
+        self.assertNotIn('related_party', payload)
+        self.assertNotIn('甲公司', json.dumps(payload, ensure_ascii=False))
         text = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn('secret-name', text)
         self.assertNotIn('秘密制单人', text)
@@ -121,7 +119,8 @@ class JevReviewTest(unittest.TestCase):
 
     def test_consent_invalidated_by_data_party_rule_or_identical_reimport(self):
         batch = prepare_batch(self.store, {})
-        self.store.save_related_party('甲公司', [])
+        self.store.db.execute("UPDATE entries SET summary='修改摘要' WHERE id=1")
+        self.store.db.commit()
         with self.assertRaisesRegex(ValueError, '已变化'):
             ReviewJob(self.store.path, batch, 'test', FakeClient).start(self.store)
         discard_preview(self.store, batch)
@@ -151,7 +150,7 @@ class JevReviewTest(unittest.TestCase):
         loan = next(g for g in medium if g['hits'][0]['local']['summary'] == '股东借款')
         self.assertAlmostEqual(loan['score'], 84.9975)
         self.assertEqual(loan['amounts'], {'CNY': 10025})
-        self.assertEqual(len(loan['hits']), 1)
+        self.assertEqual(len(loan['hits']), 2)
         self.assertEqual(len(loan['lines']), 2)
         self.assertFalse(loan['partial'])
         uncertain = voucher_results(self.store, batch, '宽松', lane='uncertain')
@@ -164,9 +163,10 @@ class JevReviewTest(unittest.TestCase):
         self.assertEqual(len(FakeClient.calls), 3)
         grouped = next((state, qs) for state, qs in FakeClient.calls if len(state['entries']) == 2)
         self.assertEqual([entry['summary'] for entry in grouped[0]['entries']], ['股东借款', '普通往来'])
-        self.assertEqual(len(grouped[1]), 24)
-        self.assertIn('`entries[1]`', grouped[1]['entry_1_priority'].instructions)
-        all_inputs = [entry for state, _ in FakeClient.calls for entry in state['entries']]
+        self.assertEqual(grouped[0]['common']['entry_date'], '2026-01-01')
+        self.assertEqual(len(grouped[1]), 12)
+        self.assertIn('整体', grouped[1]['priority'].instructions)
+        all_inputs = [{**state['common'], **entry} for state, _ in FakeClient.calls for entry in state['entries']]
         self.assertTrue(all(set(entry) == set(SEND_FIELDS) for entry in all_inputs))
         second, _ = self.run_batch()
         self.assertEqual(len(FakeClient.calls), 3)
@@ -342,8 +342,6 @@ class JevReviewTest(unittest.TestCase):
             requests.append(body)
             data = response(2.6)
             data['answers']['priority']['legend'] = {str(i): text for i, text in enumerate(default_rules()['levels'])}
-            if 'entries' in body['state']:
-                data['answers'] = {f'entry_{i}_{key}': value for i, _entry in enumerate(body['state']['entries']) for key, value in data['answers'].items()}
             return httpx2.Response(200, json=data)
         def factory(**options):
             return TypeSafeClient(**options, transport=httpx2.MockTransport(handler))
@@ -357,7 +355,7 @@ class JevReviewTest(unittest.TestCase):
         self.assertEqual(grouped['status'], 'success')
         self.assertEqual(len(grouped['items']), 2)
         self.assertEqual(grouped['items'][0]['shared_entries'], 2)
-        self.assertEqual(len(requests[1]['questions']), 24)
+        self.assertEqual(len(requests[1]['questions']), 12)
 
     def test_last_moment_snapshot_change_stops_transmission(self):
         from ledger_viewer.jev_review import snapshot_is_current
@@ -397,6 +395,107 @@ class JevReviewTest(unittest.TestCase):
             keyring.set_password.assert_not_called()
             keys.delete_api_key()
             self.assertEqual(keys.get_api_key(), '')
+
+    def test_closing_vouchers_are_skipped_as_a_whole_and_counted(self):
+        self.store.delete_source(1)
+        path = self.base / 'closing.csv'
+        path.write_text('日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n'
+            '2026-01-31,1,6001,主营业务收入,结转本期损益,100,0\n'
+            '2026-01-31,1,4103,本年利润,结转本期损益,0,100\n'
+            '2026-01-31,2,1002,银行存款,结转损益,100,0\n'
+            '2026-01-31,2,4103,本年利润,结转损益,0,100\n'
+            '2026-01-31,3,6001,主营业务收入,结转损益并支付赔偿,100,0\n'
+            '2026-01-31,3,4103,本年利润,结转损益,0,100\n', encoding='utf-8')
+        header, _, mapping = guess_header(path, 'CSV', 'entry')
+        self.store.import_sheet(ImportSpec(path, 'CSV', header, 'entry', mapping))
+        batch, _ = self.run_batch()
+        counts = batch_counts(self.store, batch)
+        self.assertEqual((counts['skipped'], counts['skipped_vouchers']), (2, 1))
+        self.assertEqual((counts['finished_vouchers'], counts['successful_vouchers']), (3, 2))
+        self.assertEqual(len(FakeClient.calls), 2)
+        self.assertEqual(batch_info(self.store, batch)['status'], 'completed')
+        self.assertEqual(len(voucher_results(self.store, batch, lane='unfinished')), 0)
+        self.assertEqual(len(voucher_results(self.store, batch, lane='completed')), 3)
+
+    def test_compact_input_deduplicates_and_splits_without_losing_tail(self):
+        from ledger_viewer.jev_review import compact_state, MAX_STATE_BYTES, encode
+        payload = send_fields(next(iter_entries(self.store)))
+        result = request_review([payload] * 100, default_rules(), 'test', threading.Event(), FakeClient)
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(len(FakeClient.calls), 1)
+        self.assertEqual(len(FakeClient.calls[0][1]), 12)
+        self.assertEqual(FakeClient.calls[0][0], compact_state([payload]))
+        FakeClient.calls = []
+        texts = [{**payload, 'summary': f'事项{i}：' + '普通经营款项' * 30} for i in range(70)]
+        texts.append({**payload, 'summary': '日常往来。' * 1000 + '尾部明确执行扣款'})
+        FakeClient.responder = staticmethod(lambda state: response(4 if '尾部明确执行扣款' in state['summary'] else 0.1))
+        result = request_review(texts, default_rules(), 'test', threading.Event(), FakeClient)
+        self.assertEqual(result['status'], 'success')
+        self.assertGreater(len(FakeClient.calls), 1)
+        self.assertEqual(result['items'][0]['answers']['priority']['score'], 4)
+        self.assertTrue(result['items'][0]['needs_manual_review'])
+        self.assertEqual(result['items'][0]['answers']['insufficient']['noul'], 0.1)
+        self.assertEqual(len(result['items'][0]['part_results']), len(FakeClient.calls))
+        self.assertEqual(result['items'][0]['chunks'], len(FakeClient.calls))
+        restored = []
+        for state, questions in FakeClient.calls:
+            self.assertLessEqual(len(encode(state).encode('utf-8')), MAX_STATE_BYTES)
+            self.assertEqual(len(questions), 12)
+            restored.extend({**state['common'], **entry} for entry in state['entries'])
+        for text in texts[:-1]:
+            self.assertIn(text, restored)
+        self.assertTrue(any('尾部明确执行扣款' in r['summary'] for r in restored))
+
+    def test_context_error_splits_and_failure_never_becomes_success(self):
+        class TooLong(Exception):
+            status_code = 413
+        class LimitedClient(FakeClient):
+            def system_one(inner, *, state, questions):
+                if len(state['entries']) > 1:
+                    raise TooLong('private body')
+                return super(LimitedClient, inner).system_one(state=state, questions=questions)
+        payload = send_fields(next(iter_entries(self.store)))
+        result = request_review([payload, {**payload, 'summary': '另一事项'}], default_rules(), 'key', threading.Event(), LimitedClient)
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(result['attempts'], 3)
+        self.assertEqual(result['items'][0]['chunks'], 2)
+        class AlwaysLong(FakeClient):
+            def system_one(inner, **kwargs):
+                raise TooLong('private body')
+        result = request_review([payload], default_rules(), 'key', threading.Event(), AlwaysLong)
+        self.assertEqual(result['status'], 'failed')
+        self.assertNotIn('private body', str(result))
+        self.assertNotIn('items', result)
+        rules = default_rules()
+        rules['common'] *= 100
+        calls = len(FakeClient.calls)
+        result = request_review([payload], rules, 'key', threading.Event(), FakeClient)
+        self.assertEqual(result['attempts'], 0)
+        self.assertEqual(len(FakeClient.calls), calls)
+
+    def test_candidate_policy_keeps_uncertainty_and_high_priority_tail(self):
+        tail = response(1.5, topics={'loan': 0.01})
+        tail['answers']['priority']['probabilities'] = {'0': 0.5, '1': 0, '2': 0, '3': 0.5, '4': 0}
+        FakeClient.responder = staticmethod(lambda state: tail if state['summary'] == '股东借款' else
+            response(0.1, insufficient=0.9 if state['summary'] == '信息含糊' else 0.1, topics={'loan': 0.01}))
+        batch, _ = self.run_batch()
+        self.assertEqual(voucher_results(self.store, batch, lane='scored'), [])
+        self.assertEqual(len(voucher_results(self.store, batch, lane='candidates')), 2)
+        self.assertEqual(len(voucher_results(self.store, batch, tier='中', lane='candidates')), 1)
+        self.assertEqual(len(voucher_results(self.store, batch, lane='completed')), 3)
+
+    def test_rule_upgrade_preserves_user_changes_and_historical_version(self):
+        from ledger_viewer.jev_rules import LEGACY_DEFAULT_RULES
+        import copy
+        old = copy.deepcopy(LEGACY_DEFAULT_RULES)
+        old['topics'][0]['question'] = '用户自定义借款问题'
+        old_id = save_rules(self.store, old)
+        new_id, updated = load_rules(self.store)
+        self.assertGreater(new_id, old_id)
+        self.assertEqual(updated['topics'][0]['question'], old['topics'][0]['question'])
+        self.assertEqual(updated['common'], default_rules()['common'])
+        self.assertEqual(json.loads(self.store.db.execute('SELECT body_json FROM jev_rules WHERE id=?', (old_id,)).fetchone()[0]), old)
+        self.assertEqual(load_rules(self.store)[0], new_id)
 
 
 if __name__ == '__main__':
