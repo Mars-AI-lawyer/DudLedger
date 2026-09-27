@@ -14,3 +14,6 @@ legal-ledger-viewer = "ledger_viewer.ui:main"
 
 [tool.setuptools.packages.find]
 include = ["ledger_viewer*"]
+
+[tool.setuptools.package-data]
+ledger_viewer = ["skills/dudledger-import/*.md"]

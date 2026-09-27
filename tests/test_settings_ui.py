@@ -53,7 +53,10 @@ class SettingsDialogTest(unittest.TestCase):
         saved = {"key": ""}
         with patch("ledger_viewer.ui.deepseek_get_api_key", side_effect=lambda: saved["key"]), patch(
             "ledger_viewer.ui.deepseek_save_api_key", side_effect=lambda value: saved.__setitem__("key", value)
-        ), patch("ledger_viewer.ui.deepseek_memory_only", return_value=False):
+        ), patch("ledger_viewer.ui.deepseek_memory_only", return_value=False), patch(
+            # 不 mock 的话，这里会删掉系统钥匙串里用户真实的 DeepSeek 密钥
+            "ledger_viewer.ui.deepseek_delete_api_key", side_effect=lambda: saved.__setitem__("key", "")
+        ):
             try:
                 app = Application()
             except tk.TclError as exc:

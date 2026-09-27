@@ -114,7 +114,8 @@ class JevMappingTest(unittest.TestCase):
         suggestion = suggest_mapping(preview, "test-key", DuplicateClient)
         self.assertNotIn("left_amount_3", suggestion.mapping)
         self.assertNotIn("right_amount_3", suggestion.mapping)
-        self.assertEqual(sorted(suggestion.warnings), sorted((
+        self.assertEqual(suggestion.warnings, ())
+        self.assertEqual(sorted(suggestion.notices), sorted((
             "“left_amount_3”与“left_amount_2”选择了同一列，已按置信度保留“left_amount_2”；请人工核对",
             "“right_amount_3”与“right_amount_2”选择了同一列，已按置信度保留“right_amount_2”；请人工核对",
         )))

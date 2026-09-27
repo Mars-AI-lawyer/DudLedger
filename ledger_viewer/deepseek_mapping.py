@@ -97,7 +97,9 @@ def _messages(preview: dict) -> list[dict]:
         "- header_row 必须是预览中真实存在的行号；两层表头时选借贷等子标题所在的最后一行，不要选公司名称或报表标题行。\n"
         "- 无法可靠判断时 kind 选 unknown 且 mapping 留空；宁可空置，不要猜测。\n"
         "- 借方/贷方金额列不能选成余额列；本年累计不能选成本期发生。\n"
-        "- warnings 用中文列出不确定之处，例如表头不规则、借贷列易混淆等。"
+        "- warnings 只列出尚未解决、会影响数据含义的具体疑点；正常双层表头或泛泛的核对建议不要列出；没有疑点返回空数组。\n"
+        "- 例如以下情况不算疑点，不要写入 warnings：某列本就不该映射（凭证合计列、原币列全为 0、行次列）；凭证字与编号合并在一列；余额方向列出现“平”；报表表尾的落款行。\n"
+        "- 多币种余额表的发生额、余额列优先选本币（人民币）列，原币列留空。"
     )
     return [{"role": "system", "content": "你是中国会计电子表格识别助手。只输出一个 JSON 对象，不要输出任何其他文字。"},
             {"role": "user", "content": user}]
@@ -163,11 +165,10 @@ def suggest_mapping(preview: dict, api_key: str, chat=_chat) -> MappingSuggestio
     payload = {
         "model": MODEL,
         "messages": _messages(preview),
-        "temperature": 0,
         "stream": False,
         "response_format": {"type": "json_object"},
-        # The user chose a no-thinking quick model; keep latency and cost low.
-        "thinking": {"type": "disabled"},
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "low",
     }
     answer = _json_answer(chat(api_key, payload))
     kind = answer.get("kind")
@@ -204,9 +205,15 @@ def suggest_mapping(preview: dict, api_key: str, chat=_chat) -> MappingSuggestio
     extra_fields = [key for key in raw if key not in KIND_FIELDS[kind]]
     if extra_fields:
         dropped.append("以下字段不属于该表类型，已忽略：" + "、".join(sorted(map(str, extra_fields))[:6]))
-    warnings = critical_warnings(kind, mapping) + dropped
+    # 舍弃说明与模型自述都只是解释性信息，不阻塞建议；真正丢数据的情形由 critical_warnings 与预检兜住
+    notices = dropped
+    model_warnings = answer.get("warnings", [])
+    if isinstance(model_warnings, list):
+        notices.extend(message[:300] for message in model_warnings[:8]
+                       if isinstance(message, str) and message.strip())
+    warnings = list(critical_warnings(kind, mapping))
     try:
         ImportSpec(Path("preview.xlsx"), preview["sheet"], header_row, kind, mapping).validate()
     except ValueError as exc:
         warnings.append(f"当前建议尚不满足导入条件：{exc}")
-    return MappingSuggestion(kind, header_row, mapping, {}, tuple(warnings), MODEL)
+    return MappingSuggestion(kind, header_row, mapping, {}, tuple(warnings), MODEL, tuple(notices))

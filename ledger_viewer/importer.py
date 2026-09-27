@@ -29,8 +29,8 @@ FIELDS = {
     "period": ("期间", "会计期间", "月份", "月", "period"),
     "voucher_no": ("凭证号", "凭证编号", "凭证号码", "凭证号数", "凭证字号", "voucher no", "voucher number"),
     "voucher_type": ("凭证字", "凭证类型", "凭证类别", "字", "voucher type"),
-    "account_code": ("科目编码", "科目代码", "会计科目编码", "科目编号", "account code"),
-    "account_name": ("科目名称", "科目全名", "会计科目", "科目", "account name"),
+    "account_code": ("科目编码", "科目代码", "会计科目编码", "科目编号", "科目末级编码", "account code"),
+    "account_name": ("科目名称", "科目全名", "会计科目", "科目", "科目末级名称", "account name"),
     "summary": ("摘要", "业务摘要", "说明", "description", "memo"),
     "debit": ("借方金额", "借方发生额", "本期借方", "借方", "debit"),
     "credit": ("贷方金额", "贷方发生额", "本期贷方", "贷方", "credit"),
@@ -43,23 +43,27 @@ FIELDS = {
     "maker": ("制单", "制单人", "录入人", "prepared by"),
     "opening_debit": ("期初借方", "期初余额借方", "期初借方余额", "年初借方", "opening debit"),
     "opening_credit": ("期初贷方", "期初余额贷方", "期初贷方余额", "年初贷方", "opening credit"),
-    "period_debit": ("本期借方发生额", "借方本期发生额", "本期借方", "本期发生借方", "本期发生额借方", "借方发生额", "period debit"),
-    "period_credit": ("本期贷方发生额", "贷方本期发生额", "本期贷方", "本期发生贷方", "本期发生额贷方", "贷方发生额", "period credit"),
+    "period_debit": ("本期借方发生额", "借方本期发生额", "本期借方", "本期发生借方", "本期发生额借方", "借方发生额", "借方本币", "period debit"),
+    "period_credit": ("本期贷方发生额", "贷方本期发生额", "本期贷方", "本期发生贷方", "本期发生额贷方", "贷方发生额", "贷方本币", "period credit"),
     "year_debit": ("本年累计借方", "本年累计借方发生额", "本年借方累计", "year debit"),
     "year_credit": ("本年累计贷方", "本年累计贷方发生额", "本年贷方累计", "year credit"),
     "closing_debit": ("期末借方", "期末余额借方", "期末借方余额", "期末借方金额", "closing debit"),
     "closing_credit": ("期末贷方", "期末余额贷方", "期末贷方余额", "期末贷方金额", "closing credit"),
-    "opening_balance": ("期初余额", "年初余额", "opening balance"),
-    "closing_balance": ("期末余额", "closing balance"),
+    "opening_balance": ("期初余额", "年初余额", "期初余额本币", "opening balance"),
+    "closing_balance": ("期末余额", "期末余额本币", "closing balance"),
     "direction": ("余额方向", "借贷方向", "方向", "借或贷", "balance direction"),
+    "opening_direction": ("期初方向", "期初余额方向", "期初借贷方向"),
+    "closing_direction": ("期末方向", "期末余额方向", "期末借贷方向"),
 }
 
 REPORT_KINDS = ("balance_sheet", "income_statement")
 REPORT_ITEM_HEADERS = {"项目", "项目名称", "报表项目", "科目", "名称", "item", "description"}
-REPORT_AMOUNT_HEADERS = {"期末余额", "期初余额", "年初余额", "上年年末余额", "本期金额", "本年金额", "上期金额", "本年累计金额", "上年同期金额", "本年累计", "上年同期", "本期数", "上期数", "期末数", "期初数", "amount", "current", "prior"}
+REPORT_AMOUNT_HEADERS = {"期末余额", "期初余额", "年初余额", "上年年末余额", "本期金额", "本年金额", "上期金额", "本年累计金额", "上年同期金额", "本年累计", "上年同期", "本期数", "上期数", "期末数", "期初数", "发生额", "amount", "current", "prior"}
+# 行次/序号是编号列，不是报表项目，也不能当作“紧邻金额列的项目”参与结构判断
+REPORT_INDEX_HEADERS = {"行次", "行号", "序号"}
 
 SUBTOTAL = re.compile(r"^(?:本月|本年|本期|全年|当月)?(?:合计|累计|小计|总计)$")
-FOOTER = re.compile(r"^(?:第\s*\d+\s*页\b|共\s*\d+\s*页\b|打印(?:时间|日期)|制表(?:人|日期)|审核(?:人|日期))")
+FOOTER = re.compile(r"^(?:第\s*\d+\s*页\b|共\s*\d+\s*页\b|打印(?:时间|日期|人)|制表(?:人|日期)|审核(?:人|日期)|复核人|会计主管|(?:企业|单位|机构|财务)?负责人)")
 
 # 表头扫描窗口：解除“前 20 行”限制即可——使用者导入前会先手动整理表格，标题区不会太深；
 # 扫太深既无必要，还会让深处另一张表的表头有机会抢过真表头。更深的表头可手动填行号。
@@ -166,6 +170,10 @@ def period_text(value: object) -> str:
         number = int(float(raw))
         if 1 <= number <= 13:
             return str(number)
+    # “2024.1”式的年.月列：期间取月份部分
+    year_month = re.fullmatch(r"(\d{4})\.(\d{1,2})", raw)
+    if year_month and 1 <= int(year_month.group(2)) <= 12:
+        return year_month.group(2)
     raise ValueError(f"会计期间无法识别：{raw}")
 
 
@@ -472,7 +480,8 @@ def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
         item_headers = {_norm(name) for name in REPORT_ITEM_HEADERS}
         amount_headers = {_norm(name) for name in REPORT_AMOUNT_HEADERS}
         items = [i for i, value in enumerate(headers) if _norm(value) in item_headers]
-        structural_items = [i for i in range(len(headers) - 1) if _norm(headers[i]) and _norm(headers[i + 1]) in amount_headers and _norm(headers[i]) not in amount_headers]
+        structural_items = [i for i in range(len(headers) - 1) if _norm(headers[i]) and _norm(headers[i + 1]) in amount_headers
+                            and _norm(headers[i]) not in amount_headers and _norm(headers[i]) not in REPORT_INDEX_HEADERS]
         items = sorted(set(items) | set(structural_items))
         if not items:
             return {}
@@ -487,7 +496,7 @@ def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
                 mapping[f"{side}_amount_{number}"] = index
         return mapping
     mapping: dict[str, int] = {}
-    fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "opening_balance", "closing_balance", "direction")
+    fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "opening_balance", "closing_balance", "direction", "opening_direction", "closing_direction")
     for field in fields:
         aliases = FIELDS[field]
         for index, header in enumerate(headers):
@@ -546,9 +555,9 @@ class ImportSpec:
                     raise ValueError("至少映射一个借方或贷方金额列，或同时映射“金额”与“借贷方向”列")
         if self.kind == "entry" and "amount" in self.mapping and "direction" not in self.mapping:
             raise ValueError("单列金额必须同时映射借贷方向列，避免猜测借贷方向")
-        if self.kind == "balance" and "closing_balance" in self.mapping and "direction" not in self.mapping:
+        if self.kind == "balance" and "closing_balance" in self.mapping and not ({"direction", "closing_direction"} & set(self.mapping)):
             raise ValueError("单列期末余额必须同时映射余额方向，避免猜测借贷方向")
-        if self.kind == "balance" and "opening_balance" in self.mapping and "direction" not in self.mapping:
+        if self.kind == "balance" and "opening_balance" in self.mapping and not ({"direction", "opening_direction"} & set(self.mapping)):
             raise ValueError("单列期初余额必须同时映射余额方向，避免猜测借贷方向")
         if len(set(self.mapping.values())) != len(self.mapping):
             raise ValueError("同一列不能映射多个字段")
@@ -837,7 +846,9 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
                     if period_name + "_balance" in spec.mapping:
                         single = money(mapped(row, period_name + "_balance", row_no))
                         if single:
-                            base = _direction_side(direction, label="余额方向")
+                            # 期初/期末方向分列的余额表各取各的方向；只有共用方向列时才共用
+                            period_direction = text_value(mapped(row, period_name + "_direction", row_no)) if period_name + "_direction" in spec.mapping else direction
+                            base = _direction_side(period_direction, label="余额方向")
                             side = base if single > 0 else ("credit" if base == "debit" else "debit")
                             amounts[period_name + "_" + side + "_cents"] = abs(single)
                 if not any(amounts.values()):

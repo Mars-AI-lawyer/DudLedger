@@ -29,7 +29,7 @@ def canned(answer, raw=False):
 
 
 class DeepSeekMappingTest(unittest.TestCase):
-    def test_payload_disables_thinking_and_result_is_parsed(self):
+    def test_payload_uses_low_thinking_and_result_is_parsed(self):
         chat = canned({"kind": "entry", "header_row": 1,
                        "mapping": {"date": 1, "voucher_no": 2, "account_code": 3, "account_name": 4, "summary": 5, "debit": 6, "credit": 7},
                        "warnings": ["请核对借贷方向"]})
@@ -37,13 +37,15 @@ class DeepSeekMappingTest(unittest.TestCase):
         payload = chat.calls[0]
         self.assertEqual(payload["model"], "deepseek-flash")
         self.assertEqual(payload["response_format"], {"type": "json_object"})
-        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertEqual(payload["reasoning_effort"], "low")
         self.assertFalse(payload["stream"])
         self.assertIn("JSON", payload["messages"][0]["content"])
         self.assertEqual(result.kind, "entry")
         self.assertEqual(result.header_row, 1)
         self.assertEqual(result.mapping, {"date": 0, "voucher_no": 1, "account_code": 2, "account_name": 3, "summary": 4, "debit": 5, "credit": 6})
         self.assertEqual(result.warnings, ())
+        self.assertEqual(result.notices, ("请核对借贷方向",))
         self.assertEqual(result.model, "deepseek-flash")
 
     def test_unknown_kind_is_rejected(self):
@@ -60,13 +62,14 @@ class DeepSeekMappingTest(unittest.TestCase):
                        "warnings": ["请核对借贷方向"]})
         result = suggest_mapping(PREVIEW, "sk-test", chat=chat)
         self.assertEqual(result.mapping, {"account_code": 6, "credit": 2})
-        self.assertEqual(result.warnings, (
-            "借方或贷方金额只识别到一侧，请核对另一侧金额列",
+        self.assertEqual(result.warnings, ("借方或贷方金额只识别到一侧，请核对另一侧金额列",))
+        self.assertEqual(result.notices, (
             "“account_name”与“account_code”建议了同一列，已保留先出现的“account_code”",
             "“debit”建议的第 99 列超出预览范围，已舍弃",
+            "请核对借贷方向",
         ))
 
-    def test_complete_mapping_stays_silent(self):
+    def test_model_notes_do_not_block_valid_mapping(self):
         balance_preview = {"sheet": "余额表", "rows": [
             {"row": 1, "cells": [f"列{i}" for i in range(1, 11)]},
             {"row": 2, "cells": ["1002", "银行存款", "1", "0", "2", "1", "3", "2", "5", "0"]},
@@ -78,6 +81,7 @@ class DeepSeekMappingTest(unittest.TestCase):
                        "warnings": ["表头为两层结构", "请核对借贷方向"]})
         result = suggest_mapping(balance_preview, "sk-test", chat=chat)
         self.assertEqual(result.warnings, ())
+        self.assertEqual(result.notices, ("表头为两层结构", "请核对借贷方向"))
 
     def test_missing_required_fields_add_import_warning(self):
         chat = canned({"kind": "entry", "header_row": 1, "mapping": {"summary": 5}, "warnings": []})

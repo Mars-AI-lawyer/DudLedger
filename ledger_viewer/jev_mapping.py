@@ -35,8 +35,8 @@ FIELD_DESCRIPTIONS = {
     "account_code": "会计科目编码或代码。",
     "account_name": "会计科目名称。",
     "summary": "分录摘要或业务说明。",
-    "debit": "明细分录的借方发生金额。",
-    "credit": "明细分录的贷方发生金额。",
+    "debit": "明细分录的借方发生金额；表格是“单列金额＋借贷方向”布局时选 none，不要选金额列。",
+    "credit": "明细分录的贷方发生金额；表格是“单列金额＋借贷方向”布局时选 none，不要选金额列。",
     "amount": "单一金额列；表格没有借贷分列、金额只有一列时选它，必须同时选“direction”。",
     "counterparty": "往来单位、客户或供应商名称。",
     "auxiliary": "辅助核算或核算维度。",
@@ -53,7 +53,9 @@ FIELD_DESCRIPTIONS = {
     "closing_debit": "科目期末余额的借方列；不能选贷方列。",
     "closing_credit": "科目期末余额的贷方列；不能选借方列。",
     "closing_balance": "科目期末余额的单列金额；不是借贷分列。",
-    "direction": "借贷方向列（借/贷/平），或余额表的余额方向；单列金额、单列余额必须选它。",
+    "direction": "借贷方向列（借/贷/平），或余额表期初与期末共用一个方向列；单列金额、单列余额必须选它。",
+    "opening_direction": "余额表期初余额的方向列（借/贷/平）；期初与期末方向分成两列时选它，不要选期末方向列。",
+    "closing_direction": "余额表期末余额的方向列（借/贷/平）；期初与期末方向分成两列时选它，不要选期初方向列。",
     "left_item": "左侧或单侧报表项目名称；不是金额。",
     "left_amount_1": "左侧项目右边第一列金额。",
     "left_amount_2": "左侧项目右边第二列金额。",
@@ -66,7 +68,7 @@ FIELD_DESCRIPTIONS = {
 
 KIND_FIELDS = {
     "entry": ("date", "fiscal_year", "period", "voucher_type", "voucher_no", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker"),
-    "balance": ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "closing_balance", "direction"),
+    "balance": ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "closing_balance", "direction", "opening_direction", "closing_direction"),
     "balance_sheet": ("left_item", "left_amount_1", "left_amount_2", "left_amount_3", "right_item", "right_amount_1", "right_amount_2", "right_amount_3"),
     "income_statement": ("left_item", "left_amount_1", "left_amount_2", "left_amount_3"),
 }
@@ -80,6 +82,8 @@ class MappingSuggestion:
     confidence: dict[str, float]
     warnings: tuple[str, ...]
     model: str
+    # 说明性提示（如同列冲突的取舍），不影响导入，也不会阻塞 AI 建议的通过
+    notices: tuple[str, ...] = ()
 
 
 _SESSION_KEY = None
@@ -207,7 +211,8 @@ def suggest_mapping(preview: dict, api_key: str, client_factory=TypeSafeClient) 
             criteria[f"c{index + 1}"] = f"第 {index + 1} 列；上一行 {upper!r}；本行 {current!r}；下一行样例 {sample!r}"
         questions = {
             field: Choice(
-                instructions=f"这张表已判断为 {KIND_DESCRIPTIONS[kind]} 请从列中选择“{field}”：{FIELD_DESCRIPTIONS[field]} 没有对应列选 none。",
+                instructions=f"这张表已判断为 {KIND_DESCRIPTIONS[kind]} 请从列中选择“{field}”：{FIELD_DESCRIPTIONS[field]} 没有对应列选 none。"
+                             + ("多币种余额表的发生额、余额请选本币（人民币）列，原币列留空。" if kind == "balance" else ""),
                 criteria=criteria,
             )
             for field in KIND_FIELDS[kind]
@@ -229,14 +234,15 @@ def suggest_mapping(preview: dict, api_key: str, client_factory=TypeSafeClient) 
         mapping[field] = index
         occupied[index] = field
     warnings = critical_warnings(kind, mapping)
+    notices = []
     for _score, field, index in sorted(candidates, reverse=True):
         if field in mapping:
             continue
         loser = occupied.get(index, "?")
-        warnings.append(f"“{field}”与“{loser}”选择了同一列，已按置信度保留“{loser}”；请人工核对")
+        notices.append(f"“{field}”与“{loser}”选择了同一列，已按置信度保留“{loser}”；请人工核对")
     try:
         ImportSpec(Path("preview.xlsx"), preview["sheet"], header_row, kind, mapping).validate()
     except ValueError as exc:
         warnings.append(f"当前建议尚不满足导入条件：{exc}")
     model = getattr(second, "model", "jev-latest")
-    return MappingSuggestion(kind, header_row, mapping, confidence, tuple(warnings), str(model))
+    return MappingSuggestion(kind, header_row, mapping, confidence, tuple(warnings), str(model), tuple(notices))
