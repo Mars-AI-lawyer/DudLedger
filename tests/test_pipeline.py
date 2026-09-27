@@ -173,7 +173,7 @@ class PipelineTest(unittest.TestCase):
         migrated = LedgerStore(path)
         row = migrated.db.execute("SELECT fiscal_year,period FROM entries WHERE id=1").fetchone()
         self.assertEqual(tuple(row), ("2026", "6"))
-        self.assertEqual(migrated.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], "legal-ledger-viewer-v6")
+        self.assertEqual(migrated.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], "legal-ledger-viewer-v7")
         self.assertTrue(migrated.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_rows'").fetchone())
         self.assertTrue(migrated.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='voucher_marks'").fetchone())
         migrated.close()
@@ -208,7 +208,7 @@ class PipelineTest(unittest.TestCase):
         self.store.db.commit()
         self.store.close()
         self.store = LedgerStore(self.base / "case.sqlite")
-        self.assertEqual(self.store.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], "legal-ledger-viewer-v6")
+        self.assertEqual(self.store.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], "legal-ledger-viewer-v7")
         self.assertIn("year_debit_cents", {row["name"] for row in self.store.db.execute("PRAGMA table_info(balances)")})
         self.assertIn("left_amount_3_cents", {row["name"] for row in self.store.db.execute("PRAGMA table_info(report_rows)")})
 

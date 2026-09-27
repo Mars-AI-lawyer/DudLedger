@@ -2,10 +2,12 @@ import tempfile
 import tkinter as tk
 import unittest
 from pathlib import Path
+from tkinter import ttk
 from unittest.mock import patch
 
 from ledger_viewer.importer import ImportSpec, guess_header
 from ledger_viewer.ui import Application
+from ledger_viewer.voucher_notes import list_marks
 
 
 class EntryWorkflowTest(unittest.TestCase):
@@ -119,3 +121,54 @@ class EntryWorkflowTest(unittest.TestCase):
         self.app.open_account(None)
         self.assertEqual(self.app.tabs.index('current'), 1)
         self.assertEqual(len(self.app.detail_view.get_children()), 2)
+
+    def test_voucher_lookup_stays_compact_until_notes_are_requested(self):
+        self.app._use_book(self.base / 'book.sqlite')
+        header, _, mapping = guess_header(self.source, 'CSV', 'entry')
+        self.app.store.import_sheet(ImportSpec(self.source, 'CSV', header, 'entry', mapping))
+        self.app.refresh_all()
+        entry_id = int(self.app.detail_view.get_children()[0])
+
+        def widgets(parent):
+            for child in parent.winfo_children():
+                yield child
+                yield from widgets(child)
+
+        def button(dialog, text):
+            return next(w for w in widgets(dialog) if isinstance(w, ttk.Button) and w.cget('text') == text)
+
+        self.app.open_voucher(None, entry_id=entry_id)
+        self.root.update()
+        dialog = next(iter(self.app.voucher_windows))
+        editor = next(w for w in widgets(dialog) if isinstance(w, tk.Text))
+        view = next(w for w in widgets(dialog) if isinstance(w, ttk.Treeview))
+        compact_height = dialog.winfo_height()
+        self.assertLess(compact_height, 350)
+        self.assertFalse(editor.winfo_ismapped())
+        self.assertTrue(view.bbox(view.get_children()[-1]))
+        self.assertEqual(list_marks(self.app.store), [])
+        button(dialog, '关注这张凭证').invoke()
+        self.root.update()
+        self.assertTrue(editor.winfo_ismapped())
+        self.assertGreater(dialog.winfo_height(), compact_height)
+        self.assertEqual(list_marks(self.app.store), [])
+        editor.insert('1.0', '待补合同')
+        button(dialog, '保存关注与注释').invoke()
+        self.assertEqual(list_marks(self.app.store)[0]['note'], '待补合同')
+        button(dialog, '收起备注').invoke()
+        self.root.update()
+        self.assertFalse(editor.winfo_ismapped())
+        self.assertLessEqual(dialog.winfo_height(), compact_height + 2)
+        self.app.open_voucher(None, entry_id=entry_id)
+        self.root.update()
+        self.assertFalse(dialog.winfo_exists())
+        dialog = next(iter(self.app.voucher_windows))
+        editor = next(w for w in widgets(dialog) if isinstance(w, tk.Text))
+        self.assertFalse(editor.winfo_ismapped())
+        self.assertEqual(editor.get('1.0', 'end-1c'), '待补合同')
+        button(dialog, '查看 / 编辑关注备注').invoke()
+        self.root.update()
+        checkbox = next(w for w in widgets(dialog) if isinstance(w, ttk.Checkbutton))
+        checkbox.invoke()
+        button(dialog, '保存关注与注释').invoke()
+        self.assertEqual(list_marks(self.app.store), [])

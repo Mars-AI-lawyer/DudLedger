@@ -89,7 +89,7 @@ class JevMappingTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 save_api_key("bad key")
 
-    def test_duplicate_amount_column_is_left_for_manual_review(self):
+    def test_duplicate_optional_columns_are_reported_not_silent(self):
         class DuplicateClient(FakeClient):
             def system_one(self, *, state, questions):
                 if "kind" in questions:
@@ -114,7 +114,32 @@ class JevMappingTest(unittest.TestCase):
         suggestion = suggest_mapping(preview, "test-key", DuplicateClient)
         self.assertNotIn("left_amount_3", suggestion.mapping)
         self.assertNotIn("right_amount_3", suggestion.mapping)
-        self.assertIn("左侧项目右边第三列金额", " ".join(suggestion.warnings))
+        self.assertEqual(sorted(suggestion.warnings), sorted((
+            "“left_amount_3”与“left_amount_2”选择了同一列，已按置信度保留“left_amount_2”；请人工核对",
+            "“right_amount_3”与“right_amount_2”选择了同一列，已按置信度保留“right_amount_2”；请人工核对",
+        )))
+
+    def test_one_sided_amount_mapping_is_reported(self):
+        class OneSidedClient(FakeClient):
+            def system_one(self, *, state, questions):
+                if "kind" in questions:
+                    proposed = {"kind": ("entry", 0.9), "header": ("r1", 0.9)}
+                else:
+                    proposed = {field: ("none", 0.9) for field in questions}
+                    proposed.update({"account_code": ("c1", 0.9), "debit": ("c2", 0.9), "credit": ("c2", 0.8)})
+                return SimpleNamespace(choices={
+                    field: SimpleNamespace(choice=value, confidence=score)
+                    for field, (value, score) in proposed.items()
+                }, model="jev-1.13.0")
+
+        preview = {"sheet": "序时簿", "rows": [
+            {"row": 1, "cells": ["科目编码", "借方金额", "贷方金额"]},
+            {"row": 2, "cells": ["1002", "10", "0"]},
+        ]}
+        suggestion = suggest_mapping(preview, "test-key", OneSidedClient)
+        self.assertEqual(suggestion.mapping.get("debit"), 1)
+        self.assertNotIn("credit", suggestion.mapping)
+        self.assertTrue(any("只识别到一侧" in warning for warning in suggestion.warnings))
 
 
 if __name__ == "__main__":

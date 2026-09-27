@@ -11,7 +11,7 @@ from pathlib import Path
 import keyring
 
 from .importer import ImportSpec
-from .jev_mapping import FIELD_DESCRIPTIONS, KIND_DESCRIPTIONS, KIND_FIELDS, MappingSuggestion
+from .jev_mapping import FIELD_DESCRIPTIONS, KIND_DESCRIPTIONS, KIND_FIELDS, MappingSuggestion, critical_warnings
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-flash"
@@ -181,27 +181,30 @@ def suggest_mapping(preview: dict, api_key: str, chat=_chat) -> MappingSuggestio
         raise ValueError("DeepSeek 返回的表头行不在预览范围内")
     column_count = max(len(item["cells"]) for item in preview["rows"])
     raw = answer.get("mapping") if isinstance(answer.get("mapping"), dict) else {}
+    # 超范围、无法解析或与其他字段占同一列的建议列为“丢弃”，必须提示而不是静默吞掉
     mapping: dict[str, int] = {}
-    occupied: set[int] = set()
-    warnings: list[str] = []
+    occupied: dict[int, str] = {}
+    dropped: list[str] = []
     for field in KIND_FIELDS[kind]:
         if field not in raw:
             continue
-        label = FIELD_DESCRIPTIONS[field].split("；", 1)[0].rstrip("。")
         try:
             index = int(raw[field]) - 1
         except (TypeError, ValueError):
-            warnings.append(f"“{label}”的列号无法解析，留待手工确认")
+            dropped.append(f"“{field}”的列号无法解析（{raw[field]!r}），已舍弃")
             continue
         if not 0 <= index < column_count:
-            warnings.append(f"“{label}”的列号超出工作表范围，留待手工确认")
+            dropped.append(f"“{field}”建议的第 {index + 1} 列超出预览范围，已舍弃")
             continue
         if index in occupied:
-            warnings.append(f"第 {index + 1} 列被重复建议；“{label}”留待手工确认")
+            dropped.append(f"“{field}”与“{occupied[index]}”建议了同一列，已保留先出现的“{occupied[index]}”")
             continue
         mapping[field] = index
-        occupied.add(index)
-    warnings.extend(str(item) for item in answer.get("warnings", ()) if item)
+        occupied[index] = field
+    extra_fields = [key for key in raw if key not in KIND_FIELDS[kind]]
+    if extra_fields:
+        dropped.append("以下字段不属于该表类型，已忽略：" + "、".join(sorted(map(str, extra_fields))[:6]))
+    warnings = critical_warnings(kind, mapping) + dropped
     try:
         ImportSpec(Path("preview.xlsx"), preview["sheet"], header_row, kind, mapping).validate()
     except ValueError as exc:

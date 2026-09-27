@@ -15,7 +15,8 @@ from .jev_runtime import REQUEST_SLOTS
 KEYRING_SERVICE = "DudLedger Jev"
 KEYRING_ACCOUNT = "typesafe_api_key"
 PREVIEW_ROWS = 20
-PREVIEW_COLUMNS = 20
+# 宽表按列分块发送：上限 40 列，超出的列不发送（本地规则仍可识别更多列）
+PREVIEW_COLUMNS = 40
 
 KIND_DESCRIPTIONS = {
     "entry": "序时账或明细账；每行是一条会计分录，常见日期、凭证号、科目、摘要、借方金额、贷方金额。",
@@ -160,6 +161,17 @@ def _answer(response, question: str, allowed: set[str]) -> tuple[str, float]:
     return answer.choice, float(answer.confidence)
 
 
+def critical_warnings(kind: str, mapping: dict) -> list[str]:
+    """Only surface suggestions that lose data the importer cannot reconstruct;
+    everything else stays silent and is reviewable in the filled preview."""
+    hints = []
+    if kind == "entry" and ("debit" in mapping) != ("credit" in mapping):
+        hints.append("借方或贷方金额只识别到一侧，请核对另一侧金额列")
+    if kind == "balance" and "closing_balance" not in mapping and ("closing_debit" in mapping) != ("closing_credit" in mapping):
+        hints.append("期末余额只识别到一侧借贷列，请核对")
+    return hints
+
+
 def suggest_mapping(preview: dict, api_key: str, client_factory=TypeSafeClient) -> MappingSuggestion:
     """Jev selects from supplied rows and columns; code validates every choice."""
     numbers = [int(item["row"]) for item in preview["rows"]]
@@ -205,19 +217,20 @@ def suggest_mapping(preview: dict, api_key: str, client_factory=TypeSafeClient) 
         confidence[field] = score
         if choice != "none":
             candidates.append((score, field, int(choice[1:]) - 1))
-    # A source column may represent only one normalized field.
+    # A source column may represent only one normalized field; conflicts are surfaced, not silently dropped.
     mapping = {}
-    occupied = set()
-    warnings = []
+    occupied = {}
     for score, field, index in sorted(candidates, reverse=True):
-        label = FIELD_DESCRIPTIONS[field].split("；", 1)[0].rstrip("。")
         if index in occupied:
-            warnings.append(f"第 {index + 1} 列被重复建议；“{label}”留待手工确认")
             continue
         mapping[field] = index
-        occupied.add(index)
-        if score < 0.5:
-            warnings.append(f"“{label}”的选择不够集中，请重点核对")
+        occupied[index] = field
+    warnings = critical_warnings(kind, mapping)
+    for _score, field, index in sorted(candidates, reverse=True):
+        if field in mapping:
+            continue
+        loser = occupied.get(index, "?")
+        warnings.append(f"“{field}”与“{loser}”选择了同一列，已按置信度保留“{loser}”；请人工核对")
     try:
         ImportSpec(Path("preview.xlsx"), preview["sheet"], header_row, kind, mapping).validate()
     except ValueError as exc:

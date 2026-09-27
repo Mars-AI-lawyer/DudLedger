@@ -43,7 +43,7 @@ class DeepSeekMappingTest(unittest.TestCase):
         self.assertEqual(result.kind, "entry")
         self.assertEqual(result.header_row, 1)
         self.assertEqual(result.mapping, {"date": 0, "voucher_no": 1, "account_code": 2, "account_name": 3, "summary": 4, "debit": 5, "credit": 6})
-        self.assertEqual(result.warnings, ("请核对借贷方向",))
+        self.assertEqual(result.warnings, ())
         self.assertEqual(result.model, "deepseek-flash")
 
     def test_unknown_kind_is_rejected(self):
@@ -54,13 +54,30 @@ class DeepSeekMappingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             suggest_mapping(PREVIEW, "sk-test", chat=canned({"kind": "entry", "header_row": 9, "mapping": {}}))
 
-    def test_duplicate_and_out_of_range_columns_are_dropped_with_warnings(self):
+    def test_duplicate_and_out_of_range_columns_are_reported_with_one_sided_amounts(self):
         chat = canned({"kind": "entry", "header_row": 1,
                        "mapping": {"account_code": 7, "account_name": 7, "credit": 3, "debit": 99},
-                       "warnings": []})
+                       "warnings": ["请核对借贷方向"]})
         result = suggest_mapping(PREVIEW, "sk-test", chat=chat)
         self.assertEqual(result.mapping, {"account_code": 6, "credit": 2})
-        self.assertEqual(len(result.warnings), 2)
+        self.assertEqual(result.warnings, (
+            "借方或贷方金额只识别到一侧，请核对另一侧金额列",
+            "“account_name”与“account_code”建议了同一列，已保留先出现的“account_code”",
+            "“debit”建议的第 99 列超出预览范围，已舍弃",
+        ))
+
+    def test_complete_mapping_stays_silent(self):
+        balance_preview = {"sheet": "余额表", "rows": [
+            {"row": 1, "cells": [f"列{i}" for i in range(1, 11)]},
+            {"row": 2, "cells": ["1002", "银行存款", "1", "0", "2", "1", "3", "2", "5", "0"]},
+        ]}
+        chat = canned({"kind": "balance", "header_row": 1,
+                       "mapping": {"account_code": 1, "account_name": 2, "opening_debit": 3, "opening_credit": 4,
+                                   "period_debit": 5, "period_credit": 6, "year_debit": 7, "year_credit": 8,
+                                   "closing_debit": 9, "closing_credit": 10},
+                       "warnings": ["表头为两层结构", "请核对借贷方向"]})
+        result = suggest_mapping(balance_preview, "sk-test", chat=chat)
+        self.assertEqual(result.warnings, ())
 
     def test_missing_required_fields_add_import_warning(self):
         chat = canned({"kind": "entry", "header_row": 1, "mapping": {"summary": 5}, "warnings": []})

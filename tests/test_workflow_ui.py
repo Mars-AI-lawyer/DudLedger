@@ -70,7 +70,7 @@ class WorkflowUITest(unittest.TestCase):
                 checkbox = next(child for child in descendants(dialog) if isinstance(child, ttk.Checkbutton) and child.cget("text") == "关注这张凭证")
                 editor = next(child for child in descendants(dialog) if isinstance(child, tk.Text))
                 save = next(child for child in descendants(dialog) if isinstance(child, ttk.Button) and child.cget("text") == "保存关注与注释")
-                checkbox.invoke()
+                self.assertTrue(window.getvar(checkbox.cget("variable")))
                 editor.insert("1.0", "核对合同")
                 save.invoke()
                 self.assertEqual(len(list_marks(window.store)), 1)

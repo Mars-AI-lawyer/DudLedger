@@ -331,7 +331,7 @@ class JevReviewTest(unittest.TestCase):
             self.store.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v5' WHERE key='format'")
         self.store.close()
         self.store = LedgerStore(self.base / 'book.sqlite')
-        self.assertEqual(self.store.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], 'legal-ledger-viewer-v6')
+        self.assertEqual(self.store.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0], 'legal-ledger-viewer-v7')
         self.assertEqual(len(self.store.entries()), 4)
         self.assertEqual(self.store.db.execute('SELECT note FROM voucher_marks').fetchone()[0], '保留关注')
 

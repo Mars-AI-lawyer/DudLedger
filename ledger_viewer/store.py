@@ -6,7 +6,20 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .importer import REPORT_KINDS, ImportSpec, file_hash, format_money, header_for_row, normalized_rows, text_value
+from .importer import (
+    DISPOSITION_IMPORT,
+    DISPOSITION_PENDING,
+    EXCLUSION_LABELS,
+    REPORT_KINDS,
+    ImportSpec,
+    classify_rows,
+    file_hash,
+    format_money,
+    formula_cells,
+    header_for_row,
+    header_signature,
+    text_value,
+)
 
 
 SCHEMA = """
@@ -57,6 +70,20 @@ CREATE TABLE IF NOT EXISTS related_parties (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
  aliases_json TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS import_templates (
+ id INTEGER PRIMARY KEY, kind TEXT NOT NULL, sheet_label TEXT NOT NULL DEFAULT '',
+ header_signature TEXT NOT NULL, mapping_json TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ used_count INTEGER NOT NULL DEFAULT 0, last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(kind, header_signature)
+);
+CREATE TABLE IF NOT EXISTS import_prechecks (
+ id INTEGER PRIMARY KEY, source_id INTEGER UNIQUE REFERENCES sources(id) ON DELETE CASCADE,
+ filename TEXT NOT NULL, sheet TEXT NOT NULL, kind TEXT NOT NULL, sha256 TEXT NOT NULL,
+ header_row INTEGER NOT NULL, mapping_json TEXT NOT NULL, verdict TEXT NOT NULL,
+ stats_json TEXT NOT NULL, issues_json TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS ix_entries_account ON entries(account_key, entry_date, id);
 CREATE INDEX IF NOT EXISTS ix_entries_voucher ON entries(entry_date, voucher_type, voucher_no);
 CREATE INDEX IF NOT EXISTS ix_entries_search ON entries(counterparty, auxiliary);
@@ -83,7 +110,7 @@ class LedgerStore:
             self.db.executescript(SCHEMA + REVIEW_SCHEMA)
             self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v6')")
             version = self.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0]
-            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3", "legal-ledger-viewer-v4", "legal-ledger-viewer-v5", "legal-ledger-viewer-v6"):
+            if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3", "legal-ledger-viewer-v4", "legal-ledger-viewer-v5", "legal-ledger-viewer-v6", "legal-ledger-viewer-v7"):
                 raise ValueError("账套格式版本不兼容")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(entries)")}
             for name in ("fiscal_year", "period", "currency", "original_amount", "maker"):
@@ -97,8 +124,8 @@ class LedgerStore:
                     if name not in present:
                         default = " NOT NULL DEFAULT 0" if table == "balances" else ""
                         self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} INTEGER{default}")
-            if version != "legal-ledger-viewer-v6":
-                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v6' WHERE key='format'")
+            if version != "legal-ledger-viewer-v7":
+                self.db.execute("UPDATE ledger_meta SET value='legal-ledger-viewer-v7' WHERE key='format'")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_entries_voucher_period ON entries(fiscal_year,period,voucher_type,voucher_no)")
             self.db.commit()
         except Exception:
@@ -187,9 +214,14 @@ class LedgerStore:
             self.db.execute("DELETE FROM related_parties WHERE id=?", (party_id,))
 
     def import_sheet(self, spec: ImportSpec, replace: bool = False) -> int:
+        """按工作表事务写入；预检未通过（关键解析错误）时抛错回滚，保持旧数据不变。"""
         spec.validate()
         digest = file_hash(spec.path)
         headers = header_for_row(spec.path, spec.sheet, spec.header_row, spec.kind)
+        formulas = formula_cells(spec.path, spec.sheet) if spec.path.suffix.lower() in (".xlsx", ".xlsm") else {}
+        excluded: dict[str, int] = {}
+        issues: list[dict] = []
+        debit_total = credit_total = 0
         with self.db:
             conflicts = self.db.execute("SELECT id FROM sources WHERE (sha256=? OR original_path=?) AND sheet=? AND kind=?", (digest, str(spec.path.resolve()), spec.sheet, spec.kind)).fetchall()
             if conflicts and not replace:
@@ -207,13 +239,24 @@ class LedgerStore:
             )
             source_id = cur.lastrowid
             count = 0
-            for row_no, data in normalized_rows(spec):
+            for decision in classify_rows(spec, formulas):
+                if decision.disposition == DISPOSITION_PENDING:
+                    raise ValueError(f"第 {decision.row_no} 行：{decision.reason}（未解决的关键解析错误，预检后再导入）")
+                if decision.disposition != DISPOSITION_IMPORT:
+                    label = EXCLUSION_LABELS.get(decision.disposition, decision.disposition)
+                    excluded[label] = excluded.get(label, 0) + 1
+                    continue
+                row_no, data = decision.row_no, decision.data
+                for warning in decision.warnings:
+                    issues.append({"severity": "warning", "row_no": row_no, "reason": warning})
                 if spec.kind in REPORT_KINDS:
                     self.db.execute(
                         "INSERT INTO report_rows(source_id,row_no,left_item,left_amount_1_cents,left_amount_2_cents,left_amount_3_cents,right_item,right_amount_1_cents,right_amount_2_cents,right_amount_3_cents,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (source_id, row_no, *(data[field] for field in ("left_item", "left_amount_1_cents", "left_amount_2_cents", "left_amount_3_cents", "right_item", "right_amount_1_cents", "right_amount_2_cents", "right_amount_3_cents", "raw_json"))),
                     )
                 elif spec.kind == "entry":
+                    debit_total += data["debit_cents"]
+                    credit_total += data["credit_cents"]
                     code, name = data["account_code"], data["account_name"]
                     key = account_key(code, name)
                     self.db.execute("INSERT INTO accounts(key,code,name) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE accounts.name END", (key, code, name))
@@ -234,7 +277,47 @@ class LedgerStore:
                 raise ValueError("没有识别到有效数据行，请检查表头和列映射")
             self.db.execute("UPDATE sources SET row_count=? WHERE id=?", (count, source_id))
             self.db.execute("DELETE FROM accounts WHERE key NOT IN (SELECT account_key FROM entries UNION SELECT account_key FROM balances)")
+            verdict = f"成功：导入 {count} 行" + (f"；排除 {sum(excluded.values())} 行" if excluded else "")
+            self.db.execute(
+                "INSERT INTO import_prechecks(source_id,filename,sheet,kind,sha256,header_row,mapping_json,verdict,stats_json,issues_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (source_id, spec.path.name, spec.sheet, spec.kind, digest, spec.header_row,
+                 json.dumps({"mapping": spec.mapping, "excluded_rows": list(spec.excluded_rows)}, ensure_ascii=False),
+                 verdict,
+                 json.dumps({"imported_rows": count, "pending_rows": 0, "excluded": excluded,
+                             "debit_cents": debit_total, "credit_cents": credit_total}, ensure_ascii=False),
+                 json.dumps(issues, ensure_ascii=False)),
+            )
+            self._save_template(spec, headers)
         return count
+
+    def _save_template(self, spec: ImportSpec, headers: list[str]) -> None:
+        """经确认且成功导入的格式保存为本地模板；按表头结构签名去重，与文件名无关。"""
+        signature = header_signature(headers)
+        if not signature:
+            return
+        self.db.execute(
+            """INSERT INTO import_templates(kind,sheet_label,header_signature,mapping_json)
+               VALUES(?,?,?,?)
+               ON CONFLICT(kind, header_signature) DO UPDATE SET
+                 used_count=used_count+1, last_used_at=CURRENT_TIMESTAMP""",
+            (spec.kind, spec.sheet[:80], signature,
+             json.dumps({"mapping": spec.mapping, "header_row": spec.header_row}, ensure_ascii=False)),
+        )
+
+    def list_templates(self) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM import_templates ORDER BY last_used_at DESC,id DESC").fetchall()
+
+    def template_candidates(self) -> list[dict]:
+        """供 classify_sheet 做模板优先匹配的轻量结构。"""
+        return [{"kind": row["kind"], "header_signature": row["header_signature"], "mapping": json.loads(row["mapping_json"])["mapping"]} for row in self.list_templates()]
+
+    def precheck_for_source(self, source_id: int) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM import_prechecks WHERE source_id=?", (source_id,)).fetchone()
+
+    def export_import_report(self, path: Path) -> int:
+        from .precheck import build_import_report
+
+        return build_import_report(self, path)
 
     def sources(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM sources ORDER BY id").fetchall()
