@@ -41,9 +41,11 @@ class WorkflowUITest(unittest.TestCase):
                 menu = window.nametowidget(window.cget("menu"))
                 self.assertEqual([menu.entrycget(index, "label") for index in range(menu.index("end") + 1)], ["文件", "查看", "设置"])
                 self.assertEqual([window.tabs.tab(tab, "text") for tab in window.tabs.tabs()], ["科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 尽调线索"])
+                # 文件菜单精简为三项：导入 Excel、打开账套、退出当前账套。
                 imports = window.nametowidget(menu.entrycget(0, "menu"))
-                self.assertEqual(imports.entrycget(4, "label"), "导入记录…")
-                imports.invoke(4)
+                self.assertEqual([imports.entrycget(index, "label") for index in range(imports.index("end") + 1) if imports.type(index) == "command"],
+                                 ["导入 Excel…", "打开账套…", "退出当前账套"])
+                window.open_utility("导入记录")
                 app.update()
                 self.assertEqual(window.utility_windows["导入记录"].state(), "normal")
                 window.utility_windows["导入记录"].withdraw()
@@ -97,6 +99,44 @@ class WorkflowUITest(unittest.TestCase):
                 self.assertTrue(path.exists())
                 self.assertEqual(len(window.store.sources()), 0)
                 self.assertEqual(list_marks(window.store)[0]["status"], "未匹配")
+            finally:
+                if window.winfo_exists():
+                    window._close()
+
+
+class CloseBookTest(unittest.TestCase):
+    def test_close_book_returns_to_welcome_and_reopen_works(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            path = base / "entries.csv"
+            path.write_text("日期,凭证字,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n"
+                            "2026-08-01,记,1,1002,银行存款,收款,100,0\n", encoding="utf-8")
+            try:
+                app = Application()
+            except tk.TclError as exc:
+                self.skipTest(f"图形界面不可用：{exc}")
+            window = next(iter(app.windows))
+            try:
+                book = base / "case.sqlite"
+                window._use_book(book)
+                header, _, mapping = guess_header(path, "CSV", "entry")
+                window.store.import_sheet(ImportSpec(path, "CSV", header, "entry", mapping))
+                window.refresh_all()
+                app.update()
+                self.assertEqual(len(window.detail_view.get_children()), 1)
+                window.close_book()
+                app.update()
+                self.assertIsNone(window.store)
+                self.assertEqual(window.book_name.get(), "未打开账套")
+                self.assertEqual(window.detail_view.get_children(), ())
+                self.assertEqual(window.summary_view.get_children(), ())
+                self.assertTrue(window.welcome.winfo_ismapped())
+                self.assertEqual(app.book_windows.get(book.resolve(), None), None)
+                # 同一窗口可再次打开账套继续工作。
+                window._use_book(book)
+                app.update()
+                self.assertIsNotNone(window.store)
+                self.assertEqual(len(window.detail_view.get_children()), 1)
             finally:
                 if window.winfo_exists():
                     window._close()

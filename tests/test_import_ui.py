@@ -123,7 +123,7 @@ class ImportDialogTest(unittest.TestCase):
                         app.update()
                         time.sleep(0.02)
                 self.assertFalse(dialog.winfo_exists())
-                consent.assert_called_once()
+                consent.assert_not_called()  # 密钥已设置时不再逐次弹窗确认发送预览
                 self.assertEqual(suggest.call_count, 2)
                 self.assertEqual(len(window.store.sources()), 2)
                 self.assertEqual(window.store.db.execute('SELECT COUNT(*) FROM entries').fetchone()[0], 2)
@@ -188,8 +188,7 @@ class ImportDialogTest(unittest.TestCase):
                         app.update()
                         time.sleep(0.02)
                 self.assertFalse(dialog.winfo_exists())
-                consent.assert_called_once()
-                self.assertIn('DeepSeek', consent.call_args.args[1])
+                consent.assert_not_called()  # 密钥已设置时不再逐次弹窗确认发送预览
                 suggest.assert_called_once()
                 self.assertEqual(len(window.store.sources()), 1)
                 self.assertEqual(window.store.db.execute('SELECT COUNT(*) FROM entries').fetchone()[0], 1)

@@ -514,32 +514,34 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
                         "2026-06-01,记,2,6602,管理费用,坏金额,错,0\n", encoding="utf-8")
         return path
 
-    def test_single_import_shows_precheck_dialog_exclusion_then_imports(self):
+    def test_single_import_with_critical_issue_stays_inline_without_popup(self):
         from unittest.mock import patch
 
-        from ledger_viewer.ui import ImportDialog, PrecheckDialog
+        from ledger_viewer.ui import ImportDialog
 
         dialog = ImportDialog(self.window, self._bad_csv())
         self.app.update()
+        with patch("ledger_viewer.ui.messagebox.showerror") as error:
+            dialog.import_now()
+            error.assert_not_called()  # 关键疑点不再弹窗，改为窗口内行内提示
+        self.assertTrue(dialog.winfo_exists())
+        self.assertIn("未导入", dialog.import_note.cget("text"))
+        self.assertEqual(self.window.store.sources(), [])
+        # 修正原表后同一窗口重试即可导入。
+        path = self.base / "待确认.csv"
+        path.write_text(",".join(ENTRY_HEADER) + "\n"
+                        "2026-06-01,记,1,1002,银行存款,收款,100,0\n"
+                        "2026-06-01,记,1,6602,管理费用,付款,0,100\n", encoding="utf-8")
         with patch("ledger_viewer.ui.messagebox.showinfo"):
             dialog.import_now()
-            pre = next(w for w in dialog.winfo_children() if isinstance(w, PrecheckDialog))
-            self.assertEqual(pre.work[0][1].pending_rows, [3])
-            # 选中待处理行并排除 → 重新预检 → 继续导入
-            children = pre.view.get_children("sheet0")
-            pre.view.selection_set(children[0])
-            pre._exclude_selected()
-            self.assertEqual(pre.work[0][1].stats.excluded.get("人工排除"), 1)
-            self.assertFalse(pre.work[0][1].pending_rows)
-            pre._proceed()
             self.app.update()
-        self.assertEqual(len(self.window.store.entries()), 1)
-        self.assertEqual(self.window.store.sources()[0]["row_count"], 1)
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(self.window.store.sources()[0]["row_count"], 2)
 
-    def test_batch_import_pauses_blocked_sheet_and_imports_clean_one(self):
+    def test_batch_import_skips_blocked_sheet_and_imports_clean_one(self):
         from unittest.mock import patch
 
-        from ledger_viewer.ui import BatchImportDialog, PrecheckDialog
+        from ledger_viewer.ui import BatchImportDialog
 
         good = self.base / "正常.csv"
         good.write_text(",".join(ENTRY_HEADER) + "\n2026-06-01,记,1,1002,银行存款,收款,100,0\n", encoding="utf-8")
@@ -553,13 +555,39 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
         with patch("ledger_viewer.ui.messagebox.showinfo", side_effect=record_info):
             dialog.use_ai.set(False)
             dialog._import_selected()
-            pre = next(w for w in self.window.winfo_children() if isinstance(w, PrecheckDialog))
-            self.assertEqual(len(pre.work), 2)
-            pre._proceed()
             self.app.update()
+        # 干净的表照常导入；有疑点的表不导入、不弹预检窗，保留在列表中标注。
         self.assertEqual(len(self.window.store.sources()), 1)
         self.assertEqual(self.window.store.sources()[0]["filename"], "正常.csv")
-        self.assertTrue(any("暂停" in message for message in shown))
+        self.assertTrue(any("疑点" in message for message in shown))
+        bad_index = next(index for index, (path, _sheet, _spec) in enumerate(dialog.items) if path.name == "问题.csv")
+        self.assertIn("疑点", dialog.view.set(str(bad_index), "state"))
+        self.assertTrue(dialog.winfo_exists())
+        dialog._close()
+
+    def test_imported_source_precheck_is_viewable_after_import(self):
+        from unittest.mock import patch
+
+        from ledger_viewer.ui import BatchImportDialog, PrecheckDetailWindow
+
+        good = self.base / "正常.csv"
+        good.write_text(",".join(ENTRY_HEADER) + "\n2026-06-01,记,1,1002,银行存款,收款,100,0\n", encoding="utf-8")
+        dialog = BatchImportDialog(self.window, [good])
+        with patch("ledger_viewer.ui.messagebox.showinfo"):
+            dialog.use_ai.set(False)
+            dialog._import_selected()
+            self.app.update()
+        dialog._close()
+        self.window.open_utility("导入记录")
+        self.app.update()
+        self.window.source_view.selection_set(str(self.window.store.sources()[0]["id"]))
+        self.window.show_precheck_detail()
+        self.app.update()
+        detail = next(w for w in self.window.winfo_children() if isinstance(w, PrecheckDetailWindow))
+        self.assertIn("导入预检", detail.title())
+        self.assertIsNotNone(detail.view)
+        detail.destroy()
+        self.window.utility_windows["导入记录"].withdraw()
 
 
 if __name__ == "__main__":

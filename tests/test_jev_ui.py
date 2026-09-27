@@ -13,6 +13,7 @@ from ledger_viewer.jev_review import ReviewJob, batch_counts, prepare_batch, bat
 from ledger_viewer.jev_rules import load_rules
 from ledger_viewer.jev_ui import ConsentDialog, ReviewDetail, ReviewRulesDialog
 from ledger_viewer.ui import Application
+from ledger_viewer.voucher_notes import list_marks
 from test_jev_review import FakeClient, response
 
 
@@ -144,6 +145,41 @@ class ReviewUITest(unittest.TestCase):
         self.assertEqual(float(self.panel.progress_bar['value']), 2)
         self.assertEqual(batch_counts(self.app.store, batch)['successful_vouchers'], 2)
 
+    def test_category_bar_click_filters_without_losing_counts(self):
+        extra = self.base / '第二张.csv'
+        extra.write_text('日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n'
+                         '2026-01-02,2,1002,银行存款,股权转让款,100,0\n', encoding='utf-8')
+        header, _, mapping = guess_header(extra, 'CSV', 'entry')
+        self.app.store.import_sheet(ImportSpec(extra, 'CSV', header, 'entry', mapping))
+        FakeClient.calls = []
+
+        def respond(state):
+            if '股权' in state.get('summary', ''):
+                return response({'capital_equity': 0.9})
+            return response({'financing': 0.9})
+
+        FakeClient.responder = staticmethod(respond)
+        batch = prepare_batch(self.app.store, {})
+        job = ReviewJob(self.app.store.path, batch, 'fake-key', FakeClient)
+        self.panel.batch_id = batch
+        job.start(self.app.store)
+        job.thread.join(5)
+        self.panel.refresh()
+        self.root.update()
+        self.assertEqual(len(self.panel.view.get_children()), 2)
+        rules = load_rules(self.app.store)[1]
+        financing = next(topic['label'] for topic in rules['topics'] if topic['id'] == 'financing')
+        equity = next(topic['label'] for topic in rules['topics'] if topic['id'] == 'capital_equity')
+        # 点击单个分类：列表过滤为该分类，选中态保持，且计数条不塌缩（其他分类仍在）。
+        button = next(b for b in self.panel.category_frame.winfo_children() if b.cget('text').startswith(financing))
+        button.invoke()
+        self.root.update()
+        self.assertEqual(self.panel.category.get(), financing)
+        self.assertEqual(len(self.panel.view.get_children()), 1)
+        self.assertIn('股东借款', self.panel.view.item(self.panel.view.get_children()[0], 'values')[2])
+        labels = [b.cget('text') for b in self.panel.category_frame.winfo_children()]
+        self.assertTrue(any(text.startswith(equity) for text in labels))
+
     def test_confirm_results_detail_review_and_open_unlisted_voucher(self):
         batch = prepare_batch(self.app.store, {'account': 'C:2241'})
         dialog = ConsentDialog(self.panel, batch)
@@ -161,15 +197,21 @@ class ReviewUITest(unittest.TestCase):
         self.assertTrue(group['partial'])
         detail = ReviewDetail(self.panel, group)
         self.root.update()
-        self.assertIn('本地保留的原始行', detail.text.get('1.0', 'end'))
-        # The entry is not selected in the main detail view; direct drill-through must work.
-        self.app.detail_view.selection_remove(*self.app.detail_view.selection())
-        detail._voucher()
-        self.assertEqual(len(self.app.voucher_windows), 1)
-        detail.review_status.set('需补材料')
+        # 凭证区与明细账双击打开的凭证同源：本凭证共 2 行分录（含未选入批次的 1002 行）。
+        self.assertEqual(len(detail.voucher_view.get_children()), 2)
+        # JSON 返回结果按需展开查看。
+        detail._toggle_json()
+        self.assertIn('完整结构化回答', detail.json_text.get('1.0', 'end'))
+        detail._toggle_json()
+        # 关注凭证：展开备注并保存，与凭证窗口的关注记录一致。
+        detail._toggle_notes()
+        detail.attention.set(True)
         detail.note.insert('1.0', '补充借款合同')
-        detail._save()
-        self.assertEqual(next(iter(self.panel.rows.values()))['review']['note'], '补充借款合同')
+        detail._save_attention()
+        marks = list_marks(self.app.store)
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(marks[0]['note'], '补充借款合同')
+        detail.destroy()
         count = len(FakeClient.calls)
         self.panel.tier.set('宽松')
         self.panel._tier_change()

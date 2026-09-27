@@ -13,10 +13,10 @@ from .dd_features import load_basis_overrides, load_config, materiality_bases, s
 from .jev_mapping import get_api_key
 from .jev_rules import default_rules, load_rules, save_rules
 from .related_parties import party_names, role_grouped_names
-from .jev_review import (BOUNDARY, CATEGORY_SOURCE_LABELS, PRIORITY_LABELS, REVIEW_STATES, SEND_FIELDS,
-    STATUS_LABELS, ReviewJob, active_job, batch_counts, batch_info, clear_category_override,
-    discard_preview, is_uncertain, prepare_batch, preview_page, recover_interrupted,
-    refresh_staleness, save_feedback, save_review, set_category_override, test_connection, voucher_results)
+from .jev_review import (BOUNDARY, PRIORITY_LABELS, STATUS_LABELS, SEND_FIELDS,
+    ReviewJob, active_job, batch_counts, batch_info, discard_preview,
+    is_uncertain, prepare_batch, preview_page, recover_interrupted,
+    refresh_staleness, save_feedback, test_connection, voucher_results)
 
 CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、往来单位、辅助核算、非零一侧的借贷金额，'
     '以及当前账套尽调主体名单中的名称与身份（不含备注），发送至 TypeSafe 的 Jev 服务，'
@@ -395,9 +395,10 @@ class ReviewPanel(ttk.Frame):
     def _render_category_bar(self, rules, counts):
         for child in self.category_frame.winfo_children():
             child.destroy()
-        self.category_ids = {'全部': ''}
+        # 类别→ID 映射由 _category_counts 维护；这里只重建按钮，不能清空映射，
+        # 否则点击分类后查不到 ID，筛选落空（表现为“点了没反应”）。
         selected = self.category.get() or '全部'
-        if selected not in counts and selected != '全部':
+        if selected not in dict(counts) and selected != '全部':
             selected = '全部'
         for index, (label, count) in enumerate(counts):
             button = ttk.Radiobutton(self.category_frame, text=f'{label} {count}', value=label,
@@ -408,6 +409,7 @@ class ReviewPanel(ttk.Frame):
     def _category_counts(self, rules, candidates):
         counts = [('全部', len(candidates))]
         unclassified = 0
+        self.category_ids = {'全部': ''}
         for topic in rules['topics']:
             self.category_ids[topic['label']] = topic['id']
         tallies = {topic['label']: 0 for topic in rules['topics']}
@@ -521,9 +523,9 @@ class ReviewPanel(ttk.Frame):
         groups = voucher_results(self.app.store, self.batch_id, self.tier.get(), self.lane.get(), self.account.get().strip(),
             category, '' if self.period.get() == '全部期间' else self.period.get(), show_ignored)
         if rules:
-            candidates = groups if self.lane.get() == 'candidates' else voucher_results(
-                self.app.store, self.batch_id, self.tier.get(), 'candidates', self.account.get().strip(),
-                '', '' if self.period.get() == '全部期间' else self.period.get(), show_ignored)
+            # 分类计数始终按未选分类的候选全集计算，避免点击分类后计数条塌缩。
+            candidates = voucher_results(self.app.store, self.batch_id, self.tier.get(), 'candidates',
+                self.account.get().strip(), '', '' if self.period.get() == '全部期间' else self.period.get(), show_ignored)
             self._render_category_bar(rules, self._category_counts(rules, candidates))
         periods = [r[0] for r in self.app.store.db.execute("SELECT DISTINCT json_extract(local_json,'$.fiscal_year') || '/' || json_extract(local_json,'$.period') FROM jev_results WHERE batch_id=?", (self.batch_id,))]
         self.period_combo.configure(values=['全部期间', *sorted(periods)])
@@ -540,7 +542,7 @@ class ReviewPanel(ttk.Frame):
             if group['partial']:
                 states.append('仅覆盖部分分录')
             currencies = group['sort_currency']
-            amount = f"{format_money(group['sort_amount'])} {currencies[0]}" if len(currencies) == 1 and currencies[0] != '币种未注明' else (f"{format_money(group['sort_amount'])}" if len(currencies) == 1 else '多币种')
+            amount = f"{format_money(group['sort_amount'], comma=True)} {currencies[0]}" if len(currencies) == 1 and currencies[0] != '币种未注明' else (f"{format_money(group['sort_amount'], comma=True)}" if len(currencies) == 1 else '多币种')
             values = (voucher, amount, '；'.join(dict.fromkeys(r['local']['summary'] for r in group['hits'])),
                 '、'.join(group['labels']), group['priority'],
                 f"{group['score']:.1f}" if group['score'] is not None else '—', '、'.join(states))
@@ -551,7 +553,7 @@ class ReviewPanel(ttk.Frame):
                 self.view.insert('', 'end', iid=item, values=values)
             self.view.move(item, '', index)
         self.view.delete(*old_items)
-        self.count_label.set(f'显示 {len(groups)} 张 · 双击查看分类依据、完整凭证并复核。查看优先级是尽调相关程度，不是法律风险评级。')
+        self.count_label.set(f'显示 {len(groups)} 张 · 双击查看分类、完整凭证与 AI 返回结果，并可关注凭证。查看优先级是尽调相关程度，不是法律风险评级。')
 
     def open_detail(self, _event=None):
         selected = self.view.selection()
@@ -583,131 +585,134 @@ class ReviewPanel(ttk.Frame):
 
 
 class ReviewDetail(tk.Toplevel):
+    """AI 尽调线索详情：只保留分类、完整凭证、按需查看的 JSON 返回与关注操作。"""
+
     def __init__(self, panel, group):
         super().__init__(panel)
-        from .ui import tree
+        from .ui import VIEW_COLUMNS, amount, tree
+        from .voucher_notes import list_marks, mark_for_entry, remove_mark, save_mark
+        self._mark_tools = (mark_for_entry, remove_mark, save_mark, list_marks)
         self.panel, self.app, self.group = panel, panel.app, group
         self.store = self.app.store
-        self.title('AI 尽调线索 · 分类与人工复核')
-        self.geometry('940x780')
-        self.minsize(720, 600)
+        local = group['hits'][0]['local']
+        voucher_title = f"{local['fiscal_year']}年{local['period']}期 {local['voucher_type']}{local['voucher_no']}" if local['voucher_no'] else '无凭证号来源行'
+        self.title(f'AI 尽调线索 · {voucher_title}')
+        self.geometry('840x560')
+        self.minsize(640, 420)
         info = batch_info(self.store, panel.batch_id)
         self.rules = json.loads(info['body_json'])
-        effective = {identifier: sources for identifier, _label, sources, _probability in group['categories']}
-        categories_text = '、'.join(group['labels'])
-        wrapped_label(self, text=f"规则 v{info['rule_id']} · 请求模型 {info['model']} · 查看优先级：{group['priority'] or '—'}\n"
-            f"尽调分类：{categories_text} · {len(group['lines'])} 条选定分录 / 本地凭证 {group['local_total']} 条\n{BOUNDARY}", padding=10, wraplength=860).pack(fill='x')
-        self.lines = {str(r['id']): r for r in group['lines']}
-        holder = ttk.Frame(self)
-        holder.pack(fill='x')
-        self.view = tree(holder, [('account', '科目', 180), ('summary', '账面摘要', 300), ('amount', '金额', 100), ('score', '相关度', 70), ('source', '来源行', 200)])
-        self.view.configure(height=4)
-        for key, r in self.lines.items():
-            local = r['local']
-            side = format_money(max(abs(local['debit_cents']), abs(local['credit_cents']))) if max(abs(local['debit_cents']), abs(local['credit_cents'])) else ''
-            self.view.insert('', 'end', iid=key, values=(f"{local['code']} {local['name']}", local['summary'],
-                side, f"{r['score']:.1f}" if r['score'] is not None else '—', f"{local['filename']}/{local['sheet']}:{local['row_no']}"))
-        self.view.bind('<<TreeviewSelect>>', self._show)
-        categories = ttk.LabelFrame(self, text='尽调分类（一张凭证可属多个分类；勾选调整仅记录律师意见，可随时改回）', padding=6)
-        categories.pack(fill='x', padx=8, pady=(6, 0))
-        self.category_vars = []
-        for index, topic in enumerate(self.rules['topics']):
-            sources = effective.get(topic['id'])
-            var = tk.BooleanVar(value=bool(sources))
-            mark = '·' + '/'.join(sorted(CATEGORY_SOURCE_LABELS[s] for s in sources)) if sources else ''
-            button = ttk.Checkbutton(categories, text=topic['label'] + mark, variable=var)
-            button.grid(row=index // 5, column=index % 5, sticky='w', padx=(0, 10))
-            self.category_vars.append((topic['id'], var, bool(sources), sources or set()))
-        ttk.Label(self, text='关注依据（程序预计算事实与 AI 判断线索，非违法认定）：', padding=(10, 4)).pack(anchor='w')
-        reasons = '\n'.join(f'✓ {fact}' for fact in group['reasons']) or '（无程序特征提示）'
-        self.text = read_only_text(self, reasons, height=9)
-        footer = ttk.Frame(self)
-        footer.pack(side='bottom', fill='x', before=self.text.frame)
-        actions = ttk.Frame(footer, padding=8)
-        actions.pack(fill='x')
-        ttk.Button(actions, text='打开本地同号凭证／加入关注', command=self._voucher).pack(side='left')
+        wrapped_label(self, text=f"尽调分类：{'、'.join(group['labels'])} · 查看优先级：{group['priority'] or '—'} · "
+            f"规则 v{info['rule_id']} · 请求模型 {info['model']}\n{BOUNDARY}", padding=10, wraplength=760).pack(fill='x')
+        # 完整凭证：与明细账双击打开的凭证同一份数据与列格式。
+        self.entry_id = group['lines'][0]['entry_id']
+        lines = self.store.voucher_lines(self.entry_id)
+        self.voucher_view = tree(self, VIEW_COLUMNS['voucher'])
+        self.app._register_column_view('voucher', self.voucher_view)
+        mark_for_entry, _remove_mark, _save_mark, _list_marks = self._mark_tools
+        existing_mark = mark_for_entry(self.store, self.entry_id)
+        for line in lines:
+            side_tag = 'debit_row' if line['debit_cents'] and not line['credit_cents'] else 'credit_row' if line['credit_cents'] and not line['debit_cents'] else ''
+            self.voucher_view.insert('', 'end', values=(line['code'], line['name'], line['summary'], line['auxiliary'],
+                line['currency'], line['original_amount'], amount(line['debit_cents']), amount(line['credit_cents']),
+                f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'),
+                tags=('marked',) if existing_mark else ((side_tag,) if side_tag else ()))
+        debit = sum(line['debit_cents'] for line in lines)
+        credit = sum(line['credit_cents'] for line in lines)
+        ttk.Label(self, text=f"{len(lines)} 行分录   借方 {amount(debit) or '0.00'}   贷方 {amount(credit) or '0.00'}   差额 {amount(debit - credit) or '0.00'}",
+            padding=(12, 5)).pack(anchor='w')
+        # 底部操作：JSON 按需展开；忽略与关注（关注展开备注区，与凭证窗口一致）。
+        self.actions = ttk.Frame(self, padding=(10, 4))
+        self.actions.pack(side='bottom', fill='x')
+        self.json_button = ttk.Button(self.actions, text='查看 JSON 返回结果 ▾', command=self._toggle_json)
+        self.json_button.pack(side='left')
         self.ignore_var = tk.BooleanVar(value=group['feedback'] == 'ignore')
-        ttk.Checkbutton(actions, text='忽略此线索（不再出现在待核列表，仅保存反馈）', variable=self.ignore_var).pack(side='left', padx=(14, 0))
-        ttk.Label(actions, text='人工复核').pack(side='left', padx=(18, 5))
-        self.review_status = tk.StringVar(value=group['review']['status'])
-        ttk.Combobox(actions, textvariable=self.review_status, values=REVIEW_STATES, state='readonly', width=15).pack(side='left')
-        ttk.Label(footer, text='核查备注（保存在当前账套，来源变化后仍保留）', padding=(8, 2)).pack(anchor='w')
-        self.note = ScrolledText(footer, height=4, wrap='word', undo=True)
-        self.note.pack(fill='x', padx=8)
-        self.note.insert('1.0', group['review']['note'])
-        ttk.Button(footer, text='保存分类与复核', command=self._save, style='Accent.TButton').pack(anchor='e', padx=8, pady=8)
-        self.view.selection_set(next(iter(self.lines)))
-        self._show()
+        ttk.Checkbutton(self.actions, text='忽略此线索', variable=self.ignore_var, command=self._save_ignore).pack(side='left', padx=(16, 0))
+        ttk.Button(self.actions, text='关闭', command=self.destroy).pack(side='right')
+        collapsed = '查看 / 编辑关注备注' if existing_mark else '关注这张凭证'
+        self.note_toggle = ttk.Button(self.actions, text=collapsed, command=self._toggle_notes, style='Accent.TButton')
+        self.note_toggle.pack(side='right', padx=8)
+        self.note_area = ttk.Frame(self, padding=(12, 5, 12, 10))
+        self.attention = tk.BooleanVar(value=bool(existing_mark))
+        ttk.Checkbutton(self.note_area, text='关注这张凭证', variable=self.attention).pack(anchor='w')
+        self.note = ScrolledText(self.note_area, height=4, wrap='word', undo=True)
+        self.note.pack(fill='x')
+        if existing_mark:
+            self.note.insert('1.0', existing_mark['note'])
+        self.feedback = tk.StringVar()
+        ttk.Label(self.note_area, textvariable=self.feedback, foreground='#555').pack(anchor='w')
+        ttk.Button(self.note_area, text='保存关注与注释', command=self._save_attention, style='Accent.TButton').pack(anchor='e', pady=(6, 0))
+        self.json_area = ttk.Frame(self)
+        self.json_text = None
+        self.bind('<Escape>', lambda _event: self.destroy())
 
-    def _selected(self):
-        selected = self.view.selection()
-        return self.lines[selected[0]] if selected else None
-
-    def _show(self, _event=None):
-        row = self._selected()
-        if row is None:
+    def _toggle_json(self):
+        if self.json_text is not None and self.json_text.winfo_manager():
+            self.json_area.pack_forget()
+            self.json_button.configure(text='查看 JSON 返回结果 ▾')
             return
-        local = row['local']
-        lines = [f"账面记载：{local['summary']}", f"分析状态：{'已过期' if row['stale'] else STATUS_LABELS[row['status']]}",
-            f"来源：{local['original_path']} / {local['sheet']} 第 {local['row_no']} 行", f"来源 SHA-256：{local['sha256']}",
-            f"借方：{format_money(local['debit_cents'])}；贷方：{format_money(local['credit_cents'])}；币种：{local['currency'] or '未注明'}；原币金额：{local['original_amount']}"]
-        if row['status'] == 'skipped':
-            lines += [f"未送 AI：{row['error']}"]
-        if row['response_json']:
-            data = json.loads(row['response_json'])
-            answers = data['answers']
-            strongest = max((value['noul'] for key, value in answers.items() if key != 'insufficient'), default=0)
-            lines += [f"判断单位：{'凭证整体' if data.get('review_unit') == 'voucher' else '分录'}；分段数：{data.get('chunks', 1)}\n实际模型：{data['model']}；相关度：{row['score']:.1f}（任一分类或整体判断的最高概率，非加权平均）；信息不足：{row['insufficient']:.3f}",
-                      f"同次请求用量（{data.get('shared_entries', 1)} 条分录共用，不逐行累加）：{data['usage']}；{'缓存复用，未再次请求' if row['cached'] else '本次请求'}", '']
-            if 'review' in answers:
-                lines += [f"整体判断（是否值得律师查看）：{answers['review']['noul']:.3f}", '']
-            if data.get('chunks', 1) > 1:
-                lines += ['分段结果：各分类信号取片段最大值，不是整张凭证的总体概率；需人工结合全文复核。', '']
-            for topic in self.rules['topics']:
-                probability = answers[topic['id']]['noul']
-                if probability >= 0.35:
-                    lines += [f"命中分类：{topic['label']}（{probability:.3f}{'，分类待确认' if probability < 0.65 else ''}）", f"建议核查：{topic['advice']}", '']
-            if is_uncertain(row):
-                lines += ['信息不足／判断不确定／已分段：请核对整张凭证的交易用途；不确定未降低分类概率。', '']
-            grouped = role_grouped_names(self.store.related_parties())
-            count = sum(len(names) for names in grouped.values())
-            preview = '；'.join(f'{role}：{"、".join(names[:4])}' for role, names in grouped.items())
-            if len(preview) > 160:
-                preview = preview[:160] + '…'
-            lines += [f"随本凭证发送的尽调主体名单（按身份分组）：共 {count} 个名称" + (f"（{preview}）" if preview else "；可在「查看 → 尽调主体名单」维护"), '']
-            lines += ['完整结构化回答：', json.dumps(answers, ensure_ascii=False, indent=2), '']
-        elif row['error']:
-            lines += [row['error']]
-        lines += [BOUNDARY, '', '当前行的精简输入（发送时与同凭证其他行合并去重：内容相同的行金额合并并标注次数；空白字段与零金额不发送）：' if row['status'] != 'skipped' else '已跳过，以下字段未发送：', display_input(json.loads(row['input_json'])), '',
-                  '本地保留的原始行（不发送）：', local['raw_json']]
-        self.text.configure(state='normal')
-        self.text.delete('1.0', 'end')
-        self.text.insert('1.0', '\n'.join(lines))
-        self.text.configure(state='disabled')
+        if self.json_text is None:
+            self.json_text = read_only_text(self.json_area, self._json_content(), height=14)
+        self.json_area.pack(fill='both', expand=True, before=self.actions)
+        self.json_button.configure(text='收起 JSON 返回结果 ▴')
 
-    def _voucher(self):
-        row = self._selected()
-        if row is None:
-            return
-        refresh_staleness(self.store, self.panel.batch_id)
-        stale = self.store.db.execute('SELECT stale FROM jev_results WHERE id=?', (row['id'],)).fetchone()[0]
-        if stale:
-            messagebox.showinfo('来源已变化', '这里保留的是历史快照。请到明细账定位当前分录，重新核实；原复核备注仍保留。', parent=self)
-            return
-        self.app.open_voucher(None, entry_id=row['entry_id'])
+    def _json_content(self) -> str:
+        """取本凭证第一份成功返回；同凭证各分录共用同一次请求的结果。"""
+        for row in self.group['lines']:
+            if row['response_json']:
+                data = json.loads(row['response_json'])
+                answers = data['answers']
+                parts = [f"实际模型：{data['model']} · 相关度：{row['score']:.1f}（任一分类或整体判断的最高概率） · "
+                         f"信息不足：{row['insufficient']:.3f} · 分段数：{data.get('chunks', 1)} · "
+                         f"{'缓存复用，未再次请求' if row['cached'] else '本次请求'}"]
+                if 'review' in answers:
+                    parts.append(f"整体判断（是否值得律师查看）：{answers['review']['noul']:.3f}")
+                for topic in self.rules['topics']:
+                    probability = answers[topic['id']]['noul']
+                    if probability >= 0.35:
+                        parts.append(f"命中分类：{topic['label']}（{probability:.3f}{'，分类待确认' if probability < 0.65 else ''}）\n建议核查：{topic['advice']}")
+                if data.get('chunks', 1) > 1:
+                    parts.append('分段结果：各分类信号取片段最大值，不是整张凭证的总体概率；需人工结合全文复核。')
+                parts.append(f"同次请求用量（{data.get('shared_entries', 1)} 条分录共用，不逐行累加）：{data['usage']}")
+                parts += ['', '完整结构化回答：', json.dumps(answers, ensure_ascii=False, indent=2)]
+                return '\n'.join(parts)
+            if row['error']:
+                return row['error']
+        return '（本凭证未送 AI，或尚无返回结果）'
 
-    def _save(self):
-        key = self.group['key']
-        for identifier, var, was, sources in self.category_vars:
-            checked = var.get()
-            if checked and not was:
-                set_category_override(self.store, key, identifier, 'add')
-            elif not checked and was:
-                if sources == {'user'}:
-                    clear_category_override(self.store, key, identifier)
-                else:
-                    set_category_override(self.store, key, identifier, 'remove')
-        save_feedback(self.store, key, 'ignore' if self.ignore_var.get() else '')
-        save_review(self.store, key, self.review_status.get(), self.note.get('1.0', 'end-1c'))
+    def _toggle_notes(self):
+        if self.note_area.winfo_manager():
+            self.note_area.pack_forget()
+            mark_for_entry, _remove, _save, _list = self._mark_tools
+            self.note_toggle.configure(text='查看 / 编辑关注备注' if mark_for_entry(self.store, self.entry_id) else '关注这张凭证')
+        else:
+            self.attention.set(True)
+            self.note_area.pack(fill='x', before=self.actions)
+            self.note.focus_set()
+
+    def _save_attention(self):
+        mark_for_entry, remove_mark, save_mark, _list_marks = self._mark_tools
+        try:
+            current = mark_for_entry(self.store, self.entry_id)
+            if self.attention.get():
+                if current:
+                    status = next((item['status'] for item in _list_marks(self.store) if item['key'] == current['voucher_key']), '正常')
+                    if status == '内容变化' and not messagebox.askyesno('确认凭证内容', '凭证内容与原标注时不同。确认已核对当前分录并继续关注吗？', parent=self):
+                        return
+                save_mark(self.store, self.entry_id, self.note.get('1.0', 'end-1c'))
+                self.feedback.set('已保存至关注凭证')
+            elif current:
+                remove_mark(self.store, current['voucher_key'])
+                self.feedback.set('已取消关注')
+            else:
+                self.feedback.set('未关注此凭证')
+        except Exception as exc:
+            messagebox.showerror('保存失败', str(exc), parent=self)
+            return
+        self.app.refresh_details()
+        self.app.refresh_marks()
+        for item in self.voucher_view.get_children():
+            self.voucher_view.item(item, tags=('marked',) if self.attention.get() else ())
+
+    def _save_ignore(self):
+        save_feedback(self.store, self.group['key'], 'ignore' if self.ignore_var.get() else '')
         self.panel.refresh_rows()
-        self.destroy()

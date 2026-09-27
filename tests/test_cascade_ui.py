@@ -39,7 +39,7 @@ class CascadeUiTest(unittest.TestCase):
             self.app.update()
             time.sleep(0.01)
 
-    def test_escalation_imports_with_single_confirmation(self):
+    def test_escalation_imports_without_per_import_popup(self):
         with patch("ledger_viewer.ui.get_api_key", return_value="first"), \
              patch("ledger_viewer.ui.deepseek_get_api_key", return_value="second"), \
              patch("ledger_viewer.ui.suggest_mapping", side_effect=ValueError("无法识别")) as first, \
@@ -48,20 +48,34 @@ class CascadeUiTest(unittest.TestCase):
              patch("ledger_viewer.ui.messagebox.showinfo"):
             self.dialog._import_selected()
             self.wait_done()
-        consent.assert_called_once()
-        self.assertIn("Jev", consent.call_args.args[1])
-        self.assertIn("DeepSeek", consent.call_args.args[1])
+        consent.assert_not_called()  # 密钥已设置即视为确认发送范围，不再弹窗
         first.assert_called_once()
         second.assert_called_once()
         self.assertEqual(len(self.window.store.sources()), 1)
 
     def test_cancel_consent_sends_nothing(self):
-        with patch("ledger_viewer.ui.get_api_key", return_value="first"), \
-             patch("ledger_viewer.ui.deepseek_get_api_key", return_value="second"), \
+        class FakeSettings:
+            def __init__(self, parent):
+                pass
+
+            def lift(self):
+                pass
+
+            def grab_set(self):
+                pass
+
+            def destroy(self):
+                pass
+
+        with patch("ledger_viewer.ui.get_api_key", return_value=""), \
+             patch("ledger_viewer.ui.deepseek_get_api_key", return_value=""), \
              patch("ledger_viewer.ui.suggest_mapping") as first, \
              patch("ledger_viewer.ui.deepseek_suggest_mapping") as second, \
-             patch("ledger_viewer.ui.messagebox.askokcancel", return_value=False):
+             patch("ledger_viewer.ui.SettingsDialog", FakeSettings), \
+             patch.object(BatchImportDialog, "wait_window", lambda self, window: None):
+            # 未保存任何密钥且直接关闭偏好设置：不发送任何预览。
             self.dialog._import_selected()
+            self.wait_done()
         first.assert_not_called()
         second.assert_not_called()
         self.assertEqual(self.window.store.sources(), [])
