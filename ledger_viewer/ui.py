@@ -30,12 +30,12 @@ from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_m
 
 FIELD_LABELS = {
     "date": "日期", "fiscal_year": "会计年度", "period": "期间", "voucher_no": "凭证号", "voucher_type": "凭证字", "account_code": "科目编码",
-    "account_name": "科目名称", "summary": "摘要", "debit": "借方金额", "credit": "贷方金额",
+    "account_name": "科目名称", "summary": "摘要", "debit": "借方金额", "credit": "贷方金额", "amount": "金额（单列）",
     "counterparty": "往来单位", "auxiliary": "辅助核算", "opening_debit": "期初借方",
     "opening_credit": "期初贷方", "period_debit": "本期借方", "period_credit": "本期贷方",
     "year_debit": "本年累计借方", "year_credit": "本年累计贷方",
     "closing_debit": "期末借方", "closing_credit": "期末贷方",
-    "opening_balance": "期初余额", "closing_balance": "期末余额", "direction": "余额方向",
+    "opening_balance": "期初余额", "closing_balance": "期末余额", "direction": "借贷/余额方向",
     "currency": "币别", "original_amount": "原币金额", "maker": "制单人",
     "left_item": "左侧项目", "left_amount_1": "左侧金额 1", "left_amount_2": "左侧金额 2", "left_amount_3": "左侧金额 3",
     "right_item": "右侧项目", "right_amount_1": "右侧金额 1", "right_amount_2": "右侧金额 2", "right_amount_3": "右侧金额 3",
@@ -865,7 +865,7 @@ class ImportDialog(tk.Toplevel):
         self.preview.pack(fill="x", padx=12, pady=8)
         bottom = ttk.Frame(self, padding=12)
         bottom.pack(side="bottom", fill="x")
-        self.import_note = ttk.Label(bottom, text="账簿空白/小计行会跳过；请确认借贷列不是余额列。", foreground="#995300")
+        self.import_note = ttk.Label(bottom, text="账簿空白/小计行会跳过；请确认借贷列不是余额列。", foreground="#995300", wraplength=460)
         self.import_note.pack(side="left")
         ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right", padx=4)
         ttk.Button(bottom, text="保存列设置" if self.on_save else "确认并导入", command=self.import_now).pack(side="right", padx=4)
@@ -976,8 +976,8 @@ class ImportDialog(tk.Toplevel):
                 fields = ("left_item", "left_amount_1", "left_amount_2", "left_amount_3", "right_item", "right_amount_1", "right_amount_2", "right_amount_3") if kind_code == "balance_sheet" else ("left_item", "left_amount_1", "left_amount_2", "left_amount_3")
                 self.import_note.configure(text="报表保留原行序、标题和小计；空白金额与零值分开保存，不做勾稽核对。")
             else:
-                fields = ("date", "fiscal_year", "period", "voucher_type", "voucher_no", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind_code == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "closing_balance", "direction")
-                self.import_note.configure(text="账簿空白/小计行会跳过；请确认借贷列不是余额列。")
+                fields = ("date", "fiscal_year", "period", "voucher_type", "voucher_no", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind_code == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "closing_balance", "direction")
+                self.import_note.configure(text="空白/小计行会跳过；金额单列时须同时选借贷方向列。")
             columns_per_row = 1 if self.parent.controller.font_size >= 17 else 2
             for n, field in enumerate(fields):
                 r, c = divmod(n, columns_per_row)

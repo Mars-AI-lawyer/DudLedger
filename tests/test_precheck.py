@@ -386,6 +386,108 @@ class DiscoveryTemplateTest(PrecheckTestBase):
         self.assertEqual(skipped, [])
 
 
+class SingleAmountDirectionTest(PrecheckTestBase):
+    """用友等导出的序时账没有借贷分列：一列“金额”加“方向”列标借/贷。"""
+
+    DIRECTION_HEADER = ["日期", "凭证号数", "科目编码", "科目名称", "摘要", "方向", "金额"]
+
+    def _journal(self) -> Path:
+        path = self.base / "序时账.csv"
+        path.write_text(",".join(self.DIRECTION_HEADER) + "\n"
+                        "2020-01-31,记-0001,100201,中国银行,往来款,借,230000\n"
+                        "2020-01-31,记-0001,1122,应收账款,往来款,贷,230000\n"
+                        "2020-01-31,记-0002,100201,中国银行,奖励,借,90000\n"
+                        "2020-02-28,记-0003,100201,中国银行,结息,平,0\n", encoding="utf-8")
+        return path
+
+    def test_auto_detection_and_import_split_by_direction(self):
+        path = self._journal()
+        spec = classify_sheet(path, "CSV")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.kind, "entry")
+        self.assertEqual(spec.mapping["amount"], 6)
+        self.assertEqual(spec.mapping["direction"], 5)
+        self.assertEqual(spec.mapping["voucher_no"], 1)  # “凭证号数”是凭证号别名
+        result = precheck(spec)
+        self.assertFalse(result.blocked)
+        self.assertEqual(result.stats.imported_rows, 3)  # “平 0”行按无金额排除
+        self.assertEqual(result.stats.debit_cents, 32000000)
+        self.assertEqual(result.stats.credit_cents, 23000000)
+        self.assertEqual(self.store.import_sheet(spec), 3)
+        entries = self.store.db.execute("SELECT voucher_no, debit_cents, credit_cents FROM entries ORDER BY id").fetchall()
+        self.assertEqual([tuple(row) for row in entries],
+                         [("记-0001", 23000000, 0), ("记-0001", 0, 23000000), ("记-0002", 9000000, 0)])
+
+    def test_unrecognized_direction_is_pending_not_guessed(self):
+        path = self.base / "方向坏.csv"
+        path.write_text(",".join(self.DIRECTION_HEADER) + "\n"
+                        "2020-01-31,记-0001,100201,中国银行,往来款,借,230000\n"
+                        "2020-01-31,记-0002,1122,应收账款,往来款,损,500\n"
+                        "2020-01-31,记-0003,1122,应收账款,空方向,,500\n", encoding="utf-8")
+        result = precheck(classify_sheet(path, "CSV"))
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.pending_rows, [3, 4])
+        self.assertTrue(any("借贷方向无法识别" in issue.reason for issue in result.issues))
+
+    def test_amount_without_direction_fails_validation(self):
+        path = self._journal()
+        spec = ImportSpec(path, "CSV", 1, "entry",
+                          {"date": 0, "voucher_no": 1, "account_code": 2, "account_name": 3, "summary": 4, "amount": 6})
+        with self.assertRaises(ValueError):
+            spec.validate()
+
+    def test_paired_total_rows_at_file_tail_are_not_imported(self):
+        # 用友把总计打印成成对两行：“合计”只标第一行，第二行除方向/金额外全空，不能当成续行导入
+        path = self.base / "成对合计.csv"
+        path.write_text(",".join(self.DIRECTION_HEADER) + "\n"
+                        "2020-01-31,记-0001,100201,中国银行,往来款,借,100\n"
+                        "2020-01-31,记-0001,1122,应收账款,往来款,贷,100\n"
+                        ",,,,合计,借,100\n"
+                        ",,,,,贷,100\n", encoding="utf-8")
+        result = precheck(classify_sheet(path, "CSV"))
+        self.assertEqual(result.stats.imported_rows, 2)
+        self.assertEqual(result.stats.debit_cents, 10000)
+        self.assertEqual(result.stats.credit_cents, 10000)
+        self.assertEqual(result.stats.excluded.get("小计/合计"), 2)
+        self.assertFalse(result.issues)
+
+    def test_dr_cr_english_directions_are_accepted(self):
+        path = self.base / "英文方向.csv"
+        path.write_text(",".join(self.DIRECTION_HEADER) + "\n"
+                        "2020-01-31,1,100201,中国银行,往来款,Dr,100\n"
+                        "2020-01-31,1,1122,应收账款,往来款,Cr,100\n", encoding="utf-8")
+        result = precheck(classify_sheet(path, "CSV"))
+        self.assertFalse(result.blocked)
+        self.assertEqual(result.stats.debit_cents, 10000)
+        self.assertEqual(result.stats.credit_cents, 10000)
+
+
+class BalanceDirectionTest(PrecheckTestBase):
+    def test_single_closing_balance_with_direction_column(self):
+        path = self.base / "科目余额.csv"
+        path.write_text("科目编码,科目名称,方向,期末余额\n1002,银行存款,借,500\n2202,应付账款,贷,300\n", encoding="utf-8")
+        spec = classify_sheet(path, "CSV")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.kind, "balance")
+        self.assertEqual(self.store.import_sheet(spec), 2)
+        balances = self.store.db.execute(
+            "SELECT closing_debit_cents, closing_credit_cents FROM balances ORDER BY account_key").fetchall()
+        self.assertEqual([tuple(row) for row in balances], [(50000, 0), (0, 30000)])
+
+
+class NonMoneyColumnTest(PrecheckTestBase):
+    def test_quantity_column_is_not_flagged_as_amount(self):
+        header = ["日期", "凭证号", "科目编码", "科目名称", "摘要", "借方金额", "贷方金额", "数量"]
+        lines = [",".join(header)]
+        for index in range(25):
+            lines.append(f"2026-06-01,{index + 1},1403,原材料,购料,100,0,{index + 2}")
+        path = self.base / "数量.csv"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = precheck(classify_sheet(path, "CSV"))
+        self.assertFalse(any("数量" in issue.reason for issue in result.issues))
+        self.assertEqual(result.stats.imported_rows, 25)
+
+
 class PrecheckDialogFlowTest(PrecheckTestBase):
     def setUp(self):
         super().setUp()

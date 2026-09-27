@@ -34,6 +34,8 @@ SEVERITY_INFO = "info"
 # 未映射列的“疑似金额”判定：非空单元格中可识别为金额且非零的比例
 AMOUNT_RATIO = 0.6
 AMOUNT_MIN_CELLS = 20
+# 表头明示的非金额数值列（数量、单价等），不再按“疑似金额”提示核对
+NON_MONEY_HEADERS = {"数量", "单价", "汇率", "税率", "件数", "人数", "次数", "页数", "序号", "行号", "id"}
 # 展示给界面的排除行样本上限
 SAMPLE_LIMIT = 200
 
@@ -231,12 +233,19 @@ def _header_labels(spec: ImportSpec) -> dict[int, str]:
 def _unmapped_amount_columns(spec: ImportSpec, header_labels: dict[int, str]) -> list[PrecheckIssue]:
     """未映射但看起来装着金额的列：可能是漏掉的借贷/余额列，提示核对。"""
     issues: list[PrecheckIssue] = []
+    from .importer import _norm
+
+    def header_name(index: int) -> str:
+        label = header_labels.get(index, "")
+        return label[label.find("「") + 1:label.rfind("」")] if "「" in label and "」" in label else ""
+
     mapped = set(spec.mapping.values())
+    numeric_only = {index for index in header_labels if _norm(header_name(index)) in NON_MONEY_HEADERS}
     stats: dict[int, list[int]] = {}
     try:
         for _row_no, row in rows(spec.path, spec.sheet):
             for index in range(min(len(row), 60)):
-                if index in mapped:
+                if index in mapped or index in numeric_only:
                     continue
                 value = row[index]
                 if value is None or str(value).strip() in ("", "—", "-", "–"):

@@ -27,13 +27,15 @@ FIELDS = {
     "date": ("日期", "凭证日期", "业务日期", "记账日期", "date"),
     "fiscal_year": ("会计年度", "账簿年度", "年度", "年", "fiscal year"),
     "period": ("期间", "会计期间", "月份", "月", "period"),
-    "voucher_no": ("凭证号", "凭证编号", "凭证号码", "凭证字号", "voucher no", "voucher number"),
+    "voucher_no": ("凭证号", "凭证编号", "凭证号码", "凭证号数", "凭证字号", "voucher no", "voucher number"),
     "voucher_type": ("凭证字", "凭证类型", "凭证类别", "字", "voucher type"),
     "account_code": ("科目编码", "科目代码", "会计科目编码", "科目编号", "account code"),
     "account_name": ("科目名称", "科目全名", "会计科目", "科目", "account name"),
     "summary": ("摘要", "业务摘要", "说明", "description", "memo"),
     "debit": ("借方金额", "借方发生额", "本期借方", "借方", "debit"),
     "credit": ("贷方金额", "贷方发生额", "本期贷方", "贷方", "credit"),
+    # 用友等导出的序时账只有一列“金额”，借贷由“方向”列给出
+    "amount": ("金额", "发生金额", "发生额", "本币金额", "本位币金额", "金额（本币）", "amount"),
     "counterparty": ("往来单位", "对方单位", "客商", "客户", "供应商", "counterparty"),
     "auxiliary": ("辅助核算", "核算维度", "核算项目", "辅助项", "项目", "部门", "auxiliary"),
     "currency": ("币别", "币种", "货币", "currency"),
@@ -49,7 +51,7 @@ FIELDS = {
     "closing_credit": ("期末贷方", "期末余额贷方", "期末贷方余额", "期末贷方金额", "closing credit"),
     "opening_balance": ("期初余额", "年初余额", "opening balance"),
     "closing_balance": ("期末余额", "closing balance"),
-    "direction": ("余额方向", "借贷方向", "方向", "balance direction"),
+    "direction": ("余额方向", "借贷方向", "方向", "借或贷", "balance direction"),
 }
 
 REPORT_KINDS = ("balance_sheet", "income_statement")
@@ -485,7 +487,7 @@ def guess_mapping(headers: list[object], kind: str) -> dict[str, int]:
                 mapping[f"{side}_amount_{number}"] = index
         return mapping
     mapping: dict[str, int] = {}
-    fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "opening_balance", "closing_balance", "direction")
+    fields = ("date", "fiscal_year", "period", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "opening_balance", "closing_balance", "direction")
     for field in fields:
         aliases = FIELDS[field]
         for index, header in enumerate(headers):
@@ -539,7 +541,11 @@ class ImportSpec:
                 raise ValueError("至少映射科目编码或科目名称")
             needed = ("debit", "credit") if self.kind == "entry" else ("closing_debit", "closing_credit", "closing_balance")
             if not any(field in self.mapping for field in needed):
-                raise ValueError("至少映射一个借方或贷方金额列")
+                # 序时账/明细账允许“单列金额 + 借贷方向”的画法（用友等导出格式）
+                if not (self.kind == "entry" and "amount" in self.mapping and "direction" in self.mapping):
+                    raise ValueError("至少映射一个借方或贷方金额列，或同时映射“金额”与“借贷方向”列")
+        if self.kind == "entry" and "amount" in self.mapping and "direction" not in self.mapping:
+            raise ValueError("单列金额必须同时映射借贷方向列，避免猜测借贷方向")
         if self.kind == "balance" and "closing_balance" in self.mapping and "direction" not in self.mapping:
             raise ValueError("单列期末余额必须同时映射余额方向，避免猜测借贷方向")
         if self.kind == "balance" and "opening_balance" in self.mapping and "direction" not in self.mapping:
@@ -570,7 +576,7 @@ def _looks_like_header(row: list[object], kind: str, width: int) -> int:
     if kind in REPORT_KINDS:
         aliases |= {_norm(name) for name in REPORT_ITEM_HEADERS} | {_norm(name) for name in REPORT_AMOUNT_HEADERS}
     else:
-        fields = ("date", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "direction")
+        fields = ("date", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "direction")
         for field in fields:
             aliases |= {_norm(alias) for alias in FIELDS[field]}
     return len({_norm(value) for value in row[:width] if value is not None} & aliases)
@@ -578,6 +584,16 @@ def _looks_like_header(row: list[object], kind: str, width: int) -> int:
 
 def _row_signature(row: list[object], width: int) -> tuple[str, ...]:
     return tuple(_norm(value) for value in row[:width])
+
+
+def _direction_side(raw: object, label: str = "借贷方向") -> str:
+    """解析方向单元格：借/贷（或 D/C/Dr/Cr）返回 debit/credit；无法识别时抛错，绝不猜测。"""
+    text = text_value(raw)
+    if text.startswith("借") or text.upper().startswith("D"):
+        return "debit"
+    if text.startswith("贷") or text.upper().startswith("C"):
+        return "credit"
+    raise ValueError(f"{label}无法识别：{text!r}")
 
 
 def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None = None) -> Iterator[RowDecision]:
@@ -594,6 +610,7 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
     last_account_name = ""
     last_voucher = {field: "" for field in ("date", "fiscal_year", "period", "voucher_type", "voucher_no")}
     alien_since = 0
+    last_subtotal_row = 0
 
     def mapped(row: list[object], field: str, row_no: int) -> object:
         index = spec.mapping[field]
@@ -687,6 +704,15 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
             raw_code = text_value(row[spec.mapping["account_code"]]) if "account_code" in spec.mapping and spec.mapping["account_code"] < len(row) else ""
             raw_name = text_value(row[spec.mapping["account_name"]]) if "account_name" in spec.mapping and spec.mapping["account_name"] < len(row) else ""
             raw_summary = text_value(row[spec.mapping["summary"]]) if "summary" in spec.mapping and spec.mapping["summary"] < len(row) else ""
+            # 用友等把总计打印成成对两行：“合计”只标在第一行，第二行除方向/金额外全空。
+            # 紧邻合计行且没有任何标识（科目/摘要/日期/凭证）的裸行是合计的另一半，不作为分录导入。
+            if last_subtotal_row and row_no == last_subtotal_row + 1 and not (raw_code or raw_name or raw_summary) and not any(
+                text_value(row[spec.mapping[field]]) for field in ("date", "voucher_type", "voucher_no")
+                if field in spec.mapping and spec.mapping[field] < len(row)
+            ):
+                last_subtotal_row = row_no
+                yield RowDecision(row_no, DISPOSITION_SUBTOTAL, "合计行的续行（成对打印的合计另一半）")
+                continue
             if spec.kind == "balance" and not (raw_code or raw_name):
                 has_amount = False
                 for amount_field in ("opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "opening_balance", "closing_balance"):
@@ -704,6 +730,7 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
                 continue
             if SUBTOTAL.match(raw_name) or SUBTOTAL.match(raw_summary) or raw_summary in ("期初余额", "上年结转"):
                 last_voucher = {field: "" for field in last_voucher}
+                last_subtotal_row = row_no
                 subtotal_cents = None
                 if spec.kind == "entry":
                     try:
@@ -723,16 +750,28 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
                 code, name = last_account_code, last_account_name
             if not code and not name:
                 if spec.kind == "entry":
-                    debit_value = mapped(row, "debit", row_no) if "debit" in spec.mapping else None
-                    credit_value = mapped(row, "credit", row_no) if "credit" in spec.mapping else None
-                    if (debit_value is not None and str(debit_value).strip() not in ("", "—", "-", "–")) or (credit_value is not None and str(credit_value).strip() not in ("", "—", "-", "–")):
+                    if "amount" in spec.mapping and "direction" in spec.mapping:
+                        amount_cells = (mapped(row, "amount", row_no), None)
+                    else:
+                        amount_cells = (mapped(row, "debit", row_no) if "debit" in spec.mapping else None,
+                                        mapped(row, "credit", row_no) if "credit" in spec.mapping else None)
+                    if any(value is not None and str(value).strip() not in ("", "—", "-", "–") for value in amount_cells):
                         raise _Pending("有金额但没有科目，且上方没有可继承的科目行")
                 yield RowDecision(row_no, DISPOSITION_ZERO, "无科目无金额行")
                 continue
             values["account_code"] = code
             values["account_name"] = name
             if spec.kind == "entry":
-                debit, credit = money(mapped(row, "debit", row_no) if "debit" in spec.mapping else None), money(mapped(row, "credit", row_no) if "credit" in spec.mapping else None)
+                if "amount" in spec.mapping and "direction" in spec.mapping:
+                    # 单列金额：方向“借”计入借方、“贷”计入贷方；零金额行不需要方向
+                    single = money(mapped(row, "amount", row_no))
+                    if single == 0:
+                        yield RowDecision(row_no, DISPOSITION_ZERO, "借贷均为空或零的行")
+                        continue
+                    side = _direction_side(values.get("direction"))
+                    debit, credit = (single, 0) if side == "debit" else (0, single)
+                else:
+                    debit, credit = money(mapped(row, "debit", row_no) if "debit" in spec.mapping else None), money(mapped(row, "credit", row_no) if "credit" in spec.mapping else None)
                 if debit == 0 and credit == 0:
                     yield RowDecision(row_no, DISPOSITION_ZERO, "借贷均为空或零的行")
                     continue
@@ -798,12 +837,8 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
                     if period_name + "_balance" in spec.mapping:
                         single = money(mapped(row, period_name + "_balance", row_no))
                         if single:
-                            if direction.startswith("借") or direction.lower().startswith("d"):
-                                side = "debit" if single > 0 else "credit"
-                            elif direction.startswith("贷") or direction.lower().startswith("c"):
-                                side = "credit" if single > 0 else "debit"
-                            else:
-                                raise _Pending(f"余额方向无法识别：{direction!r}")
+                            base = _direction_side(direction, label="余额方向")
+                            side = base if single > 0 else ("credit" if base == "debit" else "debit")
                             amounts[period_name + "_" + side + "_cents"] = abs(single)
                 if not any(amounts.values()):
                     yield RowDecision(row_no, DISPOSITION_ZERO, "借贷余额均为空或零的行")

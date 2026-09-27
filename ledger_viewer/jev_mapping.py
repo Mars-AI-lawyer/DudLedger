@@ -37,6 +37,7 @@ FIELD_DESCRIPTIONS = {
     "summary": "分录摘要或业务说明。",
     "debit": "明细分录的借方发生金额。",
     "credit": "明细分录的贷方发生金额。",
+    "amount": "单一金额列；表格没有借贷分列、金额只有一列时选它，必须同时选“direction”。",
     "counterparty": "往来单位、客户或供应商名称。",
     "auxiliary": "辅助核算或核算维度。",
     "currency": "币别或币种。",
@@ -52,7 +53,7 @@ FIELD_DESCRIPTIONS = {
     "closing_debit": "科目期末余额的借方列；不能选贷方列。",
     "closing_credit": "科目期末余额的贷方列；不能选借方列。",
     "closing_balance": "科目期末余额的单列金额；不是借贷分列。",
-    "direction": "余额方向或借贷方向。",
+    "direction": "借贷方向列（借/贷/平），或余额表的余额方向；单列金额、单列余额必须选它。",
     "left_item": "左侧或单侧报表项目名称；不是金额。",
     "left_amount_1": "左侧项目右边第一列金额。",
     "left_amount_2": "左侧项目右边第二列金额。",
@@ -64,7 +65,7 @@ FIELD_DESCRIPTIONS = {
 }
 
 KIND_FIELDS = {
-    "entry": ("date", "fiscal_year", "period", "voucher_type", "voucher_no", "account_code", "account_name", "summary", "debit", "credit", "counterparty", "auxiliary", "currency", "original_amount", "maker"),
+    "entry": ("date", "fiscal_year", "period", "voucher_type", "voucher_no", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker"),
     "balance": ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "closing_balance", "direction"),
     "balance_sheet": ("left_item", "left_amount_1", "left_amount_2", "left_amount_3", "right_item", "right_amount_1", "right_amount_2", "right_amount_3"),
     "income_statement": ("left_item", "left_amount_1", "left_amount_2", "left_amount_3"),
@@ -167,6 +168,8 @@ def critical_warnings(kind: str, mapping: dict) -> list[str]:
     hints = []
     if kind == "entry" and ("debit" in mapping) != ("credit" in mapping):
         hints.append("借方或贷方金额只识别到一侧，请核对另一侧金额列")
+    if kind == "entry" and "amount" in mapping and "direction" not in mapping:
+        hints.append("识别到单一金额列但缺少“借贷方向”列；请确认方向列并补选，导入前必须补上")
     if kind == "balance" and "closing_balance" not in mapping and ("closing_debit" in mapping) != ("closing_credit" in mapping):
         hints.append("期末余额只识别到一侧借贷列，请核对")
     return hints
