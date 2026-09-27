@@ -40,7 +40,7 @@ class WorkflowUITest(unittest.TestCase):
                 window.refresh_all()
                 menu = window.nametowidget(window.cget("menu"))
                 self.assertEqual([menu.entrycget(index, "label") for index in range(menu.index("end") + 1)], ["文件", "查看", "设置"])
-                self.assertEqual([window.tabs.tab(tab, "text") for tab in window.tabs.tabs()], ["科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 待核凭证"])
+                self.assertEqual([window.tabs.tab(tab, "text") for tab in window.tabs.tabs()], ["科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 尽调线索"])
                 imports = window.nametowidget(menu.entrycget(0, "menu"))
                 self.assertEqual(imports.entrycget(4, "label"), "导入记录…")
                 imports.invoke(4)

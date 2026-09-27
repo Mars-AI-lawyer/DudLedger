@@ -3,7 +3,9 @@ import unittest
 from pathlib import Path
 
 from ledger_viewer.importer import ImportSpec, guess_header
-from ledger_viewer.related_parties import party_names, parse_party_names, party_names_from_file, related_party_match
+from ledger_viewer.related_parties import (party_names, party_entries_from_file, party_names_from_file,
+                                           parse_party_lines, parse_party_names, parse_roles, party_roles,
+                                           related_party_match, role_grouped_names)
 from ledger_viewer.store import LedgerStore
 
 
@@ -67,6 +69,36 @@ class RelatedPartiesTest(unittest.TestCase):
         txt_path = self.base / "names.txt"
         txt_path.write_text("甲公司\n乙公司\n甲公司\n", encoding="utf-8")
         self.assertEqual(party_names_from_file(txt_path), ["甲公司", "乙公司"])
+
+    def test_roles_persist_and_grouped_payload_dedupes(self):
+        party_id = self.store.save_related_party("赵六", [], "", None, ["股东", "实际控制人"], "创始人")
+        self.store.save_related_party("张三", ["张三别名"], "", None, ["董事"], "")
+        self.store.save_related_party("无身份公司", [], "", None, [], "客户")
+        stored = {row["name"]: row for row in self.store.related_parties()}
+        self.assertEqual(party_roles(stored["赵六"]), ["股东", "实际控制人"])
+        self.assertEqual(stored["赵六"]["relation"], "创始人")
+        self.assertEqual(party_roles(stored["无身份公司"]), [])
+        grouped = role_grouped_names(self.store.related_parties())
+        self.assertEqual(grouped["股东"], ["赵六"])
+        self.assertEqual(grouped["实际控制人"], ["赵六"])  # 一个主体出现在每个身份下
+        self.assertEqual(grouped["董事"], ["张三", "张三别名"])
+        self.assertEqual(grouped["未注明身份"], ["无身份公司"])
+        # 更新身份并保留关系
+        self.store.save_related_party("赵六", [], "", party_id, ["前股东"], "创始人")
+        self.assertEqual(party_roles(next(r for r in self.store.related_parties() if r["name"] == "赵六")), ["前股东"])
+
+    def test_parse_roles_drops_unknown_words(self):
+        self.assertEqual(parse_roles("股东,董事、监事"), ["股东", "董事", "监事"])
+        self.assertEqual(parse_roles("法定代表人,股东"), ["股东"])  # 未知身份不猜测
+        self.assertEqual(parse_roles(""), [])
+
+    def test_party_lines_and_file_import_carry_roles(self):
+        text = "张三｜股东,董事\n\n李四｜未知身份\n王五\n张三"
+        self.assertEqual(parse_party_lines(text), [("张三", ["股东", "董事"]), ("李四", []), ("王五", [])])
+        csv_path = self.base / "parties_roles.csv"
+        csv_path.write_text("名称,身份,备注\n赵六,\"股东,实际控制人\",创始人\n乙公司,法人,无\n丙公司\n", encoding="utf-8")
+        entries = party_entries_from_file(csv_path)
+        self.assertEqual(entries, [("赵六", ["股东", "实际控制人"]), ("乙公司", []), ("丙公司", [])])
 
 
 if __name__ == "__main__":

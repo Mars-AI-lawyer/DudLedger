@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS voucher_marks (
 );
 CREATE TABLE IF NOT EXISTS related_parties (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
- aliases_json TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT ''
+ aliases_json TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT '',
+ roles_json TEXT NOT NULL DEFAULT '[]', relation TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS import_templates (
  id INTEGER PRIMARY KEY, kind TEXT NOT NULL, sheet_label TEXT NOT NULL DEFAULT '',
@@ -116,6 +117,18 @@ class LedgerStore:
             for name in ("fiscal_year", "period", "currency", "original_amount", "maker"):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE entries ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            # 尽调主体名单升级：身份与关系列（v7 及更早账套就地补列）。
+            party_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(related_parties)")}
+            if "roles_json" not in party_columns:
+                self.db.execute("ALTER TABLE related_parties ADD COLUMN roles_json TEXT NOT NULL DEFAULT '[]'")
+            if "relation" not in party_columns:
+                self.db.execute("ALTER TABLE related_parties ADD COLUMN relation TEXT NOT NULL DEFAULT ''")
+            review_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jev_reviews)")}
+            if "feedback" not in review_columns:
+                self.db.execute("ALTER TABLE jev_reviews ADD COLUMN feedback TEXT NOT NULL DEFAULT ''")
+            result_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jev_results)")}
+            if "features_json" not in result_columns:
+                self.db.execute("ALTER TABLE jev_results ADD COLUMN features_json TEXT")
             if version == "legal-ledger-viewer-v1":
                 self.db.execute("UPDATE entries SET fiscal_year=substr(entry_date,1,4), period=CAST(CAST(substr(entry_date,6,2) AS INTEGER) AS TEXT) WHERE entry_date GLOB '????-??-??'")
             for table, additions in (("balances", ("year_debit_cents", "year_credit_cents")), ("report_rows", ("left_amount_3_cents", "right_amount_3_cents"))):
@@ -182,15 +195,18 @@ class LedgerStore:
     def related_parties(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM related_parties ORDER BY name,id").fetchall()
 
-    def save_related_party(self, name: str, aliases: list[str], note: str = "", party_id: int | None = None) -> int:
-        from .related_parties import normalized_name
+    def save_related_party(self, name: str, aliases: list[str], note: str = "", party_id: int | None = None,
+                           roles: list[str] | None = None, relation: str = "") -> int:
+        from .related_parties import normalized_name, parse_roles
 
         name = name.strip()
+        relation = (relation or "").strip()
+        roles = parse_roles(roles or [])
         aliases = list(dict.fromkeys(alias.strip() for alias in aliases if alias.strip() and alias.strip() != name))
         if not name:
-            raise ValueError("关联方名称不能为空")
-        if len(name) > 200 or any(len(alias) > 200 for alias in aliases):
-            raise ValueError("名称或别名不能超过 200 字")
+            raise ValueError("尽调主体名称不能为空")
+        if len(name) > 200 or any(len(alias) > 200 for alias in aliases) or len(relation) > 200:
+            raise ValueError("名称、别名或关系不能超过 200 字")
         requested = {normalized_name(item) for item in (name, *aliases)}
         if len(requested) != 1 + len(aliases):
             raise ValueError("名称和别名不能重复")
@@ -202,11 +218,13 @@ class LedgerStore:
                 raise ValueError(f'名称或别名与“{existing["name"]}”重复')
         with self.db:
             if party_id is None:
-                cursor = self.db.execute("INSERT INTO related_parties(name,aliases_json,note) VALUES(?,?,?)", (name, json.dumps(aliases, ensure_ascii=False), note))
+                cursor = self.db.execute("INSERT INTO related_parties(name,aliases_json,note,roles_json,relation) VALUES(?,?,?,?,?)",
+                    (name, json.dumps(aliases, ensure_ascii=False), note, json.dumps(roles, ensure_ascii=False), relation))
                 return cursor.lastrowid
-            cursor = self.db.execute("UPDATE related_parties SET name=?,aliases_json=?,note=? WHERE id=?", (name, json.dumps(aliases, ensure_ascii=False), note, party_id))
+            cursor = self.db.execute("UPDATE related_parties SET name=?,aliases_json=?,note=?,roles_json=?,relation=? WHERE id=?",
+                (name, json.dumps(aliases, ensure_ascii=False), note, json.dumps(roles, ensure_ascii=False), relation, party_id))
             if not cursor.rowcount:
-                raise ValueError("所选关联方已不存在")
+                raise ValueError("所选尽调主体已不存在")
         return party_id
 
     def delete_related_party(self, party_id: int) -> None:

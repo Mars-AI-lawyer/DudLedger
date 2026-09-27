@@ -22,7 +22,7 @@ from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_shee
 from .jev_mapping import PREVIEW_COLUMNS, delete_api_key, get_api_key, key_memory_only, preview_sheet, save_api_key, suggest_mapping
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
-from .related_parties import parse_party_names, party_names_from_file, related_party_match
+from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, related_party_match
 from .store import LedgerStore
 from .theme import configure_theme
 from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_mark, save_mark, save_mark_by_key, source_account, update_mark_note, voucher_key
@@ -248,7 +248,7 @@ class SettingsDialog(tk.Toplevel):
         jev_actions.pack(fill="x", pady=6)
         from .jev_ui import launch_connection_test
         ttk.Button(jev_actions, text="测试连接（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
-        ttk.Button(jev_actions, text="Jev 审查规则与阈值", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
+        ttk.Button(jev_actions, text="Jev 审查规则与尽调筛选设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
         ttk.Label(body, text="批量导入默认勾选 AI 建议列；确认发送范围后才联网，也可取消勾选。", foreground="#555").pack(anchor="w", pady=(7, 0))
         ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
         ttk.Button(body, text="保存并完成", command=self._finish).pack(anchor="e", pady=(12, 0))
@@ -332,14 +332,17 @@ class RelatedPartyImportDialog(tk.Toplevel):
     def __init__(self, parent: "RelatedPartiesDialog"):
         super().__init__(parent)
         self.dialog = parent
-        self.title("批量导入关联方")
-        self.geometry("560x470")
-        self.minsize(460, 380)
+        self.title("批量导入尽调主体")
+        self.geometry("600x500")
+        self.minsize(500, 400)
         self.transient(parent)
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, foreground="#555", wraplength=500, text="每行一个名称，空白行与重复项自动忽略；也可从 Excel/CSV/TXT 导入（取每行第一个非空单元格，首行表头自动跳过）。与现有名单重复或无效的条目导入时跳过。").pack(anchor="w")
-        self.editor = tk.Text(body, height=12, wrap="word", undo=True)
+        ttk.Label(body, foreground="#555", wraplength=540, text="每行一个主体，可用“｜”补充身份，例如“张三｜股东,董事”；空白行与重复项自动忽略。"
+            "也可从 Excel/CSV/TXT 导入：第一列名称，第二列身份（如“股东、董事”，识别不了的自动留空），首行表头自动跳过。"
+            "与现有名单重复或无效的条目导入时跳过。").pack(anchor="w")
+        ttk.Label(body, foreground="#555", wraplength=540, text=f"可选身份：{'、'.join(PARTY_ROLES)}").pack(anchor="w", pady=(4, 0))
+        self.editor = tk.Text(body, height=11, wrap="word", undo=True)
         self.editor.pack(fill="both", expand=True, pady=(8, 6))
         self.status = tk.StringVar()
         ttk.Label(body, textvariable=self.status, foreground="#555").pack(anchor="w")
@@ -351,39 +354,39 @@ class RelatedPartyImportDialog(tk.Toplevel):
         self.editor.bind("<KeyRelease>", lambda _e: self._refresh_count())
         self.grab_set()
 
-    def _names(self) -> list[str]:
-        return parse_party_names(self.editor.get("1.0", "end-1c"))
+    def _entries(self) -> list[tuple[str, list[str]]]:
+        return parse_party_lines(self.editor.get("1.0", "end-1c"))
 
     def _refresh_count(self) -> None:
-        self.status.set(f"当前识别到 {len(self._names())} 个名称")
+        self.status.set(f"当前识别到 {len(self._entries())} 个主体")
 
     def _load_file(self) -> None:
-        path = filedialog.askopenfilename(parent=self, title="选择关联方清单文件",
+        path = filedialog.askopenfilename(parent=self, title="选择尽调主体清单文件",
             filetypes=[("表格与文本", "*.xlsx *.xlsm *.xls *.csv *.txt"), ("所有文件", "*.*")])
         if not path:
             return
         try:
-            names = party_names_from_file(path)
+            entries = party_entries_from_file(path)
         except Exception as exc:
             messagebox.showerror("读取失败", str(exc), parent=self)
             return
-        if not names:
-            messagebox.showinfo("没有可导入的名称", "文件中没有读到非空内容。", parent=self)
+        if not entries:
+            messagebox.showinfo("没有可导入的主体", "文件中没有读到非空内容。", parent=self)
             return
         self.editor.delete("1.0", "end")
-        self.editor.insert("1.0", "\n".join(names))
+        self.editor.insert("1.0", "\n".join(name + (f"｜{','.join(roles)}" if roles else "") for name, roles in entries))
         self._refresh_count()
-        self.status.set(f"已从文件读取 {len(names)} 个名称，可先修改再导入")
+        self.status.set(f"已从文件读取 {len(entries)} 个主体，可先修改再导入")
 
     def _import(self) -> None:
-        names = self._names()
-        if not names:
-            messagebox.showinfo("没有可导入的名称", "请先粘贴名称（每行一个）或从文件读取。", parent=self)
+        entries = self._entries()
+        if not entries:
+            messagebox.showinfo("没有可导入的主体", "请先粘贴名称（每行一个，可选“｜身份”）或从文件读取。", parent=self)
             return
         added, skipped = 0, 0
-        for name in names:
+        for name, roles in entries:
             try:
-                self.dialog.parent.store.save_related_party(name, [])
+                self.dialog.parent.store.save_related_party(name, [], "", None, roles, "")
                 added += 1
             except ValueError:
                 skipped += 1
@@ -396,14 +399,14 @@ class RelatedPartiesDialog(tk.Toplevel):
     def __init__(self, parent: "App"):
         super().__init__(parent)
         self.parent = parent
-        self.title("当前项目 · 关联方名单")
-        self.geometry("650x530")
+        self.title("当前项目 · 尽调主体名单")
+        self.geometry("760x580")
         self.transient(parent)
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="名单由用户指定；本地对往来单位、辅助核算作精确匹配。AI 审查时名称与别名（不含备注）会随每张凭证发送到 Jev 云端用于识别关联交易，不构成法律关系认定。", foreground="#555", wraplength=600).pack(anchor="w")
-        self.view = ttk.Treeview(body, columns=("name", "aliases", "note"), show="headings", height=8)
-        for key, title, width in (("name", "名称", 190), ("aliases", "别名", 210), ("note", "备注", 210)):
+        ttk.Label(body, text="名单由用户指定；本地对往来单位、辅助核算作精确匹配，命中作为程序特征随凭证发送。AI 审查时名称、别名与身份（不含备注、关系）会随每张凭证发送到 Jev 云端，用于识别关联资金往来，不构成法律关系认定。", foreground="#555", wraplength=700).pack(anchor="w")
+        self.view = ttk.Treeview(body, columns=("name", "roles", "relation", "aliases", "note"), show="headings", height=8)
+        for key, title, width in (("name", "名称", 150), ("roles", "身份", 130), ("relation", "与目标公司关系", 130), ("aliases", "别名", 140), ("note", "备注", 150)):
             self.view.heading(key, text=title)
             self.view.column(key, width=width)
         self.view.pack(fill="both", expand=True, pady=(8, 10))
@@ -413,12 +416,18 @@ class RelatedPartiesDialog(tk.Toplevel):
         ttk.Label(form, text="名称").grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar()
         ttk.Entry(form, textvariable=self.name_var).grid(row=0, column=1, sticky="ew", pady=3)
-        ttk.Label(form, text="别名（每行一个）").grid(row=1, column=0, sticky="nw")
+        ttk.Label(form, text="身份（逗号分隔）").grid(row=1, column=0, sticky="w")
+        self.roles_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.roles_var).grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Label(form, text="与目标公司关系").grid(row=2, column=0, sticky="w")
+        self.relation_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.relation_var).grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Label(form, text="别名（每行一个）").grid(row=3, column=0, sticky="nw")
         self.alias_editor = tk.Text(form, height=3, wrap="word")
-        self.alias_editor.grid(row=1, column=1, sticky="ew", pady=3)
-        ttk.Label(form, text="备注／依据").grid(row=2, column=0, sticky="nw")
+        self.alias_editor.grid(row=3, column=1, sticky="ew", pady=3)
+        ttk.Label(form, text="备注／依据").grid(row=4, column=0, sticky="nw")
         self.note_editor = tk.Text(form, height=3, wrap="word")
-        self.note_editor.grid(row=2, column=1, sticky="ew", pady=3)
+        self.note_editor.grid(row=4, column=1, sticky="ew", pady=3)
         form.columnconfigure(1, weight=1)
         buttons = ttk.Frame(body)
         buttons.pack(fill="x", pady=(10, 0))
@@ -433,7 +442,9 @@ class RelatedPartiesDialog(tk.Toplevel):
     def _refresh(self) -> None:
         self.view.delete(*self.view.get_children())
         for row in self.parent.store.related_parties():
-            self.view.insert("", "end", iid=str(row["id"]), values=(row["name"], "、".join(json.loads(row["aliases_json"])), row["note"].replace("\n", " ")[:100]))
+            roles = "、".join(json.loads(row["roles_json"])) if "roles_json" in row.keys() else ""
+            self.view.insert("", "end", iid=str(row["id"]), values=(row["name"], roles, row["relation"].replace("\n", " ")[:60] if "relation" in row.keys() else "",
+                "、".join(json.loads(row["aliases_json"])), row["note"].replace("\n", " ")[:80]))
         self.parent.refresh_details()
 
     def _select(self, _event: object) -> None:
@@ -444,6 +455,8 @@ class RelatedPartiesDialog(tk.Toplevel):
         if row is None:
             return
         self.name_var.set(row["name"])
+        self.roles_var.set("、".join(json.loads(row["roles_json"])) if "roles_json" in row.keys() else "")
+        self.relation_var.set(row["relation"] if "relation" in row.keys() else "")
         self.alias_editor.delete("1.0", "end")
         self.alias_editor.insert("1.0", "\n".join(json.loads(row["aliases_json"])))
         self.note_editor.delete("1.0", "end")
@@ -454,6 +467,8 @@ class RelatedPartiesDialog(tk.Toplevel):
         if selected:
             self.view.selection_remove(*selected)
         self.name_var.set("")
+        self.roles_var.set("")
+        self.relation_var.set("")
         self.alias_editor.delete("1.0", "end")
         self.note_editor.delete("1.0", "end")
 
@@ -461,7 +476,8 @@ class RelatedPartiesDialog(tk.Toplevel):
         selected = self.view.selection()
         party_id = int(selected[0]) if selected else None
         try:
-            saved_id = self.parent.store.save_related_party(self.name_var.get(), self.alias_editor.get("1.0", "end-1c").splitlines(), self.note_editor.get("1.0", "end-1c"), party_id)
+            saved_id = self.parent.store.save_related_party(self.name_var.get(), self.alias_editor.get("1.0", "end-1c").splitlines(),
+                self.note_editor.get("1.0", "end-1c"), party_id, self.roles_var.get(), self.relation_var.get())
         except Exception as exc:
             messagebox.showerror("保存失败", str(exc), parent=self)
             return
@@ -470,7 +486,7 @@ class RelatedPartiesDialog(tk.Toplevel):
 
     def _delete(self) -> None:
         selected = self.view.selection()
-        if selected and messagebox.askyesno("删除关联方", "确定从当前项目删除这条用户维护的关联方记录吗？", parent=self):
+        if selected and messagebox.askyesno("删除尽调主体", "确定从当前项目删除这条用户维护的尽调主体记录吗？", parent=self):
             self.parent.store.delete_related_party(int(selected[0]))
             self._clear()
             self._refresh()
@@ -1443,7 +1459,7 @@ class App(tk.Toplevel):
         ttk.Label(self.sidebar, text="DudLedger", style="Brand.TLabel").pack(anchor="w", padx=18, pady=(24, 4))
         ttk.Label(self.sidebar, text="法律尽调 · 账簿核查", style="SidebarHint.TLabel").pack(anchor="w", padx=18, pady=(0, 26))
         self.nav_buttons = []
-        self.page_names = ("科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 待核凭证")
+        self.page_names = ("科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 尽调线索")
         for index, title in enumerate(self.page_names):
             if index in (0, 4):
                 ttk.Label(self.sidebar, text="账簿" if index == 0 else "复核", style="SidebarHint.TLabel").pack(anchor="w", padx=20, pady=(14, 8))
@@ -1480,7 +1496,7 @@ class App(tk.Toplevel):
         self.tabs.pack(fill="both", expand=True)
         self.utility_windows = {}
         frames = []
-        for title in ("科目总览", "明细账", "资产负债表", "利润表", "核对提醒", "导入记录", "关注凭证", "AI 待核凭证"):
+        for title in ("科目总览", "明细账", "资产负债表", "利润表", "核对提醒", "导入记录", "关注凭证", "AI 尽调线索"):
             if title in ("核对提醒", "导入记录"):
                 dialog = tk.Toplevel(self)
                 dialog.withdraw()
@@ -1680,9 +1696,9 @@ class App(tk.Toplevel):
         review.add_command(label="科目总览", command=lambda: self.tabs.select(0))
         review.add_command(label="明细账", command=lambda: self.tabs.select(1))
         review.add_command(label="关注凭证", command=lambda: self.tabs.select(4))
-        review.add_command(label="AI 待核凭证", command=lambda: (self.review_panel.refresh(), self.tabs.select(5)))
-        review.add_command(label="核查全部凭证…", command=lambda: (self.tabs.select(5), self.review_panel.new_batch()))
-        review.add_command(label="关联方名单…", command=self.open_related_parties)
+        review.add_command(label="AI 尽调线索", command=lambda: (self.review_panel.refresh(), self.tabs.select(5)))
+        review.add_command(label="筛选全部凭证…", command=lambda: (self.tabs.select(5), self.review_panel.new_batch()))
+        review.add_command(label="尽调主体名单…", command=self.open_related_parties)
         review.add_command(label="核对提醒…", command=lambda: self.open_utility("核对提醒"))
         review.add_command(label="核对范围…", command=self.open_reconciliation)
         menu.add_cascade(label="查看", menu=review)

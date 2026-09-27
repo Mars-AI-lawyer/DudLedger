@@ -48,7 +48,7 @@ class WorkspaceUITest(unittest.TestCase):
         self.app.geometry("1160x690")
         self.root.update()
         self.assertTrue(self.app.sidebar.winfo_ismapped())
-        self.assertEqual(self.app.page_title.get(), "AI 待核凭证")
+        self.assertEqual(self.app.page_title.get(), "AI 尽调线索")
 
 
 if __name__ == "__main__":
