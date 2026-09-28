@@ -1416,7 +1416,8 @@ class App(tk.Toplevel):
         self.account: str | list[str] | None = None
         self.include_descendants = False
         self.account_label = tk.StringVar(value="全部科目")
-        self.period_filter = tk.StringVar(value="全部期间")
+        self.period_from = tk.StringVar(value="不限")
+        self.period_to = tk.StringVar(value="不限")
         self.period_options: dict[str, tuple[str, str]] = {}
         self.balance_source = tk.StringVar(value="无余额表")
         self.balance_options: dict[str, int] = {}
@@ -1552,9 +1553,13 @@ class App(tk.Toplevel):
         detail_entry.pack(side="left", fill="x", expand=True, padx=6)
         detail_entry.bind("<Return>", lambda _e: self.refresh_details())
         ttk.Label(self.detail_controls, text="期间").pack(side="left")
-        self.period_combo = ttk.Combobox(self.detail_controls, textvariable=self.period_filter, values=("全部期间",), state="readonly", width=14)
-        self.period_combo.pack(side="left", padx=6)
-        self.period_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
+        self.period_from_combo = ttk.Combobox(self.detail_controls, textvariable=self.period_from, values=("不限",), state="readonly", width=11)
+        self.period_from_combo.pack(side="left", padx=(6, 2))
+        self.period_from_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
+        ttk.Label(self.detail_controls, text="至").pack(side="left")
+        self.period_to_combo = ttk.Combobox(self.detail_controls, textvariable=self.period_to, values=("不限",), state="readonly", width=11)
+        self.period_to_combo.pack(side="left", padx=(2, 6))
+        self.period_to_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
         ttk.Button(self.detail_controls, text="查找", command=self.refresh_details, style="Accent.TButton").pack(side="left")
         ttk.Button(self.detail_controls, text="重置筛选", command=self.clear_filter).pack(side="left", padx=(6, 0))
         ttk.Label(frames[1], textvariable=self.detail_info, style="Hint.TLabel", padding=(6, 2)).pack(fill="x")
@@ -1791,7 +1796,7 @@ class App(tk.Toplevel):
         self.account = None
         self.include_descendants = False
         self.account_label.set("全部科目")
-        self.period_filter.set("全部期间")
+        self._set_all_periods()
         self.search.set("")
         self.summary_search.set("")
         self.balance_source.set("无余额表")
@@ -1824,7 +1829,7 @@ class App(tk.Toplevel):
                 view.configure(displaycolumns=visible_columns(kind, self.store.display_columns(kind)))
         self.account = None
         self.account_label.set("全部科目")
-        self.period_filter.set("全部期间")
+        self._set_all_periods()
         self.search.set("")
         self.summary_search.set("")
         self.include_descendants = False
@@ -1932,8 +1937,10 @@ class App(tk.Toplevel):
         chosen = filedialog.asksaveasfilename(parent=self, title="导出当前科目明细", defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if chosen:
             try:
-                year, period = self._selected_period()
-                count = self.store.export_entries(Path(chosen), self.account, self.search.get().strip(), year, period, self.include_descendants, self.detail_sort, self.detail_descending)
+                period_start, period_end = self._period_bounds()
+                count = self.store.export_entries(Path(chosen), self.account, self.search.get().strip(),
+                    period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
+                    sort_by=self.detail_sort, descending=self.detail_descending)
                 messagebox.showinfo("导出完成", f"已导出 {count} 行。", parent=self)
             except Exception as exc:
                 messagebox.showerror("导出失败", str(exc), parent=self)
@@ -2052,7 +2059,7 @@ class App(tk.Toplevel):
 
     def clear_filter(self) -> None:
         self.search.set("")
-        self.period_filter.set("全部期间")
+        self._set_all_periods()
         self.refresh_details()
 
     def reset_detail_sort(self) -> None:
@@ -2071,8 +2078,37 @@ class App(tk.Toplevel):
         self.account_label.set("全部科目")
         self.refresh_details()
 
-    def _selected_period(self) -> tuple[str | None, str | None]:
-        return self.period_options.get(self.period_filter.get(), (None, None))
+    @staticmethod
+    def _period_sort_key(pair: tuple[str, str]) -> tuple[int, int]:
+        def as_int(value: str) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+        return as_int(pair[0]), as_int(pair[1])
+
+    def _period_bounds(self) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
+        """起止均为闭区间（含当期）；只填一侧表示该侧不限；起止填反自动对调。"""
+        start = self.period_options.get(self.period_from.get())
+        end = self.period_options.get(self.period_to.get())
+        if start and end and self._period_sort_key(start) > self._period_sort_key(end):
+            start, end = end, start
+        return start, end
+
+    def _period_label(self) -> str:
+        reverse = {value: key for key, value in self.period_options.items()}
+        start, end = self._period_bounds()
+        if start and end:
+            return f"{reverse.get(start, self.period_from.get())} 至 {reverse.get(end, self.period_to.get())}"
+        if start:
+            return f"{reverse.get(start, self.period_from.get())} 起"
+        if end:
+            return f"至 {reverse.get(end, self.period_to.get())}"
+        return "全部期间"
+
+    def _set_all_periods(self) -> None:
+        self.period_from.set("不限")
+        self.period_to.set("不限")
 
     def _period_changed(self) -> None:
         self.refresh_details()
@@ -2085,9 +2121,12 @@ class App(tk.Toplevel):
         if not self.store:
             return
         self.period_options = {f"{year}年{period}期": (year, period) for year, period in self.store.periods()}
-        self.period_combo.configure(values=("全部期间", *self.period_options))
-        if self.period_filter.get() not in self.period_options:
-            self.period_filter.set("全部期间")
+        period_values = ("不限", *self.period_options)
+        self.period_from_combo.configure(values=period_values)
+        self.period_to_combo.configure(values=period_values)
+        for variable in (self.period_from, self.period_to):
+            if variable.get() != "不限" and variable.get() not in self.period_options:
+                variable.set("不限")
         balance_sources = [source for source in self.store.sources() if source["kind"] == "balance"]
         self.balance_options = {f'{source["id"]}: {source["filename"]} / {source["sheet"]}': source["id"] for source in balance_sources}
         self.balance_combo.configure(values=tuple(self.balance_options) if self.balance_options else ("无余额表",))
@@ -2237,7 +2276,7 @@ class App(tk.Toplevel):
             scope = scope[:30] + f"…（{len(keys)} 个科目）"
         self.account_label.set(f"{label} → {scope}" + (" · 含子科目" if include_descendants else ""))
         self.search.set("")
-        self.period_filter.set("全部期间")
+        self._set_all_periods()
         self.refresh_details()
         self.tabs.select(1)
 
@@ -2245,8 +2284,10 @@ class App(tk.Toplevel):
         self.detail_view.delete(*self.detail_view.get_children())
         if not self.store:
             return
-        year, period = self._selected_period()
-        rows_found = self.store.entries(account=self.account, search=self.search.get().strip(), fiscal_year=year, period=period, include_descendants=self.include_descendants, sort_by=self.detail_sort, descending=self.detail_descending)
+        period_start, period_end = self._period_bounds()
+        rows_found = self.store.entries(account=self.account, search=self.search.get().strip(),
+            period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
+            sort_by=self.detail_sort, descending=self.detail_descending)
         marked_keys = {row["voucher_key"] for row in self.store.db.execute("SELECT voucher_key FROM voucher_marks")}
         parties = self.store.related_parties()
         for row in rows_found:
@@ -2257,7 +2298,7 @@ class App(tk.Toplevel):
             arrow = (" ↓" if self.detail_descending else " ↑") if key == self.detail_sort else ""
             self.detail_view.heading(key, text=title + arrow)
         count_label = "已显示前 3000 条，请缩小范围；导出包含全部匹配项" if len(rows_found) == 3000 else f"{len(rows_found)} 条明细"
-        self.detail_info.set(f"{count_label} · {self.period_filter.get()} · 点击日期、科目、凭证或借贷表头排序；双击一行看凭证")
+        self.detail_info.set(f"{count_label} · {self._period_label()} · 点击日期、科目、凭证或借贷表头排序；双击一行看凭证")
 
     def open_account(self, _event: object) -> None:
         if _event is not None and self.summary_view.identify_column(_event.x) == '#0':
@@ -2268,7 +2309,7 @@ class App(tk.Toplevel):
         self.account = selection[0]
         self.include_descendants = self.account.startswith("C:")
         self.search.set("")
-        self.period_filter.set("全部期间")
+        self._set_all_periods()
         values = self.summary_view.item(selection[0], "values")
         self.account_label.set(f"{values[0]} {values[1]}".strip() + (" · 含子科目" if self.include_descendants else ""))
         self.refresh_details()

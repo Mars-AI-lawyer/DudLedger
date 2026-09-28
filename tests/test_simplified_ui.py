@@ -68,11 +68,13 @@ class SimplifiedUITest(unittest.TestCase):
 
     def test_left_right_and_income_click_clear_old_filters(self):
         self.app.search.set('不存在')
-        self.app.period_filter.set('2026年7期')
+        self.app.period_from.set('2026年7期')
+        self.app.period_to.set('2026年8期')
         self.click_report('balance_sheet', 2, 'left_item')
         self.assertEqual(self.shown_codes(), ['1002', '100201'])
         self.assertEqual(self.app.search.get(), '')
-        self.assertEqual(self.app.period_filter.get(), '全部期间')
+        self.assertEqual(self.app.period_from.get(), '不限')
+        self.assertEqual(self.app.period_to.get(), '不限')
         self.click_report('balance_sheet', 2, 'right_item')
         self.assertEqual(self.shown_codes(), ['2202'])
         self.click_report('income_statement', 2, 'left_item')
@@ -120,6 +122,50 @@ class SimplifiedUITest(unittest.TestCase):
         for widget in self.app.detail_controls.winfo_children():
             self.assertTrue(widget.winfo_ismapped())
             self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(), self.app.winfo_rootx() + self.app.winfo_width())
+
+    def test_detail_period_range_spans_years(self):
+        path = self.base / '跨年.csv'
+        path.write_text('日期,会计年度,期间,凭证字,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n'
+                        '2023-01-15,2023,1,记,1,1002,银行存款,收款,10,0\n'
+                        '2023-12-31,2023,12,记,2,1002,银行存款,收款,20,0\n'
+                        '2024-01-05,2024,1,记,3,1002,银行存款,收款,30,0\n'
+                        '2024-02-10,2024,2,记,4,1002,银行存款,收款,40,0\n'
+                        '2024-03-20,2024,3,记,5,1002,银行存款,收款,50,0\n', encoding='utf-8')
+        header, _, mapping = guess_header(path, 'CSV', 'entry')
+        self.store.import_sheet(ImportSpec(path, 'CSV', header, 'entry', mapping))
+        self.app.refresh_all()
+        self.root.update()
+        shown_dates = lambda: [self.app.detail_view.set(item, 'date') for item in self.app.detail_view.get_children()]
+        # 2023年1期 至 2024年2期：闭区间跨年，含起止两期。
+        self.app.period_from.set('2023年1期')
+        self.app.period_to.set('2024年2期')
+        self.app.refresh_details()
+        self.assertEqual(shown_dates(), ['2023-01-15', '2023-12-31', '2024-01-05', '2024-02-10'])
+        self.assertIn('2023年1期 至 2024年2期', self.app.detail_info.get())
+        # 起止填反时自动对调，结果一致。
+        self.app.period_from.set('2024年2期')
+        self.app.period_to.set('2023年1期')
+        self.app.refresh_details()
+        self.assertEqual(len(shown_dates()), 4)
+        # 只填起始期：该期及以后（含 setUp 中 2026年8期 的 4 行）。
+        self.app.period_from.set('2024年2期')
+        self.app.period_to.set('不限')
+        self.app.refresh_details()
+        self.assertEqual(shown_dates(), ['2024-02-10', '2024-03-20', '2026-08-01', '2026-08-02', '2026-08-03', '2026-08-04'])
+        # 重置筛选回到全部期间（setUp 4 行 + 本测试 5 行）。
+        self.app.clear_filter()
+        self.app.refresh_details()
+        self.assertEqual(len(shown_dates()), 9)
+        # 导出 CSV 与界面同一区间口径。
+        self.app.period_from.set('2023年1期')
+        self.app.period_to.set('2024年2期')
+        self.app.refresh_details()
+        target = self.base / 'range-export.csv'
+        with patch('ledger_viewer.ui.filedialog.asksaveasfilename', return_value=str(target)), patch('ledger_viewer.ui.messagebox.showinfo'):
+            self.app.export_csv()
+        with target.open(encoding='utf-8-sig') as handle:
+            exported = [row['日期'] for row in csv.DictReader(handle)]
+        self.assertEqual(exported, ['2023-01-15', '2023-12-31', '2024-01-05', '2024-02-10'])
 
     def test_cashflow_is_absent_from_mixed_import_and_silent_when_alone(self):
         path = self.base / '混合报表.xlsx'

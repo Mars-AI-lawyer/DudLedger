@@ -399,7 +399,7 @@ class LedgerStore:
           WHERE a.code LIKE ? OR a.name LIKE ? ORDER BY a.code,a.name
         """, (balance_source_id, pattern, pattern)).fetchall()
 
-    def entries(self, account: str | list[str] | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> list[sqlite3.Row]:
+    def entries(self, account: str | list[str] | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> list[sqlite3.Row]:
         where = []
         args: list[object] = []
         account_sql, account_args = self._account_clause(account, include_descendants)
@@ -409,6 +409,10 @@ class LedgerStore:
         if fiscal_year and period:
             where.append("e.fiscal_year=? AND e.period=?")
             args.extend((fiscal_year, period))
+        range_sql, range_args = self._period_range_clause(period_from, period_to)
+        if range_sql:
+            where.append(range_sql)
+            args.extend(range_args)
         if search:
             where.append("(a.code LIKE ? OR a.name LIKE ? OR e.summary LIKE ? OR e.voucher_no LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
             args.extend([f"%{search}%"] * 6)
@@ -417,6 +421,28 @@ class LedgerStore:
           SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path FROM entries e
           JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
         """ + clause + " ORDER BY " + self._entry_order(sort_by, descending) + " LIMIT ?", (*args, limit)).fetchall()
+
+    @staticmethod
+    def _period_int(value: str) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _period_range_clause(cls, period_from: tuple[str, str] | None, period_to: tuple[str, str] | None) -> tuple[str, list]:
+        """闭区间筛选（含起止期），可与 periods() 的 CAST 排序口径一致地跨年比较。"""
+        clauses: list[str] = []
+        args: list[object] = []
+        if period_from:
+            year, period = cls._period_int(period_from[0]), cls._period_int(period_from[1])
+            clauses.append("(CAST(e.fiscal_year AS INTEGER)>? OR (CAST(e.fiscal_year AS INTEGER)=? AND CAST(e.period AS INTEGER)>=?))")
+            args.extend((year, year, period))
+        if period_to:
+            year, period = cls._period_int(period_to[0]), cls._period_int(period_to[1])
+            clauses.append("(CAST(e.fiscal_year AS INTEGER)<? OR (CAST(e.fiscal_year AS INTEGER)=? AND CAST(e.period AS INTEGER)<=?))")
+            args.extend((year, year, period))
+        return " AND ".join(clauses), args
 
     @staticmethod
     def _entry_order(sort_by: str, descending: bool) -> str:
@@ -456,7 +482,7 @@ class LedgerStore:
           FROM entries e WHERE """ + (account_sql if account_sql else "1=1") + """ AND (? IS NULL OR e.fiscal_year=?) AND (? IS NULL OR e.period=?)
           GROUP BY label ORDER BY n DESC,label LIMIT 1000""", (*account_args, fiscal_year, fiscal_year, period, period)).fetchall()
 
-    def export_entries(self, path: Path, account: str | list[str] | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> int:
+    def export_entries(self, path: Path, account: str | list[str] | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> int:
         import csv
         from .related_parties import related_party_match
 
@@ -472,6 +498,10 @@ class LedgerStore:
         if fiscal_year and period:
             where.append("e.fiscal_year=? AND e.period=?")
             args.extend((fiscal_year, period))
+        range_sql, range_args = self._period_range_clause(period_from, period_to)
+        if range_sql:
+            where.append(range_sql)
+            args.extend(range_args)
         if search:
             where.append("(a.code LIKE ? OR a.name LIKE ? OR e.summary LIKE ? OR e.voucher_no LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
             args.extend([f"%{search}%"] * 6)
