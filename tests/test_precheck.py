@@ -142,7 +142,7 @@ class SectionTest(PrecheckTestBase):
         excluded_spec = self.entry_spec(path).with_extra_exclusions((3, 4))
         fixed = precheck(excluded_spec)
         self.assertEqual(fixed.stats.imported_rows, 1)
-        self.assertEqual(fixed.stats.excluded.get("人工排除"), 2)
+        self.assertEqual(fixed.stats.excluded.get("疑点排除"), 2)
         self.assertEqual(self.store.import_sheet(excluded_spec), 1)
 
 
@@ -514,31 +514,104 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
                         "2026-06-01,记,2,6602,管理费用,坏金额,错,0\n", encoding="utf-8")
         return path
 
-    def test_single_import_with_critical_issue_stays_inline_without_popup(self):
+    def _structural_csv(self) -> Path:
+        """表内含另一张结构不同的表：分节头及其下方行会成为疑点，程序兜底不敢自动排除。"""
+        path = self.base / "结构变化.csv"
+        alien = ["摘要", "日期", "凭证号", "科目名称", "科目编码", "贷方金额", "借方金额"]
+        path.write_text(",".join(ENTRY_HEADER) + "\n"
+                        "2026-06-01,记,1,1002,银行存款,收款,100,0\n"
+                        + ",".join(alien) + "\n"
+                        + "收款,2026-06-02,9,其他,9999,5,5\n", encoding="utf-8")
+        return path
+
+    def test_single_import_auto_excludes_critical_row_without_popup(self):
         from unittest.mock import patch
 
         from ledger_viewer.ui import ImportDialog
 
         dialog = ImportDialog(self.window, self._bad_csv())
         self.app.update()
-        with patch("ledger_viewer.ui.messagebox.showerror") as error:
+        with patch("ledger_viewer.ui.deepseek_get_api_key", return_value=""), \
+             patch("ledger_viewer.ui.messagebox.showerror") as error, \
+             patch("ledger_viewer.ui.messagebox.showinfo"):
             dialog.import_now()
-            error.assert_not_called()  # 关键疑点不再弹窗，改为窗口内行内提示
-        self.assertTrue(dialog.winfo_exists())
-        self.assertIn("未导入", dialog.import_note.cget("text"))
-        self.assertEqual(self.window.store.sources(), [])
-        # 修正原表后同一窗口重试即可导入。
-        path = self.base / "待确认.csv"
-        path.write_text(",".join(ENTRY_HEADER) + "\n"
-                        "2026-06-01,记,1,1002,银行存款,收款,100,0\n"
-                        "2026-06-01,记,1,6602,管理费用,付款,0,100\n", encoding="utf-8")
-        with patch("ledger_viewer.ui.messagebox.showinfo"):
-            dialog.import_now()
+            error.assert_not_called()  # 少量疑点行按程序规则自动排除，不弹窗
             self.app.update()
         self.assertFalse(dialog.winfo_exists())
-        self.assertEqual(self.window.store.sources()[0]["row_count"], 2)
+        # 坏行被自动排除，好行照常导入；理由留在预检记录里。
+        self.assertEqual(len(self.window.store.entries()), 1)
+        record = self.window.store.precheck_for_source(self.window.store.sources()[0]["id"])
+        self.assertEqual(json.loads(record["stats_json"])["excluded"].get("疑点排除"), 1)
+        issues = json.loads(record["issues_json"])
+        self.assertTrue(any("自动排除" in issue.get("reason", "") for issue in issues))
 
-    def test_batch_import_skips_blocked_sheet_and_imports_clean_one(self):
+    def test_single_import_holds_structural_change_inline(self):
+        from unittest.mock import patch
+
+        from ledger_viewer.ui import ImportDialog
+
+        dialog = ImportDialog(self.window, self._structural_csv())
+        self.app.update()
+        with patch("ledger_viewer.ui.deepseek_get_api_key", return_value=""), \
+             patch("ledger_viewer.ui.messagebox.showinfo"):
+            dialog.import_now()
+            self.app.update()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertIn("未导入", dialog.import_note.cget("text"))
+        self.assertIn("结构", dialog.import_note.cget("text"))
+        self.assertEqual(self.window.store.sources(), [])
+        dialog.destroy()
+
+    def test_single_import_ai_triage_excludes_junk_row(self):
+        import time
+        from unittest.mock import patch
+
+        from ledger_viewer.ui import ImportDialog
+
+        def fake_triage(spec, pending, excerpts, api_key, chat=None):
+            return {row: ("junk", "表尾批注") for row in pending}
+
+        dialog = ImportDialog(self.window, self._bad_csv())
+        self.app.update()
+        with patch("ledger_viewer.ui.deepseek_get_api_key", return_value="sk-fake"), \
+             patch("ledger_viewer.row_triage.triage_rows", side_effect=fake_triage) as triage, \
+             patch("ledger_viewer.ui.messagebox.showinfo"):
+            dialog.import_now()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and dialog.winfo_exists():
+                self.app.update()
+                time.sleep(0.01)
+        triage.assert_called_once()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(len(self.window.store.entries()), 1)
+        record = self.window.store.precheck_for_source(self.window.store.sources()[0]["id"])
+        issues = json.loads(record["issues_json"])
+        self.assertTrue(any("AI 判断为非账簿数据" in issue.get("reason", "") for issue in issues))
+
+    def test_single_import_ai_triage_holds_real_data_row(self):
+        import time
+        from unittest.mock import patch
+
+        from ledger_viewer.ui import ImportDialog
+
+        dialog = ImportDialog(self.window, self._bad_csv())
+        self.app.update()
+        with patch("ledger_viewer.ui.deepseek_get_api_key", return_value="sk-fake"), \
+             patch("ledger_viewer.row_triage.triage_rows", return_value={3: ("data", "疑似真实分录")}) as triage, \
+             patch("ledger_viewer.ui.messagebox.showinfo"):
+            dialog.import_now()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and dialog.winfo_exists() and "未导入" not in dialog.import_note.cget("text"):
+                self.app.update()
+                time.sleep(0.01)
+        triage.assert_called_once()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertIn("未导入", dialog.import_note.cget("text"))
+        self.assertIn("真实数据", dialog.import_note.cget("text"))
+        self.assertEqual(self.window.store.sources(), [])
+        dialog.destroy()
+
+    def test_batch_import_auto_excludes_and_holds_structural_sheet(self):
         from unittest.mock import patch
 
         from ledger_viewer.ui import BatchImportDialog
@@ -546,22 +619,26 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
         good = self.base / "正常.csv"
         good.write_text(",".join(ENTRY_HEADER) + "\n2026-06-01,记,1,1002,银行存款,收款,100,0\n", encoding="utf-8")
         bad = self._bad_csv().rename(self.base / "问题.csv")
-        dialog = BatchImportDialog(self.window, [good, bad])
+        structural = self._structural_csv().rename(self.base / "结构.csv")
+        dialog = BatchImportDialog(self.window, [good, bad, structural])
         shown: list[str] = []
 
         def record_info(title, message, **_kwargs):
             shown.append(message)
 
-        with patch("ledger_viewer.ui.messagebox.showinfo", side_effect=record_info):
+        with patch("ledger_viewer.ui.deepseek_get_api_key", return_value=""), \
+             patch("ledger_viewer.ui.messagebox.showinfo", side_effect=record_info):
             dialog.use_ai.set(False)
             dialog._import_selected()
             self.app.update()
-        # 干净的表照常导入；有疑点的表不导入、不弹预检窗，保留在列表中标注。
-        self.assertEqual(len(self.window.store.sources()), 1)
-        self.assertEqual(self.window.store.sources()[0]["filename"], "正常.csv")
-        self.assertTrue(any("疑点" in message for message in shown))
+        # 少量疑点行自动排除后导入；结构变化表保持不导入并在列表标注。
+        self.assertEqual(len(self.window.store.sources()), 2)
+        names = {source["filename"] for source in self.window.store.sources()}
+        self.assertEqual(names, {"正常.csv", "问题.csv"})
+        structural_index = next(index for index, (path, _sheet, _spec) in enumerate(dialog.items) if path.name == "结构.csv")
+        self.assertIn("未自动排除", dialog.view.set(str(structural_index), "state"))
         bad_index = next(index for index, (path, _sheet, _spec) in enumerate(dialog.items) if path.name == "问题.csv")
-        self.assertIn("疑点", dialog.view.set(str(bad_index), "state"))
+        self.assertIn("自动排除", dialog.view.set(str(bad_index), "state"))
         self.assertTrue(dialog.winfo_exists())
         dialog._close()
 

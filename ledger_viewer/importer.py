@@ -90,7 +90,7 @@ EXCLUSION_LABELS = {
     DISPOSITION_FOOTER: "页脚",
     DISPOSITION_DIMENSION: "维度子行",
     DISPOSITION_ZERO: "无金额行",
-    DISPOSITION_EXCLUDED: "人工排除",
+    DISPOSITION_EXCLUDED: "疑点排除",
     DISPOSITION_RANGE: "数据区域外",
 }
 
@@ -648,7 +648,7 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
             yield RowDecision(row_no, DISPOSITION_HEADER, "表头行")
             continue
         if row_no in excluded:
-            yield RowDecision(row_no, DISPOSITION_EXCLUDED, "已由人工排除")
+            yield RowDecision(row_no, DISPOSITION_EXCLUDED, "疑点行已排除（自动分诊或人工设置）")
             continue
         if row_no < start_row or (end_row and row_no > end_row):
             yield RowDecision(row_no, DISPOSITION_RANGE, "位于设定的数据区域之外")

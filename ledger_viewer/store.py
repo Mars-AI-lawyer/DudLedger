@@ -231,14 +231,18 @@ class LedgerStore:
         with self.db:
             self.db.execute("DELETE FROM related_parties WHERE id=?", (party_id,))
 
-    def import_sheet(self, spec: ImportSpec, replace: bool = False) -> int:
-        """按工作表事务写入；预检未通过（关键解析错误）时抛错回滚，保持旧数据不变。"""
+    def import_sheet(self, spec: ImportSpec, replace: bool = False, exclusion_reasons: dict[int, str] | None = None) -> int:
+        """按工作表事务写入；预检未通过（关键解析错误）时抛错回滚，保持旧数据不变。
+
+        exclusion_reasons：自动分诊排除的行号 → 理由，随预检记录留痕（导入后可查）。
+        """
         spec.validate()
         digest = file_hash(spec.path)
         headers = header_for_row(spec.path, spec.sheet, spec.header_row, spec.kind)
         formulas = formula_cells(spec.path, spec.sheet) if spec.path.suffix.lower() in (".xlsx", ".xlsm") else {}
         excluded: dict[str, int] = {}
         issues: list[dict] = []
+        exclusion_reasons = exclusion_reasons or {}
         debit_total = credit_total = 0
         with self.db:
             conflicts = self.db.execute("SELECT id FROM sources WHERE (sha256=? OR original_path=?) AND sheet=? AND kind=?", (digest, str(spec.path.resolve()), spec.sheet, spec.kind)).fetchall()
@@ -263,6 +267,9 @@ class LedgerStore:
                 if decision.disposition != DISPOSITION_IMPORT:
                     label = EXCLUSION_LABELS.get(decision.disposition, decision.disposition)
                     excluded[label] = excluded.get(label, 0) + 1
+                    if decision.row_no in exclusion_reasons:
+                        issues.append({"severity": "info", "row_no": decision.row_no,
+                                       "reason": f"自动排除：{exclusion_reasons[decision.row_no]}"})
                     continue
                 row_no, data = decision.row_no, decision.data
                 for warning in decision.warnings:

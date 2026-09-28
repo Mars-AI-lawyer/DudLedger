@@ -280,7 +280,9 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(jev_actions, text="Jev 审查规则与尽调筛选设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
         ttk.Label(body, text="AI 建议列：保存密钥后不再逐次弹窗确认，直接把所选工作表的有限预览发送给所选模型"
             "（每表最多前 20 行、每格最多 60 字，可能含名称和金额；不发送整份文件或本地路径）。"
-            "自动模式先交给 Jev，未通过时才升级至 DeepSeek；也可取消勾选改用手动核对。", foreground="#555", wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
+            "自动模式先交给 Jev，未通过时才升级至 DeepSeek；也可取消勾选改用手动核对。"
+            "DeepSeek 还用于导入分诊：无法解析的疑点行（最多 40 行的原文摘录）会请 AI 判断能否安全排除；"
+            "AI 判断为真实数据的行不会导入，会提示行号与理由。", foreground="#555", wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
         ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
         ttk.Button(body, text="保存并完成", command=self._finish).pack(anchor="e", pady=(12, 0))
 
@@ -796,6 +798,8 @@ class ImportDialog(tk.Toplevel):
         self.columns: list[str] = []
         self.vars: dict[str, tk.StringVar] = {}
         self._ai_queue: Queue = Queue()
+        self._triage_queue: Queue = Queue()
+        self._triage_running = False
         self._ai_sheet = ""
         self._layout()
         if spec is not None:
@@ -844,7 +848,8 @@ class ImportDialog(tk.Toplevel):
         self.import_note = ttk.Label(bottom, text="账簿空白/小计行会跳过；请确认借贷列不是余额列。", foreground="#995300", wraplength=460)
         self.import_note.pack(side="left")
         ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right", padx=4)
-        ttk.Button(bottom, text="保存列设置" if self.on_save else "确认并导入", command=self.import_now).pack(side="right", padx=4)
+        self.import_button = ttk.Button(bottom, text="保存列设置" if self.on_save else "确认并导入", command=self.import_now)
+        self.import_button.pack(side="right", padx=4)
         map_holder = ttk.Frame(self)
         map_holder.pack(fill="both", expand=True, padx=12, pady=4)
         self.map_canvas = tk.Canvas(map_holder, highlightthickness=0, background="#F7F5F1")
@@ -973,6 +978,8 @@ class ImportDialog(tk.Toplevel):
         return "balance_sheet" if self.kind.get() == "资产负债表" else "income_statement"
 
     def import_now(self) -> None:
+        if self._triage_running:
+            return
         try:
             mapping = {field: self.columns.index(var.get()) for field, var in self.vars.items() if var.get() != "不导入"}
             spec = ImportSpec(self.path, self.sheet.get(), int(self.header.get()), self.kind_code(), mapping)
@@ -989,17 +996,79 @@ class ImportDialog(tk.Toplevel):
         except Exception as exc:
             messagebox.showerror("预检失败", f"没有写入本次数据。\n{exc}", parent=self)
             return
-        # 预检不再弹窗：有关键疑点时留在本窗口内提示，调整列设置后重试；其余直接导入。
+        # 疑点行默认自动排除后导入：配置了 DeepSeek 时先让 AI 逐行判断，否则按程序规则兜底。
+        if result.pending_rows:
+            self._auto_resolve(spec, result)
+            return
         if result.blocked:
             criticals = [issue.reason for issue in result.issues if issue.severity == SEVERITY_CRITICAL][:3]
-            self.import_note.configure(text="未导入：" + "；".join(criticals or ["存在未解决的关键解析错误"])
-                + "。请调整列设置或修正原表后重试。")
+            self.import_note.configure(text="未导入：" + "；".join(criticals or ["没有识别到可导入的数据行"])
+                + "。请调整表头行或列设置后重试。")
             return
         self._import_prechecked([(spec, result)])
 
-    def _import_prechecked(self, work: list, paused_count: int = 0) -> None:
+    def _auto_resolve(self, spec, result) -> None:
+        from .row_triage import MAX_TRIAGE_ROWS, pending_reasons, row_excerpts, triage_rows
+
+        pending = pending_reasons(result)
+        key = deepseek_get_api_key()
+        if key and len(pending) <= MAX_TRIAGE_ROWS:
+            self._triage_running = True
+            self.import_button.configure(state="disabled")
+            self.import_note.configure(text=f"发现 {len(pending)} 行无法解析，正在让 AI 判断能否安全排除（只发送这些行的原文摘录）…")
+            excerpts = row_excerpts(spec, set(pending))
+
+            def work() -> None:
+                try:
+                    labels = triage_rows(spec, pending, excerpts, key)
+                except Exception:
+                    labels = None
+                self._triage_queue.put(labels)
+
+            Thread(target=work, daemon=True).start()
+            self.after(120, self._poll_triage, spec, result)
+            return
+        self._apply_resolution(spec, result, None)
+
+    def _poll_triage(self, spec, result) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            labels = self._triage_queue.get_nowait()
+        except Empty:
+            self.after(120, self._poll_triage, spec, result)
+            return
+        self._triage_running = False
+        if self.winfo_exists() and self.import_button.winfo_exists():
+            self.import_button.configure(state="normal")
+        self._apply_resolution(spec, result, labels)
+
+    def _apply_resolution(self, spec, result, labels) -> None:
+        from .row_triage import pending_reasons, resolve_pending
+
+        outcome = resolve_pending(spec, pending_reasons(result), result.stats.imported_rows, labels)
+        if not outcome.resolved:
+            shown = "；".join(f"第 {row} 行 {reason}" for row, reason in sorted(outcome.held.items())[:3])
+            more = "…" if len(outcome.held) > 3 else ""
+            self.import_note.configure(text=f"未导入：{len(outcome.held)} 行疑点被判断为真实数据或结构变化，不能自动排除。{shown}{more}"
+                + "请调整列设置或修正原表后重试。")
+            return
+        if outcome.excluded:
+            spec = spec.with_extra_exclusions(tuple(outcome.excluded))
+            try:
+                result = precheck(spec)
+            except Exception as exc:
+                messagebox.showerror("预检失败", f"没有写入本次数据。\n{exc}", parent=self)
+                return
+            if result.blocked:
+                self.import_note.configure(text="未导入：排除疑点行后仍没有可导入的数据行，请调整列设置后重试。")
+                return
+        self._import_prechecked([(spec, result)], auto_excluded=outcome.excluded)
+
+    def _import_prechecked(self, work: list, auto_excluded: dict | None = None) -> None:
         if not work:
             return
+        auto_excluded = auto_excluded or {}
         spec, result = work[0]
         try:
             if file_hash(spec.path) != result.fingerprint:
@@ -1007,12 +1076,12 @@ class ImportDialog(tk.Toplevel):
                     return
                 self.import_now()
                 return
-            count = self.parent.store.import_sheet(spec)
+            count = self.parent.store.import_sheet(spec, exclusion_reasons=auto_excluded)
         except sqlite3.IntegrityError:
             if not messagebox.askyesno("重新导入", "同一来源工作表已有导入记录。是否用当前列映射替换旧导入记录？原始 Excel 不会修改。", parent=self):
                 return
             try:
-                count = self.parent.store.import_sheet(spec, replace=True)
+                count = self.parent.store.import_sheet(spec, replace=True, exclusion_reasons=auto_excluded)
             except Exception as exc:
                 messagebox.showerror("替换失败", f"旧导入记录已保留。\n{exc}", parent=self)
                 return
@@ -1022,6 +1091,8 @@ class ImportDialog(tk.Toplevel):
         excluded_note = ""
         if result.stats.excluded_total:
             excluded_note = f"预检排除 {result.stats.excluded_total} 行（{result.stats.exclusion_line()}）。"
+        if auto_excluded:
+            excluded_note = f"已自动排除 {len(auto_excluded)} 行疑点行（理由见导入记录的预检详情）。" + excluded_note
         self.destroy()
         self.parent.refresh_all()
         differences = sum(item.level == "差异" for item in run_checks(self.parent.store))
@@ -1042,6 +1113,9 @@ class BatchImportDialog(tk.Toplevel):
         self.ai_queue = Queue()
         self.ai_cancel = Event()
         self.ai_running = False
+        self._triage_queue = Queue()
+        self._triage_work = None
+        self._triage_labels = None
         templates = parent.store.template_candidates() if parent.store else None
         for path in dict.fromkeys(paths):
             try:
@@ -1269,6 +1343,8 @@ class BatchImportDialog(tk.Toplevel):
             self.after(120, self._poll_ai_batch, total, done, problems, label)
 
     def _import_ready(self) -> None:
+        if self.ai_running:
+            return
         if any(self.items[index][2] is None for index in self.selected):
             messagebox.showinfo("请确认列设置", "选中的表包含未识别项，请双击手动调整列，或取消勾选。", parent=self)
             return
@@ -1283,20 +1359,105 @@ class BatchImportDialog(tk.Toplevel):
                 work.append((index, spec, precheck(spec)))
             except Exception:
                 work.append((index, spec, None))
-        # 预检不弹窗：有未解决疑点的表不导入（不偷偷跳过坏行），在列表中标注后可双击调整列。
-        blocked = [index for index, _spec, result in work if result is None or result.blocked]
-        for index in blocked:
-            self.view.set(str(index), "state", "有未解决疑点，未导入；双击调整列设置")
-        importable = [(spec, result) for _index, spec, result in work if result is not None and not result.blocked]
-        if not importable:
-            self.ai_status.set(f"{len(blocked)} 张表存在未解决疑点，均未导入；双击对应表调整列设置或修正原表后重试。")
-            return
-        self._import_prechecked(importable, paused_specs=[self.items[index][2] for index in blocked])
+        # 疑点行默认自动排除后导入；配置了 DeepSeek 时先让 AI 逐行判断，否则按程序规则兜底。
+        from .row_triage import MAX_TRIAGE_ROWS
 
-    def _import_prechecked(self, work: list, paused_specs: list | None = None) -> None:
+        pending = [(index, spec, result) for index, spec, result in work
+                   if result is not None and result.pending_rows]
+        key = deepseek_get_api_key() if pending else ""
+        if pending and key and all(len(item[2].pending_rows) <= MAX_TRIAGE_ROWS for item in pending):
+            self._triage_work = work
+            self._triage_labels = {}
+            self.ai_running = True
+            for button in (self.import_button, self.edit_button, self.agent_button, self.ai_toggle):
+                button.configure(state="disabled")
+            self.ai_status.set(f"{len(pending)} 张表有疑点行，正在让 AI 判断能否安全排除（只发送这些行的原文摘录）…")
+
+            def worker() -> None:
+                from .row_triage import pending_reasons, row_excerpts, triage_rows
+
+                for index, spec, result in pending:
+                    try:
+                        reasons = pending_reasons(result)
+                        labels = triage_rows(spec, reasons, row_excerpts(spec, set(reasons)), key)
+                    except Exception:
+                        labels = None
+                    self._triage_queue.put((index, labels))
+                self._triage_queue.put((None, None))
+
+            Thread(target=worker, daemon=True).start()
+            self.after(120, self._poll_triage_batch)
+            return
+        self._apply_batch_resolutions(work, {})
+
+    def _poll_triage_batch(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            index, labels = self._triage_queue.get_nowait()
+        except Empty:
+            self.after(120, self._poll_triage_batch)
+            return
+        if index is not None:
+            self._triage_labels[index] = labels
+            self.after(120, self._poll_triage_batch)
+            return
+        self.ai_running = False
+        for button in (self.import_button, self.edit_button, self.agent_button, self.ai_toggle):
+            button.configure(state="normal")
+        collected, self._triage_labels = self._triage_labels, None
+        work, self._triage_work = self._triage_work, None
+        self._apply_batch_resolutions(work, collected)
+
+    def _apply_batch_resolutions(self, work: list, labels_by_index: dict) -> None:
+        from .row_triage import pending_reasons, resolve_pending
+
+        importable: list[tuple[ImportSpec, object, dict]] = []
+        held_specs: list[ImportSpec] = []
+        for index, spec, result in work:
+            if result is None:
+                self.view.set(str(index), "state", "整表无法预检，未导入；双击调整列设置")
+                held_specs.append(spec)
+                continue
+            if not result.pending_rows:
+                if result.blocked:
+                    self.view.set(str(index), "state", "没有识别到可导入的数据行，未导入")
+                    held_specs.append(spec)
+                    continue
+                importable.append((spec, result, {}))
+                continue
+            outcome = resolve_pending(spec, pending_reasons(result), result.stats.imported_rows,
+                                      labels_by_index.get(index))
+            if not outcome.resolved:
+                self.view.set(str(index), "state", f"{len(outcome.held)} 行疑点为真实数据或结构变化，未自动排除；双击调整列设置")
+                held_specs.append(spec)
+                continue
+            spec2 = spec.with_extra_exclusions(tuple(outcome.excluded)) if outcome.excluded else spec
+            result2 = result
+            if outcome.excluded:
+                try:
+                    result2 = precheck(spec2)
+                except Exception:
+                    result2 = None
+                if result2 is None or result2.blocked:
+                    self.view.set(str(index), "state", "排除疑点行后仍无可导入行，未导入；双击调整列设置")
+                    held_specs.append(spec)
+                    continue
+                self.items[index] = (self.items[index][0], self.items[index][1], spec2)
+                self.view.set(str(index), "state", f"已自动排除 {len(outcome.excluded)} 行疑点，随本次导入")
+            importable.append((spec2, result2, outcome.excluded))
+        if not importable:
+            self.ai_status.set(f"{len(held_specs)} 张表无法自动排除疑点，均未导入；双击对应表调整列设置或修正原表后重试。")
+            return
+        self._import_prechecked([(spec, result) for spec, result, _reasons in importable],
+                                paused_specs=held_specs,
+                                auto_reasons={(spec.sheet, str(spec.path)): reasons for spec, _result, reasons in importable})
+
+    def _import_prechecked(self, work: list, paused_specs: list | None = None, auto_reasons: dict | None = None) -> None:
         if not work:
             return
         paused_specs = paused_specs or []
+        auto_reasons = auto_reasons or {}
         selected: list[ImportSpec] = []
         results: dict[tuple[str, str], object] = {}
         for spec, result in work:
@@ -1325,11 +1486,15 @@ class BatchImportDialog(tk.Toplevel):
             if index in unreadable or (index in duplicate and not replace):
                 continue
             try:
-                count = self.parent.store.import_sheet(spec, replace=index in duplicate)
+                count = self.parent.store.import_sheet(spec, replace=index in duplicate,
+                    exclusion_reasons=auto_reasons.get((spec.sheet, str(spec.path))))
                 note = ""
                 result = results.get((spec.sheet, str(spec.path)))
+                reasons = auto_reasons.get((spec.sheet, str(spec.path)))
+                if reasons:
+                    note = f"（自动排除疑点 {len(reasons)} 行）"
                 if result is not None and result.stats.excluded_total:
-                    note = f"（另排除 {result.stats.excluded_total} 行）"
+                    note += f"（另排除 {result.stats.excluded_total} 行）"
                 imported.append(f'{spec.path.name}/{spec.sheet}：{count} 行{note}')
             except Exception as exc:
                 failures.append(f'{spec.path.name}/{spec.sheet}：{exc}')
@@ -1337,7 +1502,7 @@ class BatchImportDialog(tk.Toplevel):
         differences = sum(item.level == "差异" for item in run_checks(self.parent.store))
         summary = f"成功导入 {len(imported)} 个工作表；当前发现 {differences} 项差异。"
         if paused_specs:
-            summary += f"\n{len(paused_specs)} 张表因未解决的疑点未导入（保留在导入列表中，可双击调整列设置）。"
+            summary += f"\n{len(paused_specs)} 张表的疑点行经判断为真实数据或结构变化，未导入（保留在导入列表中，可双击调整列设置）。"
         if duplicate and not replace:
             summary += f"\n跳过 {len(duplicate)} 个已有来源。"
         if failures:
