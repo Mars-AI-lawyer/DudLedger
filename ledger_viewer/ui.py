@@ -16,17 +16,19 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from .agent_import import handoff_text
-from .import_cascade import suggest_cascade, redact_error
+from .import_cascade import redact_error
+from .import_preview import preview_headers, PRIVACY_NOTICE
 from .checks import run_checks
 from .deepseek_mapping import delete_api_key as deepseek_delete_api_key, get_api_key as deepseek_get_api_key, key_memory_only as deepseek_memory_only, save_api_key as deepseek_save_api_key, suggest_mapping as deepseek_suggest_mapping
 from .grid_lines import DashedGrid
 from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_sheet, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
-from .jev_mapping import delete_api_key, get_api_key, key_memory_only, preview_sheet, save_api_key, suggest_mapping
+from .jev_mapping import delete_api_key, get_api_key, key_memory_only, save_api_key
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, PrecheckStats, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
 from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, related_party_match
 from .store import LedgerStore
 from .theme import configure_theme
+from .table_tools import TableTools
 from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_mark, save_mark, save_mark_by_key, source_account, update_mark_note, voucher_key
 
 
@@ -45,29 +47,27 @@ FIELD_LABELS = {
 
 REPORT_LABELS = {"balance_sheet": "资产负债表", "income_statement": "利润表"}
 
-PROVIDER_LABELS = {"cascade": "自动逐层识别", "jev": "Jev", "deepseek": "DeepSeek"}
+PROVIDER_LABELS = {"deepseek": "DeepSeek Flash"}
 
 
 def ai_tools(controller) -> tuple[str, object, object]:
-    """Return (label, suggest, get_key) for the configured column-suggestion provider."""
-    if getattr(controller, "ai_provider", "cascade") == "cascade":
-        def keys():
-            return {name: key for name, key in (("jev", get_api_key()), ("deepseek", deepseek_get_api_key())) if key}
-        return "Jev → DeepSeek（低思考）", None, keys
-    if getattr(controller, "ai_provider", "jev") == "deepseek":
-        return "DeepSeek", deepseek_suggest_mapping, deepseek_get_api_key
-    return "Jev", suggest_mapping, get_api_key
+    """Import recognition always uses DeepSeek Flash, including old preferences."""
+    return "DeepSeek Flash", deepseek_suggest_mapping, deepseek_get_api_key
 
 
-def suggest_for_import(path, sheet, suggest, api_key, cancelled=lambda: False):
+def suggest_for_import(path, sheet, suggest, api_key, cancelled=lambda: False, *, header_row=None, kind=None):
     fingerprint = file_hash(path)
-    preview = preview_sheet(path, sheet)
+    preview = preview_headers(path, sheet, header_row, kind)
     if file_hash(path) != fingerprint:
         raise ValueError("读取预览期间原文件发生变化，请重试")
-    if suggest is None:
-        return suggest_cascade(path, sheet, preview, api_key, suggest_mapping,
-                               deepseek_suggest_mapping, cancelled)
-    return suggest(preview, api_key)
+    if cancelled():
+        raise ValueError("已取消分析")
+    result = deepseek_suggest_mapping(preview, api_key)
+    if cancelled():
+        raise ValueError("已取消分析")
+    if file_hash(path) != fingerprint:
+        raise ValueError("分析期间原文件发生变化，请重试")
+    return result
 
 
 def copy_agent_task(dialog, items):
@@ -122,9 +122,13 @@ def tree(parent: tk.Widget, columns: list[tuple[str, str, int]]) -> ttk.Treeview
     def on_y_scroll(first: str, last: str) -> None:
         ybar.set(first, last)
         view.dashed_grid.schedule_scroll()
+        if hasattr(view, "cell_tools"):
+            view.cell_tools.schedule()
     def on_x_scroll(first: str, last: str) -> None:
         xbar.set(first, last)
         view.dashed_grid.schedule_scroll()
+        if hasattr(view, "cell_tools"):
+            view.cell_tools.schedule()
     view.configure(yscrollcommand=on_y_scroll, xscrollcommand=on_x_scroll)
     view.grid(row=0, column=0, sticky="nsew")
     ybar.grid(row=0, column=1, sticky="ns")
@@ -235,15 +239,9 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(body, text="显示表格虚线（关闭后大表滚动更轻快）", variable=self.grid_lines,
                         command=lambda: parent.controller.set_grid_lines(self.grid_lines.get())).pack(anchor="w", pady=(7, 0))
         ttk.Separator(body).pack(fill="x", pady=12)
-        ttk.Label(body, text="导入识别方式（第三层可复制任务给自己的 Agent）").pack(anchor="w")
-        self.provider = tk.StringVar(value=PROVIDER_LABELS.get(parent.controller.ai_provider, "Jev"))
-        ttk.Radiobutton(body, text="自动逐层识别：Jev → DeepSeek 低思考 → 我的 Agent（推荐）", variable=self.provider,
-                        value=PROVIDER_LABELS["cascade"], command=self._save_provider).pack(anchor="w")
-        provider_row = ttk.Frame(body)
-        provider_row.pack(fill="x", pady=(5, 0))
-        ttk.Radiobutton(provider_row, text="仅 Jev（TypeSafe）", variable=self.provider, value="Jev", command=self._save_provider).pack(side="left")
-        ttk.Radiobutton(provider_row, text="仅 DeepSeek（低思考）", variable=self.provider, value="DeepSeek", command=self._save_provider).pack(side="left", padx=12)
-        ttk.Label(body, text="Jev API Key").pack(anchor="w", pady=(7, 0))
+        ttk.Label(body, text="导入识别：仅 DeepSeek Flash（低思考）").pack(anchor="w")
+        self.provider = tk.StringVar(value=PROVIDER_LABELS["deepseek"])
+        ttk.Label(body, text="Jev API Key（仅用于凭证尽调筛查）").pack(anchor="w", pady=(7, 0))
         key_row = ttk.Frame(body)
         key_row.pack(fill="x", pady=(5, 0))
         try:
@@ -278,11 +276,9 @@ class SettingsDialog(tk.Toplevel):
         from .jev_ui import launch_connection_test
         ttk.Button(jev_actions, text="测试连接（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
         ttk.Button(jev_actions, text="Jev 审查规则与尽调筛选设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
-        ttk.Label(body, text="AI 建议列：保存密钥后不再逐次弹窗确认，直接把所选工作表的有限预览发送给所选模型"
-            "（每表最多前 20 行、每格最多 60 字，可能含名称和金额；不发送整份文件或本地路径）。"
-            "自动模式先交给 Jev，未通过时才升级至 DeepSeek；也可取消勾选改用手动核对。"
-            "DeepSeek 还用于导入分诊：无法解析的疑点行（最多 40 行的原文摘录）会请 AI 判断能否安全排除；"
-            "AI 判断为真实数据的行不会导入，会提示行号与理由。", foreground="#555", wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
+        ttk.Label(body, text="AI 建议列使用 DeepSeek Flash。" + PRIVACY_NOTICE
+            + "保存密钥后可直接建议列；也可取消 AI 改用手动核对。完整账簿的解析、预检和疑点处理均在本机完成。",
+            foreground="#555", wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
         ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
         ttk.Button(body, text="保存并完成", command=self._finish).pack(anchor="e", pady=(12, 0))
 
@@ -291,8 +287,7 @@ class SettingsDialog(tk.Toplevel):
             self.parent.store.save_setting("voucher_open_mode", self.mode.get())
 
     def _save_provider(self) -> None:
-        provider = next((code for code, label in PROVIDER_LABELS.items() if label == self.provider.get()), "jev")
-        self.parent.controller.set_ai_provider(provider)
+        self.parent.controller.set_ai_provider("deepseek")
 
     def _refresh_key_status(self) -> None:
         try:
@@ -798,8 +793,6 @@ class ImportDialog(tk.Toplevel):
         self.columns: list[str] = []
         self.vars: dict[str, tk.StringVar] = {}
         self._ai_queue: Queue = Queue()
-        self._triage_queue: Queue = Queue()
-        self._triage_running = False
         self._ai_sheet = ""
         self._layout()
         if spec is not None:
@@ -880,18 +873,21 @@ class ImportDialog(tk.Toplevel):
                 if not api_key:
                     return
             sheet = self.sheet.get()
-            preview_sheet(self.path, sheet)
+            header_row = int(self.header.get())
+            kind = next(code for code, name in BatchImportDialog.LABELS.items() if name == self.kind.get())
+            preview_headers(self.path, sheet, header_row, kind)
         except Exception as exc:
             messagebox.showerror("无法取得建议", str(exc), parent=self)
             return
         # 密钥已在偏好设置中保存即视为已确认发送范围，不再逐次弹窗；发送范围说明见偏好设置。
-        self.import_note.configure(text=f"正在把“{sheet}”的有限预览（最多前 20 行、每格 60 字）发送给 {label} 建议列；发送范围说明见偏好设置。")
+        self.import_note.configure(text=f"{label} 正在分析 1 行表头；业务数据和疑点行保留在本机。")
         self._ai_sheet = sheet
         self.ai_button.configure(state="disabled", text=f"{label} 正在分析…")
 
         def worker() -> None:
             try:
-                self._ai_queue.put((True, suggest_for_import(self.path, sheet, suggest, api_key)))
+                self._ai_queue.put((True, suggest_for_import(self.path, sheet, suggest, api_key,
+                                                            header_row=header_row, kind=kind)))
             except Exception as exc:
                 self._ai_queue.put((False, redact_error(exc, api_key)))
 
@@ -978,8 +974,6 @@ class ImportDialog(tk.Toplevel):
         return "balance_sheet" if self.kind.get() == "资产负债表" else "income_statement"
 
     def import_now(self) -> None:
-        if self._triage_running:
-            return
         try:
             mapping = {field: self.columns.index(var.get()) for field, var in self.vars.items() if var.get() != "不导入"}
             spec = ImportSpec(self.path, self.sheet.get(), int(self.header.get()), self.kind_code(), mapping)
@@ -996,7 +990,7 @@ class ImportDialog(tk.Toplevel):
         except Exception as exc:
             messagebox.showerror("预检失败", f"没有写入本次数据。\n{exc}", parent=self)
             return
-        # 疑点行默认自动排除后导入：配置了 DeepSeek 时先让 AI 逐行判断，否则按程序规则兜底。
+        # 疑点行仅由本地规则处理；无法安全处理时交回人工。
         if result.pending_rows:
             self._auto_resolve(spec, result)
             return
@@ -1008,40 +1002,8 @@ class ImportDialog(tk.Toplevel):
         self._import_prechecked([(spec, result)])
 
     def _auto_resolve(self, spec, result) -> None:
-        from .row_triage import MAX_TRIAGE_ROWS, pending_reasons, row_excerpts, triage_rows
-
-        pending = pending_reasons(result)
-        key = deepseek_get_api_key()
-        if key and len(pending) <= MAX_TRIAGE_ROWS:
-            self._triage_running = True
-            self.import_button.configure(state="disabled")
-            self.import_note.configure(text=f"发现 {len(pending)} 行无法解析，正在让 AI 判断能否安全排除（只发送这些行的原文摘录）…")
-            excerpts = row_excerpts(spec, set(pending))
-
-            def work() -> None:
-                try:
-                    labels = triage_rows(spec, pending, excerpts, key)
-                except Exception:
-                    labels = None
-                self._triage_queue.put(labels)
-
-            Thread(target=work, daemon=True).start()
-            self.after(120, self._poll_triage, spec, result)
-            return
+        # Import never sends questionable business rows to a cloud service.
         self._apply_resolution(spec, result, None)
-
-    def _poll_triage(self, spec, result) -> None:
-        if not self.winfo_exists():
-            return
-        try:
-            labels = self._triage_queue.get_nowait()
-        except Empty:
-            self.after(120, self._poll_triage, spec, result)
-            return
-        self._triage_running = False
-        if self.winfo_exists() and self.import_button.winfo_exists():
-            self.import_button.configure(state="normal")
-        self._apply_resolution(spec, result, labels)
 
     def _apply_resolution(self, spec, result, labels) -> None:
         from .row_triage import pending_reasons, resolve_pending
@@ -1113,9 +1075,6 @@ class BatchImportDialog(tk.Toplevel):
         self.ai_queue = Queue()
         self.ai_cancel = Event()
         self.ai_running = False
-        self._triage_queue = Queue()
-        self._triage_work = None
-        self._triage_labels = None
         templates = parent.store.template_candidates() if parent.store else None
         for path in dict.fromkeys(paths):
             try:
@@ -1145,7 +1104,7 @@ class BatchImportDialog(tk.Toplevel):
         self.ai_toggle = ttk.Checkbutton(body, text="使用 AI 为所有勾选的工作表建议列（默认）", variable=self.use_ai,
                                           command=self._toggle_ai)
         self.ai_toggle.pack(anchor="w", pady=(9, 0))
-        self.ai_hint = ttk.Label(body, text="导入时一次确认发送范围；AI 只读取每张表的有限预览。", foreground="#555")
+        self.ai_hint = ttk.Label(body, text="DeepSeek Flash 仅分析 1 行表头；业务数据和疑点行保留在本机。", foreground="#555")
         self.ai_hint.pack(anchor="w", pady=(2, 5))
         self.ai_progress = ttk.Progressbar(body, mode="determinate")
         self.ai_status = tk.StringVar(value="")
@@ -1182,7 +1141,7 @@ class BatchImportDialog(tk.Toplevel):
 
     def _toggle_ai(self):
         if self.use_ai.get():
-            self.ai_hint.configure(text="导入时一次确认发送范围；AI 只读取每张表的有限预览。", foreground="#555")
+            self.ai_hint.configure(text="DeepSeek Flash 仅分析 1 行表头；业务数据和疑点行保留在本机。", foreground="#555")
         else:
             self.ai_hint.configure(text="未使用 AI，自动识别可能有误；可双击工作表手动调整列。", foreground="#995300")
             messagebox.showinfo("请核对列设置", "未使用 AI 时，自动识别可能有误。导入前可双击工作表，手动调整表头、借贷方向和金额列。", parent=self)
@@ -1264,7 +1223,7 @@ class BatchImportDialog(tk.Toplevel):
                         self.ai_status.set(f"尚未设置 {label} 密钥；可取消勾选 AI 后手动核对列。")
                         return
                 # 密钥已在偏好设置中保存即视为已确认发送范围，不再逐次弹窗；说明见偏好设置。
-                self.ai_hint.configure(text=f"正在把 {len(pending)} 张表的有限预览发送给 {label} 建议列（每表最多前 20 行、每格 60 字）；发送范围说明见偏好设置。")
+                self.ai_hint.configure(text=f"{label} 正在分析 {len(pending)} 张表的表头（每表仅 1 行）；业务数据不发送。")
                 self._start_ai(pending, api_key, suggest, label)
                 return
         self._import_ready()
@@ -1284,9 +1243,10 @@ class BatchImportDialog(tk.Toplevel):
             for index in pending:
                 if self.ai_cancel.is_set():
                     return
-                path, sheet, _ = self.items[index]
+                path, sheet, current = self.items[index]
                 try:
-                    result = suggest_for_import(path, sheet, suggest, api_key, self.ai_cancel.is_set)
+                    result = suggest_for_import(path, sheet, suggest, api_key, self.ai_cancel.is_set,
+                        header_row=current.header_row if current else None, kind=current.kind if current else None)
                     if result.kind not in self.LABELS:
                         raise ValueError("未识别表类型")
                     spec = ImportSpec(path, sheet, result.header_row, result.kind, result.mapping)
@@ -1302,7 +1262,7 @@ class BatchImportDialog(tk.Toplevel):
         Thread(target=worker, daemon=True).start()
         self.after(120, self._poll_ai_batch, len(pending), 0, [], label)
 
-    def _poll_ai_batch(self, total, done, problems, label="Jev"):
+    def _poll_ai_batch(self, total, done, problems, label="DeepSeek Flash"):
         if not self.winfo_exists():
             return
         try:
@@ -1359,55 +1319,8 @@ class BatchImportDialog(tk.Toplevel):
                 work.append((index, spec, precheck(spec)))
             except Exception:
                 work.append((index, spec, None))
-        # 疑点行默认自动排除后导入；配置了 DeepSeek 时先让 AI 逐行判断，否则按程序规则兜底。
-        from .row_triage import MAX_TRIAGE_ROWS
-
-        pending = [(index, spec, result) for index, spec, result in work
-                   if result is not None and result.pending_rows]
-        key = deepseek_get_api_key() if pending else ""
-        if pending and key and all(len(item[2].pending_rows) <= MAX_TRIAGE_ROWS for item in pending):
-            self._triage_work = work
-            self._triage_labels = {}
-            self.ai_running = True
-            for button in (self.import_button, self.edit_button, self.agent_button, self.ai_toggle):
-                button.configure(state="disabled")
-            self.ai_status.set(f"{len(pending)} 张表有疑点行，正在让 AI 判断能否安全排除（只发送这些行的原文摘录）…")
-
-            def worker() -> None:
-                from .row_triage import pending_reasons, row_excerpts, triage_rows
-
-                for index, spec, result in pending:
-                    try:
-                        reasons = pending_reasons(result)
-                        labels = triage_rows(spec, reasons, row_excerpts(spec, set(reasons)), key)
-                    except Exception:
-                        labels = None
-                    self._triage_queue.put((index, labels))
-                self._triage_queue.put((None, None))
-
-            Thread(target=worker, daemon=True).start()
-            self.after(120, self._poll_triage_batch)
-            return
+        # Keep every questionable row local, even when a DeepSeek key exists.
         self._apply_batch_resolutions(work, {})
-
-    def _poll_triage_batch(self) -> None:
-        if not self.winfo_exists():
-            return
-        try:
-            index, labels = self._triage_queue.get_nowait()
-        except Empty:
-            self.after(120, self._poll_triage_batch)
-            return
-        if index is not None:
-            self._triage_labels[index] = labels
-            self.after(120, self._poll_triage_batch)
-            return
-        self.ai_running = False
-        for button in (self.import_button, self.edit_button, self.agent_button, self.ai_toggle):
-            button.configure(state="normal")
-        collected, self._triage_labels = self._triage_labels, None
-        work, self._triage_work = self._triage_work, None
-        self._apply_batch_resolutions(work, collected)
 
     def _apply_batch_resolutions(self, work: list, labels_by_index: dict) -> None:
         from .row_triage import pending_reasons, resolve_pending
@@ -1586,6 +1499,7 @@ class App(tk.Toplevel):
         self.period_options: dict[str, tuple[str, str]] = {}
         self.balance_source = tk.StringVar(value="无余额表")
         self.balance_options: dict[str, int] = {}
+        self.balance_calc_sources: dict[str, str] = {}
         self.report_source = {kind: tk.StringVar(value="无报表") for kind in REPORT_KINDS}
         self.report_options: dict[str, dict[str, int]] = {kind: {} for kind in REPORT_KINDS}
         self.search = tk.StringVar()
@@ -1679,7 +1593,8 @@ class App(tk.Toplevel):
         ttk.Button(summary_search_row, text="清除", command=self.clear_summary_filter).pack(side="left", padx=5)
         balance_top = ttk.Frame(frames[0], padding=5)
         balance_top.pack(fill="x")
-        ttk.Label(balance_top, text="双击科目查看明细；点击“展开／收起”打开子科目。", style="Hint.TLabel").pack(side="left")
+        ttk.Label(balance_top, text="双击科目查看明细；点击“展开／收起”打开子科目。", style="Hint.TLabel",
+                  wraplength=250, justify="left").pack(side="left")
         ttk.Button(balance_top, text="全部展开", command=lambda: self.set_expansion(True)).pack(side="left", padx=(12, 4))
         ttk.Button(balance_top, text="全部收起", command=lambda: self.set_expansion(False)).pack(side="left")
         summary_more = ttk.Menubutton(balance_top, text="更多 ▾")
@@ -1699,6 +1614,9 @@ class App(tk.Toplevel):
         self.summary_view.bind("<<TreeviewOpen>>", self._after_expansion_change)
         self.summary_view.bind("<<TreeviewClose>>", self._after_expansion_change)
         self.summary_view.bind("<Double-1>", self.open_account)
+        self.balance_tools = TableTools(self.summary_view, {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc"},
+            source_for_row=lambda row: self.balance_calc_sources.get(row, row))
+        ttk.Button(balance_top, text="计算器", command=self.balance_tools.toggle).pack(side="right", padx=4)
         detail_top = ttk.Frame(frames[1], padding=5)
         detail_top.pack(fill="x")
         ttk.Label(detail_top, textvariable=self.account_label, wraplength=330, justify="left").pack(side="left")
@@ -1729,6 +1647,8 @@ class App(tk.Toplevel):
         ttk.Button(self.detail_controls, text="重置筛选", command=self.clear_filter).pack(side="left", padx=(6, 0))
         ttk.Label(frames[1], textvariable=self.detail_info, style="Hint.TLabel", padding=(6, 2)).pack(fill="x")
         self.detail_view = tree(frames[1], VIEW_COLUMNS["detail"])
+        self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"})
+        ttk.Button(detail_top, text="计算器", command=self.detail_tools.toggle).pack(side="right", padx=4)
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
         for key in ("date", "voucher", "code", "name", "summary", "debit", "credit"):
@@ -1891,6 +1811,8 @@ class App(tk.Toplevel):
         for view in self.column_views[kind]:
             view.configure(displaycolumns=selected)
             view.dashed_grid.schedule()
+            if hasattr(view, "cell_tools"):
+                view.cell_tools.schedule()
 
     def _open_columns(self, parent: tk.Widget, kind: str) -> None:
         if not self.store:
@@ -1958,6 +1880,8 @@ class App(tk.Toplevel):
         self.controller.book_windows.pop(self.store.path.resolve(), None)
         self.store.close()
         self.store = None
+        self.detail_tools.clear()
+        self.balance_tools.clear()
         self.account = None
         self.include_descendants = False
         self.account_label.set("全部科目")
@@ -2279,6 +2203,8 @@ class App(tk.Toplevel):
         self.refresh_details()
 
     def refresh_all(self) -> None:
+        self.balance_tools.reset_selection()
+        self.balance_calc_sources.clear()
         for view in (self.summary_view, self.detail_view, self.check_view, self.source_view, self.mark_view):
             view.delete(*view.get_children())
         for view in self.report_views.values():
@@ -2315,6 +2241,8 @@ class App(tk.Toplevel):
         expanded = set(json.loads(self.store.setting("expanded_accounts", "[]"))) if expansion_mode == "custom" else set()
         for row in summary_rows:
             # When no supplied balance table exists, show computed period movement only.
+            origin = self.balance_source.get() if row["balance_count"] else "已导入明细汇总"
+            self.balance_calc_sources[row["key"]] = f'{origin} · 科目 {row["code"]} {row["name"]}'
             pd = row["reported_debit"] if row["balance_count"] else row["detail_debit"]
             pc = row["reported_credit"] if row["balance_count"] else row["detail_credit"]
             side_tag = "debit_row" if row["closing_debit"] and not row["closing_credit"] else "credit_row" if row["closing_credit"] and not row["closing_debit"] else ""
@@ -2446,6 +2374,7 @@ class App(tk.Toplevel):
         self.tabs.select(1)
 
     def refresh_details(self) -> None:
+        self.detail_tools.reset_selection()
         self.detail_view.delete(*self.detail_view.get_children())
         if not self.store:
             return
@@ -2463,7 +2392,7 @@ class App(tk.Toplevel):
             arrow = (" ↓" if self.detail_descending else " ↑") if key == self.detail_sort else ""
             self.detail_view.heading(key, text=title + arrow)
         count_label = "已显示前 3000 条，请缩小范围；导出包含全部匹配项" if len(rows_found) == 3000 else f"{len(rows_found)} 条明细"
-        self.detail_info.set(f"{count_label} · {self._period_label()} · 点击日期、科目、凭证或借贷表头排序；双击一行看凭证")
+        self.detail_info.set(f"{count_label} · {self._period_label()} · 拖动框选合计、计数；Ctrl+C 复制；双击看凭证")
 
     def open_account(self, _event: object) -> None:
         if _event is not None and self.summary_view.identify_column(_event.x) == '#0':
@@ -2517,6 +2446,7 @@ class App(tk.Toplevel):
                 visit(item)
         visit()
         self.summary_view.dashed_grid.schedule()
+        self.balance_tools.schedule()
 
     def set_expansion(self, expanded: bool) -> None:
         if not self.store:
@@ -2569,12 +2499,14 @@ class App(tk.Toplevel):
         display_menu.add_command(label="还原默认格式", command=self.reset_voucher_format)
         more.configure(menu=display_menu)
         view = tree(dialog, VIEW_COLUMNS["voucher"])
+        dialog.cell_tools = TableTools(view, {"debit", "credit", "original"})
+        ttk.Button(voucher_top, text="计算器", command=dialog.cell_tools.toggle).pack(side="right", padx=4)
         view.configure(height=min(8, max(2, len(lines))))
         self._register_column_view("voucher", view)
         for key, width in self.store.voucher_widths().items():
             if key in view["columns"]:
                 view.column(key, width=width)
-        view.bind("<ButtonRelease-1>", lambda _e, widget=view: self._save_voucher_widths(widget))
+        view.bind("<ButtonRelease-1>", lambda _e, widget=view: self._save_voucher_widths(widget), add="+")
         for line in lines:
             side_tag = "debit_row" if line["debit_cents"] and not line["credit_cents"] else "credit_row" if line["credit_cents"] and not line["debit_cents"] else ""
             view.insert("", "end", values=(line["code"], line["name"], line["summary"], line["auxiliary"], line["currency"], line["original_amount"], amount(line["debit_cents"]), amount(line["credit_cents"]), f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'), tags=("marked",) if existing_mark else ((side_tag,) if side_tag else ()))
@@ -2691,9 +2623,8 @@ class Application(tk.Tk):
         if self.scroll_mode not in ("system", "gentle", "quick"):
             self.scroll_mode = "system"
         self.show_grid = self.preferences.get("show_grid", True) is not False
-        self.ai_provider = self.preferences.get("import_strategy", "cascade")
-        if self.ai_provider not in PROVIDER_LABELS:
-            self.ai_provider = "cascade"
+        self.ai_provider = "deepseek"
+        self.preferences.update(import_strategy="deepseek", ai_provider="deepseek")
         self.font_size = default_size
         self.set_font_size(saved_size, persist=False)
         self.withdraw()

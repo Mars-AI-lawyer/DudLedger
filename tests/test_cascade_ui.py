@@ -9,7 +9,7 @@ from ledger_viewer.jev_mapping import MappingSuggestion
 from ledger_viewer.ui import Application, BatchImportDialog, copy_agent_task
 
 
-class CascadeUiTest(unittest.TestCase):
+class DeepSeekImportUiTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name)
@@ -22,7 +22,7 @@ class CascadeUiTest(unittest.TestCase):
         except tk.TclError as exc:
             self.temp.cleanup()
             self.skipTest(str(exc))
-        self.assertEqual(self.app.ai_provider, "cascade")
+        self.assertEqual(self.app.ai_provider, "deepseek")
         self.window = next(iter(self.app.windows))
         self.window._use_book(self.base / "existing.sqlite")
         self.dialog = BatchImportDialog(self.window, [self.source])
@@ -39,17 +39,17 @@ class CascadeUiTest(unittest.TestCase):
             self.app.update()
             time.sleep(0.01)
 
-    def test_escalation_imports_without_per_import_popup(self):
+    def test_import_never_calls_jev_even_with_a_jev_key(self):
         with patch("ledger_viewer.ui.get_api_key", return_value="first"), \
              patch("ledger_viewer.ui.deepseek_get_api_key", return_value="second"), \
-             patch("ledger_viewer.ui.suggest_mapping", side_effect=ValueError("无法识别")) as first, \
+             patch("ledger_viewer.jev_mapping.suggest_mapping", side_effect=ValueError("无法识别")) as first, \
              patch("ledger_viewer.ui.deepseek_suggest_mapping", return_value=self.good) as second, \
              patch("ledger_viewer.ui.messagebox.askokcancel", return_value=True) as consent, \
              patch("ledger_viewer.ui.messagebox.showinfo"):
             self.dialog._import_selected()
             self.wait_done()
         consent.assert_not_called()  # 密钥已设置即视为确认发送范围，不再弹窗
-        first.assert_called_once()
+        first.assert_not_called()
         second.assert_called_once()
         self.assertEqual(len(self.window.store.sources()), 1)
 
@@ -69,7 +69,7 @@ class CascadeUiTest(unittest.TestCase):
 
         with patch("ledger_viewer.ui.get_api_key", return_value=""), \
              patch("ledger_viewer.ui.deepseek_get_api_key", return_value=""), \
-             patch("ledger_viewer.ui.suggest_mapping") as first, \
+             patch("ledger_viewer.jev_mapping.suggest_mapping") as first, \
              patch("ledger_viewer.ui.deepseek_suggest_mapping") as second, \
              patch("ledger_viewer.ui.SettingsDialog", FakeSettings), \
              patch.object(BatchImportDialog, "wait_window", lambda self, window: None):
@@ -80,10 +80,10 @@ class CascadeUiTest(unittest.TestCase):
         second.assert_not_called()
         self.assertEqual(self.window.store.sources(), [])
 
-    def test_two_failures_leave_book_empty_and_enable_handoff(self):
+    def test_deepseek_failure_leaves_book_empty_and_enables_handoff(self):
         with patch("ledger_viewer.ui.get_api_key", return_value="first"), \
              patch("ledger_viewer.ui.deepseek_get_api_key", return_value="second"), \
-             patch("ledger_viewer.ui.suggest_mapping", side_effect=ValueError("无法识别")), \
+             patch("ledger_viewer.jev_mapping.suggest_mapping", side_effect=ValueError("无法识别")), \
              patch("ledger_viewer.ui.deepseek_suggest_mapping", side_effect=ValueError("仍无法识别")), \
              patch("ledger_viewer.ui.messagebox.askokcancel", return_value=True), \
              patch("ledger_viewer.ui.messagebox.showwarning") as warning:

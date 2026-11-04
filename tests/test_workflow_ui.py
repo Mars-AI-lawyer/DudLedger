@@ -70,7 +70,7 @@ class WorkflowUITest(unittest.TestCase):
                 dialog = next(iter(window.voucher_windows))
                 self.assertFalse(any(type(child).__name__ == "NoteDialog" for child in descendants(dialog)))
                 checkbox = next(child for child in descendants(dialog) if isinstance(child, ttk.Checkbutton) and child.cget("text") == "关注这张凭证")
-                editor = next(child for child in descendants(dialog) if isinstance(child, tk.Text))
+                editor = next(child for child in descendants(dialog) if isinstance(child, tk.Text) and child.cget("state") == "normal")
                 save = next(child for child in descendants(dialog) if isinstance(child, ttk.Button) and child.cget("text") == "保存关注与注释")
                 self.assertTrue(window.getvar(checkbox.cget("variable")))
                 editor.insert("1.0", "核对合同")

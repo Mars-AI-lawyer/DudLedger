@@ -10,8 +10,6 @@ PREVIEW = {
     "sheet": "凭证",
     "rows": [
         {"row": 1, "cells": ["日期", "凭证号", "科目编码", "科目名称", "摘要", "借方金额", "贷方金额"]},
-        {"row": 2, "cells": ["2026-08-01", "记-1", "1002", "银行存款", "收款", "10", "0"]},
-        {"row": 3, "cells": ["2026-08-02", "记-2", "6001", "主营业务收入", "销售", "0", "200"]},
     ],
 }
 
@@ -72,7 +70,6 @@ class DeepSeekMappingTest(unittest.TestCase):
     def test_model_notes_do_not_block_valid_mapping(self):
         balance_preview = {"sheet": "余额表", "rows": [
             {"row": 1, "cells": [f"列{i}" for i in range(1, 11)]},
-            {"row": 2, "cells": ["1002", "银行存款", "1", "0", "2", "1", "3", "2", "5", "0"]},
         ]}
         chat = canned({"kind": "balance", "header_row": 1,
                        "mapping": {"account_code": 1, "account_name": 2, "opening_debit": 3, "opening_credit": 4,
@@ -88,6 +85,24 @@ class DeepSeekMappingTest(unittest.TestCase):
         result = suggest_mapping(PREVIEW, "sk-test", chat=chat)
         self.assertEqual(result.mapping, {"summary": 4})
         self.assertTrue(any("尚不满足导入条件" in warning for warning in result.warnings))
+
+    def test_legacy_multirow_preview_is_rejected_before_sending(self):
+        chat = canned({})
+        preview = {"sheet": "秘密公司", "rows": [*PREVIEW["rows"],
+            {"row": 2, "cells": ["秘密业务数据"]}]}
+        with self.assertRaisesRegex(ValueError, "1 行逻辑表头"):
+            suggest_mapping(preview, "sk-test", chat=chat)
+        self.assertEqual(chat.calls, [])
+
+    def test_payload_strips_extra_metadata_and_enforces_header_limits(self):
+        chat = canned({"kind": "entry", "header_row": 1,
+                       "mapping": {"account_name": 1, "debit": 2, "credit": 3}})
+        preview = {"sheet": "秘密公司", "path": "/private/secret", "rows": [
+            {"row": 1, "cells": ["名" * 100] * 60, "raw_data": "秘密明细"}]}
+        suggest_mapping(preview, "sk-test", chat=chat)
+        payload = json.dumps(chat.calls, ensure_ascii=False)
+        for secret in ("秘密公司", "/private/secret", "秘密明细", "名" * 61):
+            self.assertNotIn(secret, payload)
 
     def test_non_json_answer_is_rejected(self):
         with self.assertRaises(ValueError):

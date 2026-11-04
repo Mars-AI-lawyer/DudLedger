@@ -121,7 +121,11 @@ class ReviewUITest(unittest.TestCase):
             job.start(self.app.store)
             self.panel.refresh()
             deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not self.panel.view.get_children():
+            # A worker can commit between refresh()'s count and row queries;
+            # allow the regular progress poll to deliver that same completion.
+            while time.monotonic() < deadline and (
+                not self.panel.view.get_children() or float(self.panel.progress_bar['value']) < 1
+            ):
                 self.root.update()
                 time.sleep(0.02)
             self.assertTrue(waiting.is_set())

@@ -562,7 +562,7 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
         self.assertEqual(self.window.store.sources(), [])
         dialog.destroy()
 
-    def test_single_import_ai_triage_excludes_junk_row(self):
+    def test_single_import_uses_local_guard_even_with_deepseek_key(self):
         import time
         from unittest.mock import patch
 
@@ -581,20 +581,23 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
             while time.monotonic() < deadline and dialog.winfo_exists():
                 self.app.update()
                 time.sleep(0.01)
-        triage.assert_called_once()
+        triage.assert_not_called()
         self.assertFalse(dialog.winfo_exists())
         self.assertEqual(len(self.window.store.entries()), 1)
         record = self.window.store.precheck_for_source(self.window.store.sources()[0]["id"])
         issues = json.loads(record["issues_json"])
-        self.assertTrue(any("AI 判断为非账簿数据" in issue.get("reason", "") for issue in issues))
+        self.assertTrue(any("程序规则" in issue.get("reason", "") for issue in issues))
 
-    def test_single_import_ai_triage_holds_real_data_row(self):
+    def test_single_import_holds_structural_rows_without_cloud_triage(self):
         import time
         from unittest.mock import patch
 
         from ledger_viewer.ui import ImportDialog
 
-        dialog = ImportDialog(self.window, self._bad_csv())
+        source = self.base / "结构变化.csv"
+        source.write_text(",".join(ENTRY_HEADER) + "\n2026-06-01,记,1,1002,银行存款,收款,100,0\n"
+                          "科目名称,借方金额,贷方金额\n银行存款,100,0\n", encoding="utf-8")
+        dialog = ImportDialog(self.window, source)
         self.app.update()
         with patch("ledger_viewer.ui.deepseek_get_api_key", return_value="sk-fake"), \
              patch("ledger_viewer.row_triage.triage_rows", return_value={3: ("data", "疑似真实分录")}) as triage, \
@@ -604,7 +607,7 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
             while time.monotonic() < deadline and dialog.winfo_exists() and "未导入" not in dialog.import_note.cget("text"):
                 self.app.update()
                 time.sleep(0.01)
-        triage.assert_called_once()
+        triage.assert_not_called()
         self.assertTrue(dialog.winfo_exists())
         self.assertIn("未导入", dialog.import_note.cget("text"))
         self.assertIn("真实数据", dialog.import_note.cget("text"))

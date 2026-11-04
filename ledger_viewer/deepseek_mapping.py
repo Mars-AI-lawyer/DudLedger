@@ -10,7 +10,8 @@ from pathlib import Path
 
 import keyring
 
-from .importer import ImportSpec
+from .importer import ImportSpec, text_value
+from .import_preview import MAX_COLUMNS, MAX_CELL_CHARS
 from .jev_mapping import FIELD_DESCRIPTIONS, KIND_DESCRIPTIONS, KIND_FIELDS, MappingSuggestion, critical_warnings
 
 API_URL = "https://api.deepseek.com/chat/completions"
@@ -87,7 +88,7 @@ _KIND_HINT = "\n".join(f"- {name}：{description}" for name, description in KIND
 def _messages(preview: dict) -> list[dict]:
     rows = json.dumps(preview, ensure_ascii=False)
     user = (
-        f"下面是一个工作表的前 {len(preview['rows'])} 行预览，每项的 row 是电子表格行号，cells 是该行单元格文本（可能被截断）：\n{rows}\n\n"
+        f"下面是本地定位并合并后的表头，仅含 {len(preview['rows'])} 行表头文字，没有业务数据样本。row 是原表行号，cells 是按原列序排列的表头（可能被截断）：\n{rows}\n\n"
         "请判断这张表的类型、表头行和每列的含义，严格只输出一个 JSON 对象：\n"
         '{"kind": "entry|balance|balance_sheet|income_statement|unknown", "header_row": 行号整数, '
         '"mapping": {"字段名": 列号整数}, "warnings": ["需要人工核对之处"]}\n\n'
@@ -159,6 +160,13 @@ def _json_answer(content: str) -> dict:
 
 def suggest_mapping(preview: dict, api_key: str, chat=_chat) -> MappingSuggestion:
     """One DeepSeek request returns kind, header row and column mapping; code validates every value."""
+    if len(preview.get("rows", [])) != 1:
+        raise ValueError("导入 AI 仅允许发送 1 行逻辑表头，请在本地定位或合并表头")
+    # Enforce the privacy boundary here as well as in the desktop caller, so
+    # older integrations cannot accidentally send the old multi-row preview.
+    item = preview["rows"][0]
+    preview = {"sheet": "工作表", "rows": [{"row": item["row"],
+        "cells": [text_value(value)[:MAX_CELL_CHARS] for value in item["cells"][:MAX_COLUMNS]]}]}
     numbers = [int(item["row"]) for item in preview["rows"]]
     if not numbers:
         raise ValueError("没有可分析的预览行")

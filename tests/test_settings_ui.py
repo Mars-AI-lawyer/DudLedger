@@ -76,7 +76,7 @@ class SettingsDialogTest(unittest.TestCase):
             finally:
                 app.destroy()
 
-    def test_provider_choice_is_persisted(self):
+    def test_import_provider_is_fixed_to_deepseek(self):
         with patch("ledger_viewer.ui.get_api_key", return_value=""), patch(
             "ledger_viewer.ui.deepseek_get_api_key", return_value=""
         ):
@@ -89,13 +89,13 @@ class SettingsDialogTest(unittest.TestCase):
                 app.ai_provider = "jev"
                 window = next(iter(app.windows))
                 settings = SettingsDialog(window)
-                self.assertEqual(settings.provider.get(), "Jev")
+                self.assertEqual(settings.provider.get(), "DeepSeek Flash")
                 settings.provider.set("DeepSeek")
                 settings._save_provider()
                 self.assertEqual(app.ai_provider, "deepseek")
                 self.assertIn("deepseek", app.preferences_path.read_text(encoding="utf-8"))
                 reopened = SettingsDialog(window)
-                self.assertEqual(reopened.provider.get(), "DeepSeek")
+                self.assertEqual(reopened.provider.get(), "DeepSeek Flash")
                 reopened.destroy()
             finally:
                 app.destroy()

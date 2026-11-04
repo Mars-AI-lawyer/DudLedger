@@ -10,7 +10,7 @@ from ledger_viewer.ui import Application, ImportDialog, BatchImportDialog
 
 
 class ImportDialogTest(unittest.TestCase):
-    def test_jev_action_is_visible_near_the_header_at_large_font(self):
+    def test_ai_action_is_visible_near_the_header_at_large_font(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "sample.csv"
             path.write_text("科目编码,科目名称,借方金额,贷方金额\n1002,银行存款,10,0\n", encoding="utf-8")
@@ -40,7 +40,7 @@ class ImportDialogTest(unittest.TestCase):
             finally:
                 app.destroy()
 
-    def test_unified_import_preserves_per_sheet_mapping_and_jev_suggestions(self):
+    def test_unified_import_preserves_per_sheet_mapping_and_deepseek_suggestions(self):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
             known = base / '正常.csv'
@@ -49,7 +49,7 @@ class ImportDialogTest(unittest.TestCase):
             unknown.write_text('编号,名称,增加,减少\n2241,其他应付款,0,10\n', encoding='utf-8')
             app = Application()
             window = next(iter(app.windows))
-            app.ai_provider = 'jev'
+            app.ai_provider = 'deepseek'
             try:
                 window._use_book(base / 'book.sqlite')
                 with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(known), str(unknown))):
@@ -64,9 +64,9 @@ class ImportDialogTest(unittest.TestCase):
                 self.assertTrue(editor.ai_button.winfo_ismapped())
                 suggestion = SimpleNamespace(kind='entry', header_row=1,
                     mapping={'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3}, warnings=[], model='fake')
-                with patch('ledger_viewer.ui.get_api_key', return_value='fake-key'), \
+                with patch('ledger_viewer.ui.deepseek_get_api_key', return_value='fake-key'), \
                      patch('ledger_viewer.ui.messagebox.askokcancel', return_value=True), \
-                     patch('ledger_viewer.ui.suggest_mapping', return_value=suggestion) as suggest, \
+                     patch('ledger_viewer.ui.deepseek_suggest_mapping', return_value=suggestion) as suggest, \
                      patch('ledger_viewer.ui.messagebox.showinfo'):
                     editor._offer_ai()
                     # Wait for the simulated response without sending any data.
@@ -85,7 +85,7 @@ class ImportDialogTest(unittest.TestCase):
                 editor = next(w for w in window.winfo_children() if isinstance(w, ImportDialog))
                 self.assertEqual(editor.vars['credit'].get(), editor.columns[3])
                 editor.destroy()
-                with patch('ledger_viewer.ui.messagebox.showinfo'), patch('ledger_viewer.ui.suggest_mapping') as suggest:
+                with patch('ledger_viewer.ui.messagebox.showinfo'), patch('ledger_viewer.ui.deepseek_suggest_mapping') as suggest:
                     dialog.use_ai.set(False)
                     dialog._import_selected()
                     suggest.assert_not_called()
@@ -95,7 +95,7 @@ class ImportDialogTest(unittest.TestCase):
             finally:
                 window._close()
 
-    def test_default_jev_applies_to_every_sheet_after_one_confirmation(self):
+    def test_default_deepseek_applies_to_every_sheet_after_one_confirmation(self):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
             first = base / '一.csv'
@@ -104,7 +104,7 @@ class ImportDialogTest(unittest.TestCase):
             second.write_text('编号,名称,增加,减少\n2241,其他应付款,0,10\n', encoding='utf-8')
             app = Application()
             window = next(iter(app.windows))
-            app.ai_provider = 'jev'
+            app.ai_provider = 'deepseek'
             try:
                 window._use_book(base / 'book.sqlite')
                 dialog = BatchImportDialog(window, [first, second])
@@ -112,9 +112,9 @@ class ImportDialogTest(unittest.TestCase):
                 self.assertEqual(dialog.selected, {0, 1})
                 suggestion = SimpleNamespace(kind='entry', header_row=1,
                     mapping={'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3}, warnings=[], model='fake')
-                with patch('ledger_viewer.ui.get_api_key', return_value='fake-key'), \
+                with patch('ledger_viewer.ui.deepseek_get_api_key', return_value='fake-key'), \
                      patch('ledger_viewer.ui.messagebox.askokcancel', return_value=True) as consent, \
-                     patch('ledger_viewer.ui.suggest_mapping', return_value=suggestion) as suggest, \
+                     patch('ledger_viewer.ui.deepseek_suggest_mapping', return_value=suggestion) as suggest, \
                      patch('ledger_viewer.ui.messagebox.showinfo'):
                     dialog._import_selected()
                     import time
@@ -130,23 +130,23 @@ class ImportDialogTest(unittest.TestCase):
             finally:
                 window._close()
 
-    def test_jev_warning_pauses_import_for_review(self):
+    def test_deepseek_warning_pauses_import_for_review(self):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
             source = base / '账.csv'
             source.write_text('编号,名称,增加,减少\n1002,银行存款,10,0\n', encoding='utf-8')
             app = Application()
             window = next(iter(app.windows))
-            app.ai_provider = 'jev'
+            app.ai_provider = 'deepseek'
             try:
                 window._use_book(base / 'book.sqlite')
                 dialog = BatchImportDialog(window, [source])
                 suggestion = SimpleNamespace(kind='entry', header_row=1,
                     mapping={'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3},
                     warnings=('借贷列请重点核对',), model='fake')
-                with patch('ledger_viewer.ui.get_api_key', return_value='fake-key'), \
+                with patch('ledger_viewer.ui.deepseek_get_api_key', return_value='fake-key'), \
                      patch('ledger_viewer.ui.messagebox.askokcancel', return_value=True), \
-                     patch('ledger_viewer.ui.suggest_mapping', return_value=suggestion) as suggest, \
+                     patch('ledger_viewer.ui.deepseek_suggest_mapping', return_value=suggestion) as suggest, \
                      patch('ledger_viewer.ui.messagebox.showwarning') as warning, \
                      patch('ledger_viewer.ui.messagebox.showinfo'):
                     dialog._import_selected()
