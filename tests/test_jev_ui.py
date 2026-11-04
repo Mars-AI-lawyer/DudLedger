@@ -99,6 +99,7 @@ class ReviewUITest(unittest.TestCase):
         prepare.assert_called_once_with({})
 
     def test_progress_and_low_score_result_visible_before_all_done(self):
+        self.app.tabs.select(5)
         extra = self.base / '第二张.csv'
         extra.write_text('日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n'
                          '2026-01-01,2,1002,银行存款,等待返回,10,0\n', encoding='utf-8')

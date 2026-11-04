@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS import_prechecks (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ix_entries_account ON entries(account_key, entry_date, id);
+CREATE INDEX IF NOT EXISTS ix_entries_date ON entries(entry_date,id);
 CREATE INDEX IF NOT EXISTS ix_entries_voucher ON entries(entry_date, voucher_type, voucher_no);
 CREATE INDEX IF NOT EXISTS ix_entries_search ON entries(counterparty, auxiliary);
 CREATE INDEX IF NOT EXISTS ix_balances_account ON balances(account_key);
@@ -102,11 +103,12 @@ class LedgerStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         existing = self.path.exists() and self.path.stat().st_size > 0
-        self.db = sqlite3.connect(self.path)
+        self.db = sqlite3.connect(self.path, timeout=0.1)
         self.db.row_factory = sqlite3.Row
         try:
             if existing and not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_meta'").fetchone():
                 raise ValueError("这不是本软件创建的账套文件")
+            self.db.execute("PRAGMA journal_mode=WAL")
             from .jev_review import SCHEMA as REVIEW_SCHEMA
             self.db.executescript(SCHEMA + REVIEW_SCHEMA)
             self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v6')")
@@ -147,6 +149,28 @@ class LedgerStore:
 
     def close(self) -> None:
         self.db.close()
+
+    @classmethod
+    def connect_existing(cls, path: Path, *, readonly=True, cancelled=None):
+        """Open an initialized book in this thread without running migrations."""
+        store = cls.__new__(cls)
+        store.path = Path(path)
+        store.cancelled = cancelled
+        mode = "ro" if readonly else "rw"
+        store.db = sqlite3.connect(store.path.resolve().as_uri() + f"?mode={mode}", uri=True, timeout=5)
+        store.db.row_factory = sqlite3.Row
+        store.db.execute("PRAGMA foreign_keys=ON")
+        if cancelled is not None:
+            store.db.set_progress_handler(lambda: int(cancelled.is_set()), 1000)
+        return store
+
+    def data_token(self):
+        return self.db.total_changes, self.db.execute("PRAGMA data_version").fetchone()[0]
+
+    def large_book(self) -> bool:
+        # A bounded primary-key scan also handles sparse ids and external imports.
+        return any(self.db.execute(f"SELECT 1 FROM {table} LIMIT 1 OFFSET 5000").fetchone() is not None
+                   for table in ("entries", "balances", "report_rows"))
 
     def display_columns(self, view: str) -> list[str] | None:
         row = self.db.execute("SELECT value FROM ledger_meta WHERE key=?", (f"display_columns:{view}",)).fetchone()
@@ -231,15 +255,17 @@ class LedgerStore:
         with self.db:
             self.db.execute("DELETE FROM related_parties WHERE id=?", (party_id,))
 
-    def import_sheet(self, spec: ImportSpec, replace: bool = False, exclusion_reasons: dict[int, str] | None = None) -> int:
+    def import_sheet(self, spec: ImportSpec, replace: bool = False, exclusion_reasons: dict[int, str] | None = None, *, cancelled=None, progress=None, expected_fingerprint=None) -> int:
         """按工作表事务写入；预检未通过（关键解析错误）时抛错回滚，保持旧数据不变。
 
         exclusion_reasons：自动分诊排除的行号 → 理由，随预检记录留痕（导入后可查）。
         """
         spec.validate()
-        digest = file_hash(spec.path)
+        digest = file_hash(spec.path, cancelled=cancelled)
+        if expected_fingerprint is not None and digest != expected_fingerprint:
+            raise ValueError("预检之后原文件发生变化，请重新预检后再导入")
         headers = header_for_row(spec.path, spec.sheet, spec.header_row, spec.kind)
-        formulas = formula_cells(spec.path, spec.sheet) if spec.path.suffix.lower() in (".xlsx", ".xlsm") else {}
+        formulas = formula_cells(spec.path, spec.sheet, cancelled=cancelled) if spec.path.suffix.lower() in (".xlsx", ".xlsm") else {}
         excluded: dict[str, int] = {}
         issues: list[dict] = []
         exclusion_reasons = exclusion_reasons or {}
@@ -261,7 +287,9 @@ class LedgerStore:
             )
             source_id = cur.lastrowid
             count = 0
-            for decision in classify_rows(spec, formulas):
+            for decision in classify_rows(spec, formulas, cancelled=cancelled):
+                if progress and decision.row_no % 1000 == 0:
+                    progress(decision.row_no)
                 if decision.disposition == DISPOSITION_PENDING:
                     raise ValueError(f"第 {decision.row_no} 行：{decision.reason}（未解决的关键解析错误，预检后再导入）")
                 if decision.disposition != DISPOSITION_IMPORT:
@@ -313,7 +341,14 @@ class LedgerStore:
                  json.dumps(issues, ensure_ascii=False)),
             )
             self._save_template(spec, headers)
+            if file_hash(spec.path, cancelled=cancelled) != digest:
+                raise ValueError("读取期间原文件发生变化，本工作表未写入，请重新预检")
+            self._touch_ledger()
         return count
+
+    def _touch_ledger(self):
+        self.db.execute("INSERT INTO ledger_meta(key,value) VALUES('setting:data_revision','1') "
+                        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1")
 
     def _save_template(self, spec: ImportSpec, headers: list[str]) -> None:
         """经确认且成功导入的格式保存为本地模板；按表头结构签名去重，与文件名无关。"""
@@ -358,6 +393,7 @@ class LedgerStore:
                 self.db.execute(f"DELETE FROM {table} WHERE source_id=?", (source_id,))
             self.db.execute("DELETE FROM sources WHERE id=?", (source_id,))
             self.db.execute("DELETE FROM accounts WHERE key NOT IN (SELECT account_key FROM entries UNION SELECT account_key FROM balances)")
+            self._touch_ledger()
         return True
 
     @staticmethod
@@ -406,7 +442,8 @@ class LedgerStore:
           WHERE a.code LIKE ? OR a.name LIKE ? ORDER BY a.code,a.name
         """, (balance_source_id, pattern, pattern)).fetchall()
 
-    def entries(self, account: str | list[str] | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> list[sqlite3.Row]:
+    def _entry_filter(self, account=None, search="", fiscal_year=None, period=None,
+                      period_from=None, period_to=None, include_descendants=False):
         where = []
         args: list[object] = []
         account_sql, account_args = self._account_clause(account, include_descendants)
@@ -424,10 +461,30 @@ class LedgerStore:
             where.append("(a.code LIKE ? OR a.name LIKE ? OR e.summary LIKE ? OR e.voucher_no LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
             args.extend([f"%{search}%"] * 6)
         clause = " WHERE " + " AND ".join(where) if where else ""
+        return clause, args
+
+    def entries(self, account: str | list[str] | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False, offset: int = 0) -> list[sqlite3.Row]:
+        clause, args = self._entry_filter(account, search, fiscal_year, period, period_from, period_to, include_descendants)
         return self.db.execute("""
           SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path FROM entries e
           JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
-        """ + clause + " ORDER BY " + self._entry_order(sort_by, descending) + " LIMIT ?", (*args, limit)).fetchall()
+        """ + clause + " ORDER BY " + self._entry_order(sort_by, descending) + " LIMIT ? OFFSET ?", (*args, limit, max(0, offset))).fetchall()
+
+    def entries_page(self, *, offset=0, page_size=500, **filters):
+        """Return a bounded page and the total matching the same filter scope."""
+        if not 1 <= page_size <= 5000:
+            raise ValueError("分页大小须为 1 至 5000")
+        scope = {key: value for key, value in filters.items() if key not in ("sort_by", "descending")}
+        clause, args = self._entry_filter(**scope)
+        token = (self.data_token(), clause, tuple(args))
+        cached = getattr(self, "_entry_count_cache", None)
+        if cached is None or cached[0] != token:
+            total = self.db.execute("SELECT COUNT(*) FROM entries e JOIN accounts a ON a.key=e.account_key" + clause, args).fetchone()[0]
+            self._entry_count_cache = (token, total)
+        else:
+            total = cached[1]
+        offset = min(max(0, offset), max(0, (total - 1) // page_size * page_size))
+        return self.entries(**filters, limit=page_size, offset=offset), total, offset
 
     @staticmethod
     def _period_int(value: str) -> int:
@@ -491,9 +548,9 @@ class LedgerStore:
 
     def export_entries(self, path: Path, account: str | list[str] | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> int:
         import csv
-        from .related_parties import related_party_match
+        from .related_parties import build_party_index, indexed_party_match
 
-        parties = self.related_parties()
+        party_index = build_party_index(self.related_parties())
         query = """SELECT e.*,a.code,a.name,s.filename,s.sheet FROM entries e
             JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id"""
         where = []
@@ -521,6 +578,6 @@ class LedgerStore:
             writer = csv.writer(handle)
             writer.writerow(["日期", "会计年度", "期间", "凭证字", "凭证号", "科目编码", "科目名称", "摘要", "往来单位", "辅助核算", "币别", "原币金额", "制单人", "借方金额", "贷方金额", "源文件", "工作表", "原行号", "用户标注关联方"])
             for row in cursor:
-                writer.writerow([row["entry_date"], row["fiscal_year"], row["period"], row["voucher_type"], row["voucher_no"], row["code"], row["name"], row["summary"], row["counterparty"], row["auxiliary"], row["currency"], row["original_amount"], row["maker"], format_money(row["debit_cents"]), format_money(row["credit_cents"]), row["filename"], row["sheet"], row["row_no"], related_party_match(row, parties)])
+                writer.writerow([row["entry_date"], row["fiscal_year"], row["period"], row["voucher_type"], row["voucher_no"], row["code"], row["name"], row["summary"], row["counterparty"], row["auxiliary"], row["currency"], row["original_amount"], row["maker"], format_money(row["debit_cents"]), format_money(row["credit_cents"]), row["filename"], row["sheet"], row["row_no"], indexed_party_match(row, party_index)])
                 count += 1
         return count

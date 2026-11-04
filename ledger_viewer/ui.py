@@ -18,6 +18,8 @@ from . import __version__
 from .agent_import import handoff_text
 from .import_cascade import redact_error
 from .import_preview import preview_headers, PRIVACY_NOTICE
+from .import_work import inventory, prepare_sheets, preview_data, requires_background
+from .background import BackgroundTasks, Cancelled, check_cancelled
 from .checks import run_checks
 from .deepseek_mapping import delete_api_key as deepseek_delete_api_key, get_api_key as deepseek_get_api_key, key_memory_only as deepseek_memory_only, save_api_key as deepseek_save_api_key, suggest_mapping as deepseek_suggest_mapping
 from .grid_lines import DashedGrid
@@ -25,7 +27,7 @@ from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_shee
 from .jev_mapping import delete_api_key, get_api_key, key_memory_only, save_api_key
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, PrecheckStats, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
-from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, related_party_match
+from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, build_party_index, indexed_party_match
 from .store import LedgerStore
 from .theme import configure_theme
 from .table_tools import TableTools
@@ -87,7 +89,7 @@ VIEW_COLUMNS = {
 
 DEFAULT_COLUMNS = {
     "balance": ["code", "name", "pd", "pc", "cd", "cc", "n"],
-    "detail": ["marked", "date", "voucher", "name", "summary", "counterparty", "debit", "credit"],
+    "detail": ["date", "voucher", "name", "summary", "counterparty", "debit", "credit", "marked"],
     "voucher": ["code", "name", "summary", "debit", "credit", "source"],
 }
 
@@ -101,6 +103,9 @@ def visible_columns(kind: str, saved: list[str] | None) -> list[str]:
         return DEFAULT_COLUMNS[kind].copy()
     selected = set(saved)
     result = [key for key in available if key in selected]
+    if kind == "detail" and "marked" in result:
+        result.remove("marked")
+        result.append("marked")
     return result or DEFAULT_COLUMNS[kind].copy()
 
 
@@ -781,13 +786,18 @@ class ImportDialog(tk.Toplevel):
         self.parent = parent
         self.path = path
         self.on_save = on_save
+        self.tasks = BackgroundTasks(self)
+        self.large_file = requires_background([path])
+        self.stop_requested = Event()
+        self.working = False
+        self.sheet_names = [sheet_name] if sheet_name else ([] if self.large_file else sheet_names(path))
         self.title("导入资料 · 核对每列含义")
         width = min(960, max(600, self.winfo_screenwidth() - 80))
         height = min(780, max(500, self.winfo_screenheight() - 150))
         self.geometry(f"{width}x{height}")
         self.transient(parent)
         self.grab_set()
-        self.sheet = tk.StringVar(value=sheet_name or sheet_names(path)[0])
+        self.sheet = tk.StringVar(value=sheet_name or (self.sheet_names[0] if self.sheet_names else ""))
         self.kind = tk.StringVar(value="明细账／序时账")
         self.header = tk.StringVar(value="1")
         self.columns: list[str] = []
@@ -798,12 +808,40 @@ class ImportDialog(tk.Toplevel):
         if spec is not None:
             self.kind.set(BatchImportDialog.LABELS[spec.kind])
             self.header.set(str(spec.header_row))
-            self.refresh_preview(manual=True)
-            for field, variable in self.vars.items():
-                variable.set(self.columns[spec.mapping[field]] if field in spec.mapping else "不导入")
+            self.refresh_preview(manual=True, mapping=spec.mapping)
+        elif self.sheet.get():
+            if self.large_file:
+                self.refresh_preview(manual=on_save is not None, auto_kind=True)
+            else:
+                self._auto_kind_for_sheet()
+                self.refresh_preview(manual=on_save is not None)
         else:
-            self._auto_kind_for_sheet()
-            self.refresh_preview(manual=on_save is not None)
+            self.import_button.configure(state="disabled")
+            self.tasks.submit('sheets', lambda cancelled, report: sheet_names(path), self._sheets_ready,
+                lambda exc: self.import_note.configure(text=f"读取失败：{exc}"))
+        self.protocol("WM_DELETE_WINDOW", self._close_import)
+        self.bind("<Destroy>", self._destroy_import, add="+")
+
+    def _sheets_ready(self, names):
+        self.sheet_names = names
+        self.sheet_combo.configure(values=names)
+        if names:
+            self.sheet.set(names[0])
+            self.refresh_preview(auto_kind=True)
+
+    def _close_import(self):
+        if self.working:
+            self.stop_requested.set()
+            self.import_note.configure(text="正在停止；当前未完成的工作表不会写入。")
+        else:
+            self.destroy()
+
+    def _destroy_import(self, event):
+        if event.widget is self:
+            self.stop_requested.set()
+            if getattr(self.parent, 'import_owner', None) is self:
+                self.parent.import_busy = False
+                self.parent.import_owner = None
 
     def _auto_kind_for_sheet(self) -> None:
         templates = self.parent.store.template_candidates() if self.parent.store else None
@@ -818,9 +856,10 @@ class ImportDialog(tk.Toplevel):
         row = ttk.Frame(top)
         row.pack(fill="x")
         ttk.Label(row, text="工作表").pack(side="left")
-        sheet = ttk.Combobox(row, textvariable=self.sheet, values=sheet_names(self.path), state="disabled" if self.on_save else "readonly", width=25)
+        sheet = ttk.Combobox(row, textvariable=self.sheet, values=self.sheet_names, state="disabled" if self.on_save else "readonly", width=25)
         sheet.pack(side="left", padx=(6, 18))
-        sheet.bind("<<ComboboxSelected>>", lambda _e: (self._auto_kind_for_sheet(), self.refresh_preview()))
+        self.sheet_combo = sheet
+        sheet.bind("<<ComboboxSelected>>", lambda _e: self.refresh_preview(auto_kind=True))
         ttk.Label(row, text="表类型").pack(side="left")
         kind = ttk.Combobox(row, textvariable=self.kind, values=("明细账／序时账", "科目余额表", "资产负债表", "利润表"), state="readonly", width=16)
         kind.pack(side="left", padx=(6, 18))
@@ -840,7 +879,7 @@ class ImportDialog(tk.Toplevel):
         bottom.pack(side="bottom", fill="x")
         self.import_note = ttk.Label(bottom, text="账簿空白/小计行会跳过；请确认借贷列不是余额列。", foreground="#995300", wraplength=460)
         self.import_note.pack(side="left")
-        ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right", padx=4)
+        ttk.Button(bottom, text="取消", command=self._close_import).pack(side="right", padx=4)
         self.import_button = ttk.Button(bottom, text="保存列设置" if self.on_save else "确认并导入", command=self.import_now)
         self.import_button.pack(side="right", padx=4)
         map_holder = ttk.Frame(self)
@@ -875,7 +914,6 @@ class ImportDialog(tk.Toplevel):
             sheet = self.sheet.get()
             header_row = int(self.header.get())
             kind = next(code for code, name in BatchImportDialog.LABELS.items() if name == self.kind.get())
-            preview_headers(self.path, sheet, header_row, kind)
         except Exception as exc:
             messagebox.showerror("无法取得建议", str(exc), parent=self)
             return
@@ -884,17 +922,20 @@ class ImportDialog(tk.Toplevel):
         self._ai_sheet = sheet
         self.ai_button.configure(state="disabled", text=f"{label} 正在分析…")
 
+        path, queue, stop = self.path, self._ai_queue, self.stop_requested
         def worker() -> None:
             try:
-                self._ai_queue.put((True, suggest_for_import(self.path, sheet, suggest, api_key,
-                                                            header_row=header_row, kind=kind)))
+                queue.put((True, suggest_for_import(path, sheet, suggest, api_key, stop.is_set,
+                                                     header_row=header_row, kind=kind)))
             except Exception as exc:
-                self._ai_queue.put((False, redact_error(exc, api_key)))
+                queue.put((False, redact_error(exc, api_key)))
 
         Thread(target=worker, daemon=True).start()
         self.after(120, self._poll_ai)
 
     def _poll_ai(self) -> None:
+        if not self.winfo_exists():
+            return
         try:
             success, result = self._ai_queue.get_nowait()
         except Empty:
@@ -909,62 +950,68 @@ class ImportDialog(tk.Toplevel):
             return
         self.kind.set({"entry": "明细账／序时账", "balance": "科目余额表", "balance_sheet": "资产负债表", "income_statement": "利润表"}[result.kind])
         self.header.set(str(result.header_row))
-        self.refresh_preview(manual=True)
-        for variable in self.vars.values():
-            variable.set("不导入")
-        for field, index in result.mapping.items():
-            if field in self.vars and index < len(self.columns):
-                self.vars[field].set(self.columns[index])
-        self.import_note.configure(text="已填入 AI 建议；请对照原表逐列确认后再导入。")
+        self.refresh_preview(manual=True, mapping=result.mapping)
         if result.warnings:
             caution = "\n".join(result.warnings[:8])
             messagebox.showinfo("AI 建议需要核对", f"表类型、表头行和列映射已填入下方，但有以下需要注意之处：\n{caution}", parent=self)
 
-    def refresh_preview(self, manual: bool = False) -> None:
+    def refresh_preview(self, manual: bool = False, *, auto_kind=False, mapping=None) -> None:
+        if self.working:
+            return
+        self.tasks.cancel('preview')
+        path, sheet, kind = self.path, self.sheet.get(), self.kind_code()
         try:
-            if manual:
-                row_no = int(self.header.get())
-                if row_no < 1:
-                    raise ValueError("表头行号必须大于 0")
-                headers = header_for_row(self.path, self.sheet.get(), row_no, self.kind_code())
-                guess = guess_mapping(headers, self.kind_code())
-            else:
-                row_no, headers, guess = guess_header(self.path, self.sheet.get(), self.kind_code())
-            if not headers:
-                raise ValueError("找不到表头")
-            self.header.set(str(row_no))
-            self.columns = [f"{i+1}: {name or '(空列)'}" for i, name in enumerate(headers)]
-            self.preview.configure(state="normal")
-            self.preview.delete("1.0", "end")
-            for number, line in rows(self.path, self.sheet.get()):
-                self.preview.insert("end", f"{number:>4}  " + " | ".join((text_value(value)[:26] if value is not None and str(value).strip() else "〔空〕") for value in line[:14]) + "\n")
-                if number >= row_no + 5:
-                    break
-            self.preview.configure(state="disabled")
-            for child in self.map_frame.winfo_children():
-                child.destroy()
-            self.vars.clear()
-            kind_code = self.kind_code()
-            if kind_code in REPORT_KINDS:
-                fields = ("left_item", "left_amount_1", "left_amount_2", "left_amount_3", "right_item", "right_amount_1", "right_amount_2", "right_amount_3") if kind_code == "balance_sheet" else ("left_item", "left_amount_1", "left_amount_2", "left_amount_3")
-                self.import_note.configure(text="报表保留原行序、标题和小计；空白金额与零值分开保存，不做勾稽核对。")
-            else:
-                fields = ("date", "fiscal_year", "period", "voucher_type", "voucher_no", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind_code == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "opening_direction", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "closing_balance", "closing_direction", "direction")
-                self.import_note.configure(text="空白/小计行会跳过；金额单列时须同时选借贷方向列。")
-            columns_per_row = 1 if self.parent.controller.font_size >= 17 else 2
-            for n, field in enumerate(fields):
-                r, c = divmod(n, columns_per_row)
-                cell = ttk.Frame(self.map_frame)
-                cell.grid(row=r, column=c, sticky="ew", padx=6, pady=8)
-                ttk.Label(cell, text=FIELD_LABELS[field], width=11).pack(side="left")
-                selected = self.columns[guess[field]] if field in guess else "不导入"
-                variable = tk.StringVar(value=selected)
-                self.vars[field] = variable
-                ttk.Combobox(cell, textvariable=variable, values=["不导入", *self.columns], state="readonly", width=28).pack(side="left", fill="x", expand=True)
-            self.map_frame.columnconfigure(0, weight=1)
-            self.map_frame.columnconfigure(1, weight=1)
-        except Exception as exc:
-            messagebox.showerror("读取失败", str(exc), parent=self)
+            row_no = int(self.header.get()) if manual else 1
+        except ValueError:
+            self.import_note.configure(text="表头行号必须为正整数")
+            return
+        templates = self.parent.store.template_candidates() if self.parent.store else None
+        def query(cancelled, report):
+            return preview_data(path, sheet, kind, manual, row_no, cancelled,
+                auto_kind=auto_kind, templates=templates, mapping=mapping)
+        if self.large_file:
+            self.import_button.configure(state="disabled")
+            self.import_note.configure(text="正在本机读取表头和预览…")
+            self.tasks.submit('preview', query, self._render_preview,
+                lambda exc: self.import_note.configure(text=f"读取失败，可重新读取：{exc}"))
+        else:
+            try:
+                self._render_preview(query(Event(), lambda _: None))
+            except Exception as exc:
+                messagebox.showerror("读取失败", str(exc), parent=self)
+
+    def _render_preview(self, result):
+        row_no, headers, guess, preview, kind = result
+        self.kind.set(BatchImportDialog.LABELS[kind])
+        self.header.set(str(row_no))
+        self.columns = [f"{i+1}: {name or '(空列)'}" for i, name in enumerate(headers)]
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.insert("1.0", preview)
+        self.preview.configure(state="disabled")
+        self.import_button.configure(state="normal")
+        for child in self.map_frame.winfo_children():
+            child.destroy()
+        self.vars.clear()
+        kind_code = kind
+        if kind_code in REPORT_KINDS:
+            fields = ("left_item", "left_amount_1", "left_amount_2", "left_amount_3", "right_item", "right_amount_1", "right_amount_2", "right_amount_3") if kind_code == "balance_sheet" else ("left_item", "left_amount_1", "left_amount_2", "left_amount_3")
+            self.import_note.configure(text="报表保留原行序、标题和小计；空白金额与零值分开保存，不做勾稽核对。")
+        else:
+            fields = ("date", "fiscal_year", "period", "voucher_type", "voucher_no", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction", "counterparty", "auxiliary", "currency", "original_amount", "maker") if kind_code == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "opening_balance", "opening_direction", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "closing_balance", "closing_direction", "direction")
+            self.import_note.configure(text="空白/小计行会跳过；金额单列时须同时选借贷方向列。")
+        columns_per_row = 1 if self.parent.controller.font_size >= 17 else 2
+        for n, field in enumerate(fields):
+            r, c = divmod(n, columns_per_row)
+            cell = ttk.Frame(self.map_frame)
+            cell.grid(row=r, column=c, sticky="ew", padx=6, pady=8)
+            ttk.Label(cell, text=FIELD_LABELS[field], width=11).pack(side="left")
+            selected = self.columns[guess[field]] if field in guess else "不导入"
+            variable = tk.StringVar(value=selected)
+            self.vars[field] = variable
+            ttk.Combobox(cell, textvariable=variable, values=["不导入", *self.columns], state="readonly", width=28).pack(side="left", fill="x", expand=True)
+        self.map_frame.columnconfigure(0, weight=1)
+        self.map_frame.columnconfigure(1, weight=1)
 
     def kind_code(self) -> str:
         if self.kind.get() == "明细账／序时账":
@@ -973,7 +1020,35 @@ class ImportDialog(tk.Toplevel):
             return "balance"
         return "balance_sheet" if self.kind.get() == "资产负债表" else "income_statement"
 
+    def _set_import_working(self, working):
+        self.working = working
+        self.import_button.configure(state="disabled" if working else "normal")
+        self.ai_button.configure(state="disabled" if working else "normal")
+        if working:
+            self.stop_requested.clear()
+            self.parent.import_busy = True
+            self.parent.import_owner = self
+        elif getattr(self.parent, 'import_owner', None) is self:
+            self.parent.import_busy = False
+            self.parent.import_owner = None
+
+    def _import_failed(self, exc):
+        stopped = self.stop_requested.is_set() or isinstance(exc, Cancelled)
+        self._set_import_working(False)
+        self.import_note.configure(text="已停止；本工作表未写入，可重试。" if stopped else f"没有写入本次数据，可重试：{exc}")
+
+    def _single_prepared(self, outcome):
+        self._set_import_working(False)
+        prepared, held, statuses, updated = outcome
+        if not prepared:
+            self.import_note.configure(text="未导入：" + statuses.get(0, "请检查列设置"))
+            return
+        spec, result, reasons = prepared[0]
+        self._import_prechecked([(spec, result)], auto_excluded=reasons)
+
     def import_now(self) -> None:
+        if self.working or self.tasks.busy('preview'):
+            return
         try:
             mapping = {field: self.columns.index(var.get()) for field, var in self.vars.items() if var.get() != "不导入"}
             spec = ImportSpec(self.path, self.sheet.get(), int(self.header.get()), self.kind_code(), mapping)
@@ -984,6 +1059,14 @@ class ImportDialog(tk.Toplevel):
         if self.on_save:
             self.on_save(spec)
             self.destroy()
+            return
+        if self.large_file:
+            self._set_import_working(True)
+            self.import_note.configure(text="正在本机整表预检…")
+            stop = self.stop_requested
+            self.tasks.submit('precheck', lambda cancelled, report: prepare_sheets([(0, spec)], stop, report),
+                self._single_prepared, self._import_failed,
+                lambda value: self.import_note.configure(text=value))
             return
         try:
             result = precheck(spec)
@@ -1032,6 +1115,31 @@ class ImportDialog(tk.Toplevel):
             return
         auto_excluded = auto_excluded or {}
         spec, result = work[0]
+        if self.large_file:
+            old_sources = self.parent.store.sources()
+            duplicate = any(source["kind"] == spec.kind and source["sheet"] == spec.sheet and
+                (source["sha256"] == result.fingerprint or source["original_path"] == str(spec.path.resolve())) for source in old_sources)
+            if duplicate and not messagebox.askyesno("重新导入", "同一来源工作表已有导入记录。是否替换？原始文件不会修改。", parent=self):
+                return
+            self._set_import_working(True)
+            path, stop = self.parent.store.path, self.stop_requested
+            def write(cancelled, report):
+                store = LedgerStore.connect_existing(path, readonly=False, cancelled=stop)
+                try:
+                    return store.import_sheet(spec, replace=duplicate, exclusion_reasons=auto_excluded,
+                        expected_fingerprint=result.fingerprint, cancelled=stop,
+                        progress=lambda count: report(f"正在写入 {count:,} 行…"))
+                finally:
+                    store.close()
+            def finish(count):
+                self._set_import_working(False)
+                parent = self.parent
+                self.destroy()
+                parent.refresh_all()
+                messagebox.showinfo("导入完成", f"成功导入 {count:,} 行。核对提醒会自动更新。", parent=parent)
+            self.tasks.submit('write', write, finish, self._import_failed,
+                lambda value: self.import_note.configure(text=value))
+            return
         try:
             if file_hash(spec.path) != result.fingerprint:
                 if not messagebox.askyesno("文件已修改", "预检之后文件内容发生了变化，建议重新预检。是否重新预检后再导入？", parent=self):
@@ -1057,9 +1165,7 @@ class ImportDialog(tk.Toplevel):
             excluded_note = f"已自动排除 {len(auto_excluded)} 行疑点行（理由见导入记录的预检详情）。" + excluded_note
         self.destroy()
         self.parent.refresh_all()
-        differences = sum(item.level == "差异" for item in run_checks(self.parent.store))
-        tail = f"发现 {differences} 项差异，请从顶部“查看”菜单打开“核对提醒”。" if differences else "没有发现已确认口径下的金额差异；待核事项请从顶部“查看”菜单打开“核对提醒”。"
-        messagebox.showinfo("导入完成", f"成功导入 {count} 行。{excluded_note}{tail}", parent=self.parent)
+        messagebox.showinfo("导入完成", f"成功导入 {count} 行。{excluded_note}核对提醒会自动更新，可从“查看”菜单打开。", parent=self.parent)
 
 
 class BatchImportDialog(tk.Toplevel):
@@ -1075,24 +1181,18 @@ class BatchImportDialog(tk.Toplevel):
         self.ai_queue = Queue()
         self.ai_cancel = Event()
         self.ai_running = False
+        self.tasks = BackgroundTasks(self)
+        self.working = False
+        self.stop_requested = Event()
+        self.item_status = {}
+        self.completed = set()
         templates = parent.store.template_candidates() if parent.store else None
-        for path in dict.fromkeys(paths):
-            try:
-                names = sheet_names(path)
-            except Exception as exc:
-                self.skipped.append(f"{path.name}：{exc}")
-                continue
-            for sheet in names:
-                try:
-                    if is_cashflow_sheet(path, sheet):
-                        continue
-                    spec = classify_sheet(path, sheet, templates)
-                except Exception:
-                    spec = None
-                self.items.append((path, sheet, spec))
-        if not self.items and not self.skipped:
-            self.destroy()
-            return
+        background = requires_background(paths)
+        if not background:
+            self.items, self.skipped, self.item_status = inventory(paths, templates, self.stop_requested, lambda _: None)
+            if not self.items and not self.skipped:
+                self.destroy()
+                return
         self.title("导入表格 · 可选择一个或多个文件")
         self.geometry("820x520")
         self.minsize(650, 420)
@@ -1108,7 +1208,9 @@ class BatchImportDialog(tk.Toplevel):
         self.ai_hint.pack(anchor="w", pady=(2, 5))
         self.ai_progress = ttk.Progressbar(body, mode="determinate")
         self.ai_status = tk.StringVar(value="")
-        ttk.Label(body, textvariable=self.ai_status, foreground="#555").pack(anchor="w")
+        status_label = ttk.Label(body, textvariable=self.ai_status, foreground="#555", wraplength=740)
+        status_label.pack(fill="x")
+        status_label.bind("<Configure>", lambda event: status_label.configure(wraplength=max(200, event.width - 8)))
         footer = ttk.Frame(body)
         footer.pack(side="bottom", fill="x", pady=(12, 0))
         self.cancel_button = ttk.Button(footer, text="取消", command=self._close)
@@ -1128,14 +1230,70 @@ class BatchImportDialog(tk.Toplevel):
             self._render_item(index)
         self.view.bind("<Button-1>", self._toggle_item)
         self.view.bind("<Double-1>", self._edit_current)
+        self.sheet_status = tk.StringVar()
+        sheet_label = ttk.Label(self.view.master, textvariable=self.sheet_status, wraplength=740, foreground="#555")
+        sheet_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        sheet_label.bind("<Configure>", lambda event: sheet_label.configure(wraplength=max(200, event.width - 8)))
+        self.view.bind("<<TreeviewSelect>>", self._show_sheet_status)
         if self.items:
             self.view.selection_set('0')
         if self.skipped:
             ttk.Label(body, text="读取失败：" + "；".join(self.skipped), wraplength=730).pack(fill="x")
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Destroy>", self._destroy_import, add="+")
+        if background:
+            self._set_working(True, "正在本机读取工作表…")
+            stop = self.stop_requested
+            self.tasks.submit('inventory', lambda cancelled, report: inventory(paths, templates, stop, report),
+                self._inventory_ready, self._work_failed, self.ai_status.set)
+
+    def _destroy_import(self, event):
+        if event.widget is self:
+            self.stop_requested.set()
+            self.ai_cancel.set()
+            if getattr(self.parent, 'import_owner', None) is self:
+                self.parent.import_busy = False
+                self.parent.import_owner = None
+
+    def _set_working(self, working, text=""):
+        self.working = working
+        if working:
+            self.parent.import_busy = True
+            self.parent.import_owner = self
+            self.stop_requested.clear()
+        elif getattr(self.parent, 'import_owner', None) is self:
+            self.parent.import_busy = False
+            self.parent.import_owner = None
+        for widget in (self.import_button, self.edit_button, self.agent_button, self.ai_toggle):
+            widget.configure(state="disabled" if working else "normal")
+        self.cancel_button.configure(text="停止" if working else "关闭", state="normal")
+        if text:
+            self.ai_status.set(text)
+
+    def _inventory_ready(self, result):
+        self._set_working(False)
+        self.items, self.skipped, self.item_status = result
+        self.selected = set(range(len(self.items)))
+        for index in range(len(self.items)):
+            self._render_item(index)
+        if self.items:
+            self.view.selection_set('0')
+        if not self.items and not self.skipped:
+            self.destroy()
+            return
+        self.ai_status.set("读取失败：" + "；".join(self.skipped) if self.skipped else f"已读取 {len(self.items)} 张表，请选择导入。")
+
+    def _work_failed(self, exc):
+        stopped = isinstance(exc, Cancelled) or self.stop_requested.is_set()
+        self._set_working(False, "已停止，已完成的工作表保留；可继续重试。" if stopped else f"处理失败，可重试：{exc}")
 
     def _close(self):
+        if self.working:
+            self.stop_requested.set()
+            self.ai_status.set("正在停止；当前未完成的工作表不会写入，已完成的保留。")
+            self.cancel_button.configure(state="disabled")
+            return
         self.ai_cancel.set()
         self.destroy()
 
@@ -1153,13 +1311,19 @@ class BatchImportDialog(tk.Toplevel):
             f"AI 已建议 · 表头第 {spec.header_row} 行" if index in self.ai_ready else
             (f"手动设置 · 表头第 {spec.header_row} 行" if index in self.manual else
              (f"表头第 {spec.header_row} 行" if spec else "待 AI 建议／手动设置")))
+        if index in self.item_status:
+            values = (*values[:-1], self.item_status[index])
         if self.view.exists(str(index)):
             self.view.item(str(index), values=values)
         else:
             self.view.insert('', 'end', iid=str(index), values=values)
 
+    def _show_sheet_status(self, event=None):
+        selected = self.view.selection()
+        self.sheet_status.set(self.view.set(selected[0], "state") if selected else "")
+
     def _toggle_item(self, event):
-        if self.ai_running:
+        if self.ai_running or self.working:
             return
         item = self.view.identify_row(event.y)
         if item and self.view.identify_column(event.x) == '#1':
@@ -1171,7 +1335,7 @@ class BatchImportDialog(tk.Toplevel):
             self._render_item(index)
 
     def _edit_current(self, event=None):
-        if self.ai_running:
+        if self.ai_running or self.working:
             return
         if event is not None:
             item = self.view.identify_row(event.y)
@@ -1186,6 +1350,8 @@ class BatchImportDialog(tk.Toplevel):
         path, sheet, spec = self.items[index]
         def save(updated):
             self.items[index] = (path, sheet, updated)
+            self.item_status.pop(index, None)
+            self.completed.discard(index)
             self.selected.add(index)
             self.manual.add(index)
             self.ai_ready.discard(index)
@@ -1198,7 +1364,7 @@ class BatchImportDialog(tk.Toplevel):
         editor.bind('<Destroy>', restore, add='+')
 
     def _import_selected(self) -> None:
-        if self.ai_running:
+        if self.ai_running or self.working:
             return
         if not self.selected:
             messagebox.showinfo("未选择表", "请至少勾选一个工作表。", parent=self)
@@ -1239,25 +1405,27 @@ class BatchImportDialog(tk.Toplevel):
         self.ai_progress.pack(fill="x", pady=(2, 5))
         self.ai_status.set(f"{label} 正在建议列：0 / {len(pending)}")
 
+        queue, stop = self.ai_queue, self.ai_cancel
+        items = [(index, *self.items[index]) for index in pending]
+        kinds = set(self.LABELS)
         def worker():
-            for index in pending:
-                if self.ai_cancel.is_set():
+            for index, path, sheet, current in items:
+                if stop.is_set():
                     return
-                path, sheet, current = self.items[index]
                 try:
-                    result = suggest_for_import(path, sheet, suggest, api_key, self.ai_cancel.is_set,
+                    result = suggest_for_import(path, sheet, suggest, api_key, stop.is_set,
                         header_row=current.header_row if current else None, kind=current.kind if current else None)
-                    if result.kind not in self.LABELS:
+                    if result.kind not in kinds:
                         raise ValueError("未识别表类型")
                     spec = ImportSpec(path, sheet, result.header_row, result.kind, result.mapping)
                     spec.validate()
                     headers = header_for_row(path, sheet, result.header_row, result.kind)
                     if not headers or any(column >= len(headers) or column < 0 for column in result.mapping.values()):
                         raise ValueError("建议列超出工作表范围")
-                    self.ai_queue.put((index, spec, result.warnings, None))
+                    queue.put((index, spec, result.warnings, None))
                 except Exception as exc:
-                    self.ai_queue.put((index, None, (), redact_error(exc, api_key)))
-            self.ai_queue.put((None, None, (), None))
+                    queue.put((index, None, (), redact_error(exc, api_key)))
+            queue.put((None, None, (), None))
 
         Thread(target=worker, daemon=True).start()
         self.after(120, self._poll_ai_batch, len(pending), 0, [], label)
@@ -1303,7 +1471,7 @@ class BatchImportDialog(tk.Toplevel):
             self.after(120, self._poll_ai_batch, total, done, problems, label)
 
     def _import_ready(self) -> None:
-        if self.ai_running:
+        if self.ai_running or self.working:
             return
         if any(self.items[index][2] is None for index in self.selected):
             messagebox.showinfo("请确认列设置", "选中的表包含未识别项，请双击手动调整列，或取消勾选。", parent=self)
@@ -1312,15 +1480,37 @@ class BatchImportDialog(tk.Toplevel):
         if not indices:
             messagebox.showinfo("未选择表", "请至少勾选一个工作表。", parent=self)
             return
+        selected = [(index, self.items[index][2]) for index in indices]
+        if requires_background([spec.path for _, spec in selected]):
+            self._set_working(True, "正在本机整表预检…")
+            stop = self.stop_requested
+            self.tasks.submit('precheck', lambda cancelled, report: prepare_sheets(selected, stop, report),
+                self._prepared_ready, self._work_failed, self.ai_status.set)
+            return
         work: list[tuple[int, ImportSpec, object]] = []
-        for index in indices:
-            spec = self.items[index][2]
+        self._precheck_errors = {}
+        for index, spec in selected:
             try:
                 work.append((index, spec, precheck(spec)))
-            except Exception:
+            except Exception as exc:
+                self._precheck_errors[index] = str(exc)
                 work.append((index, spec, None))
-        # Keep every questionable row local, even when a DeepSeek key exists.
         self._apply_batch_resolutions(work, {})
+
+    def _prepared_ready(self, result):
+        self._set_working(False)
+        prepared, held, statuses, updated = result
+        self.item_status.update(statuses)
+        for index, spec in updated.items():
+            self.item_status.pop(index, None)
+            self.items[index] = (spec.path, spec.sheet, spec)
+        for index in set(statuses) | set(updated):
+            self._render_item(index)
+        if prepared:
+            self._import_prechecked([(spec, report) for spec, report, reasons in prepared],
+                paused_specs=held, auto_reasons={(spec.sheet, str(spec.path)): reasons for spec, report, reasons in prepared})
+        else:
+            self.ai_status.set("所选表均未通过预检；具体原因见列表，可调整列设置后重试。")
 
     def _apply_batch_resolutions(self, work: list, labels_by_index: dict) -> None:
         from .row_triage import pending_reasons, resolve_pending
@@ -1329,7 +1519,7 @@ class BatchImportDialog(tk.Toplevel):
         held_specs: list[ImportSpec] = []
         for index, spec, result in work:
             if result is None:
-                self.view.set(str(index), "state", "整表无法预检，未导入；双击调整列设置")
+                self.view.set(str(index), "state", "整表无法预检：" + getattr(self, "_precheck_errors", {}).get(index, "请调整列设置后重试"))
                 held_specs.append(spec)
                 continue
             if not result.pending_rows:
@@ -1367,67 +1557,89 @@ class BatchImportDialog(tk.Toplevel):
                                 auto_reasons={(spec.sheet, str(spec.path)): reasons for spec, _result, reasons in importable})
 
     def _import_prechecked(self, work: list, paused_specs: list | None = None, auto_reasons: dict | None = None) -> None:
+        work = [(spec, result) for spec, result in work if result is not None and not result.blocked]
         if not work:
             return
-        paused_specs = paused_specs or []
-        auto_reasons = auto_reasons or {}
-        selected: list[ImportSpec] = []
-        results: dict[tuple[str, str], object] = {}
-        for spec, result in work:
-            if result is None or result.blocked:
-                continue
-            selected.append(spec)
-            results[(spec.sheet, str(spec.path))] = result
+        paused_specs, auto_reasons = paused_specs or [], auto_reasons or {}
         old_sources = self.parent.store.sources()
-        duplicate = set()
-        failures = []
-        unreadable = set()
-        for index, spec in enumerate(selected):
-            try:
-                digest = file_hash(spec.path)
-            except OSError as exc:
-                failures.append(f'{spec.path.name}/{spec.sheet}：文件无法读取（{exc}）')
-                unreadable.add(index)
-                continue
-            if any(source["kind"] == spec.kind and source["sheet"] == spec.sheet and (source["sha256"] == digest or source["original_path"] == str(spec.path.resolve())) for source in old_sources):
-                duplicate.add(index)
-        replace = False
-        if duplicate:
-            replace = messagebox.askyesno("已有导入记录", f"{len(duplicate)} 个工作表已有导入记录。是否替换这些记录？选择“否”将跳过它们，继续导入其他表。", parent=self)
-        imported = []
-        for index, spec in enumerate(selected):
-            if index in unreadable or (index in duplicate and not replace):
-                continue
-            try:
-                count = self.parent.store.import_sheet(spec, replace=index in duplicate,
-                    exclusion_reasons=auto_reasons.get((spec.sheet, str(spec.path))))
-                note = ""
-                result = results.get((spec.sheet, str(spec.path)))
-                reasons = auto_reasons.get((spec.sheet, str(spec.path)))
-                if reasons:
-                    note = f"（自动排除疑点 {len(reasons)} 行）"
-                if result is not None and result.stats.excluded_total:
-                    note += f"（另排除 {result.stats.excluded_total} 行）"
-                imported.append(f'{spec.path.name}/{spec.sheet}：{count} 行{note}')
-            except Exception as exc:
-                failures.append(f'{spec.path.name}/{spec.sheet}：{exc}')
-        self.parent.refresh_all()
-        differences = sum(item.level == "差异" for item in run_checks(self.parent.store))
-        summary = f"成功导入 {len(imported)} 个工作表；当前发现 {differences} 项差异。"
-        if paused_specs:
-            summary += f"\n{len(paused_specs)} 张表的疑点行经判断为真实数据或结构变化，未导入（保留在导入列表中，可双击调整列设置）。"
-        if duplicate and not replace:
-            summary += f"\n跳过 {len(duplicate)} 个已有来源。"
-        if failures:
-            summary += "\n失败项：\n" + "\n".join(failures)
-        if self.skipped:
-            summary += f"\n另有 {len(self.skipped)} 个文件读取失败。"
-        messagebox.showinfo("导入结果", summary, parent=self.parent)
-        if paused_specs:
-            # 疑点表未导入时保留本窗口，方便双击调整列设置后重试。
-            self.ai_status.set(f"{len(paused_specs)} 张表有未解决疑点未导入；双击列表中的表调整列设置。")
+        duplicates = {number for number, (spec, result) in enumerate(work) if any(
+            source["kind"] == spec.kind and source["sheet"] == spec.sheet and
+            (source["sha256"] == result.fingerprint or source["original_path"] == str(spec.path.resolve())) for source in old_sources)}
+        replace = bool(duplicates) and messagebox.askyesno("已有导入记录",
+            f"{len(duplicates)} 个工作表已有导入记录。是否替换这些记录？选择“否”将跳过它们，继续导入其他表。", parent=self)
+        jobs, skipped = [], []
+        for number, (spec, result) in enumerate(work):
+            index = next(index for index, (path, sheet, _) in enumerate(self.items) if path == spec.path and sheet == spec.sheet)
+            if number in duplicates and not replace:
+                skipped.append(index)
+            else:
+                jobs.append((index, spec, result, number in duplicates, auto_reasons.get((spec.sheet, str(spec.path)), {})))
+        path = self.parent.store.path
+        def write(store, stop, report):
+            outcomes = []
+            for index, spec, result, replacement, reasons in jobs:
+                if stop.is_set():
+                    break
+                report(f"写入 {spec.path.name}/{spec.sheet}")
+                try:
+                    count = store.import_sheet(spec, replace=replacement, exclusion_reasons=reasons,
+                        cancelled=stop, expected_fingerprint=result.fingerprint,
+                        progress=lambda row: report(f"写入 {spec.path.name}/{spec.sheet}：{row:,} 行"))
+                    outcomes.append((index, count, ""))
+                except Exception as exc:
+                    if stop.is_set():
+                        break
+                    outcomes.append((index, 0, str(exc)))
+            return outcomes, stop.is_set()
+        def finish(result):
+            outcomes, stopped = result
+            self._set_working(False)
+            failures = []
+            for index in skipped:
+                self.selected.discard(index)
+                self.item_status[index] = "已跳过已有来源"
+                self._render_item(index)
+            for index, count, error in outcomes:
+                if error:
+                    self.item_status[index] = f"导入失败：{error}；可重试"
+                    failures.append(error)
+                else:
+                    self.selected.discard(index)
+                    self.completed.add(index)
+                    excluded = next((len(reasons) for job_index, _, _, _, reasons in jobs if job_index == index), 0)
+                    note = f"；自动排除 {excluded} 行" if excluded else ""
+                    self.item_status[index] = f"已完成：导入 {count:,} 行{note}"
+                self._render_item(index)
+            self.parent.refresh_all()
+            successful = sum(not error for _, _, error in outcomes)
+            summary = f"成功导入 {successful} 张表。核对提醒会自动更新。"
+            if paused_specs:
+                summary += f" {len(paused_specs)} 张表有未解决疑点，未导入，可调整后重试。"
+            if skipped:
+                summary += f" 跳过 {len(skipped)} 个已有来源。"
+            if failures:
+                summary += " 失败原因：" + "；".join(failures[:3])
+                if len(failures) > 3:
+                    summary += f"；另有 {len(failures) - 3} 项，选中列表可查看具体原因。"
+            if stopped:
+                summary += " 已停止；当前未完成的工作表未写入。"
+            self.ai_status.set(summary)
+            if not stopped:
+                messagebox.showinfo("导入结果", summary, parent=self)
+            if not paused_specs and not failures and not stopped:
+                self.destroy()
+        if requires_background([spec.path for _, spec, _, _, _ in jobs]):
+            self._set_working(True, "正在本机写入…")
+            stop = self.stop_requested
+            def worker(cancelled, report):
+                store = LedgerStore.connect_existing(path, readonly=False, cancelled=stop)
+                try:
+                    return write(store, stop, report)
+                finally:
+                    store.close()
+            self.tasks.submit('write', worker, finish, self._work_failed, self.ai_status.set)
         else:
-            self.destroy()
+            finish(write(self.parent.store, Event(), lambda _: None))
 
 
 class ReportAccountsDialog(tk.Toplevel):
@@ -1486,6 +1698,11 @@ class App(tk.Toplevel):
     def __init__(self, controller: "Application"):
         super().__init__(controller)
         self.controller = controller
+        self.tasks = BackgroundTasks(self)
+        self.import_busy = False
+        self.detail_offset = 0
+        self.detail_total = 0
+        self._checks_cache = None
         self.title(f"账簿核查 · v{__version__}")
         self.geometry("1160x690")
         self.minsize(820, 520)
@@ -1514,6 +1731,7 @@ class App(tk.Toplevel):
         self.status = tk.StringVar(value="从“文件”导入表格即可开始；新建账套前可选择保存位置。")
         self.column_views: dict[str, list[ttk.Treeview]] = {kind: [] for kind in VIEW_COLUMNS}
         self.voucher_windows: set[tk.Toplevel] = set()
+        self.review_windows: set[tk.Toplevel] = set()
         self._layout()
         self._build_menu()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -1588,16 +1806,22 @@ class App(tk.Toplevel):
         ttk.Label(summary_search_row, text="查找科目").pack(side="left")
         summary_entry = ttk.Entry(summary_search_row, textvariable=self.summary_search)
         summary_entry.pack(side="left", fill="x", expand=True, padx=6)
-        summary_entry.bind("<Return>", lambda _e: self.refresh_all())
-        ttk.Button(summary_search_row, text="查找", command=self.refresh_all).pack(side="left")
+        summary_entry.bind("<Return>", lambda _e: self.refresh_summary())
+        ttk.Button(summary_search_row, text="查找", command=self.refresh_summary).pack(side="left")
         ttk.Button(summary_search_row, text="清除", command=self.clear_summary_filter).pack(side="left", padx=5)
         balance_top = ttk.Frame(frames[0], padding=5)
         balance_top.pack(fill="x")
-        ttk.Label(balance_top, text="双击科目查看明细；点击“展开／收起”打开子科目。", style="Hint.TLabel",
+        balance_hint = ttk.Frame(balance_top)
+        balance_actions = ttk.Frame(balance_top)
+        balance_hint.grid(row=0, column=0, sticky="w")
+        balance_actions.grid(row=0, column=1, sticky="e")
+        balance_top.columnconfigure(0, weight=1)
+        balance_top.bind("<Configure>", lambda event: self._flow_bar(balance_top, balance_hint, balance_actions))
+        ttk.Label(balance_hint, text="双击科目查看明细；点击“展开／收起”打开子科目。", style="Hint.TLabel",
                   wraplength=250, justify="left").pack(side="left")
-        ttk.Button(balance_top, text="全部展开", command=lambda: self.set_expansion(True)).pack(side="left", padx=(12, 4))
-        ttk.Button(balance_top, text="全部收起", command=lambda: self.set_expansion(False)).pack(side="left")
-        summary_more = ttk.Menubutton(balance_top, text="更多 ▾")
+        ttk.Button(balance_actions, text="全部展开", command=lambda: self.set_expansion(True)).pack(side="left", padx=(12, 4))
+        ttk.Button(balance_actions, text="全部收起", command=lambda: self.set_expansion(False)).pack(side="left")
+        summary_more = ttk.Menubutton(balance_actions, text="更多 ▾")
         summary_more.pack(side="right")
         summary_menu = tk.Menu(summary_more, tearoff=False)
         summary_menu.add_command(label="选择显示列…", command=lambda: self._open_columns(self, "balance"))
@@ -1616,39 +1840,59 @@ class App(tk.Toplevel):
         self.summary_view.bind("<Double-1>", self.open_account)
         self.balance_tools = TableTools(self.summary_view, {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc"},
             source_for_row=lambda row: self.balance_calc_sources.get(row, row))
-        ttk.Button(balance_top, text="计算器", command=self.balance_tools.toggle).pack(side="right", padx=4)
+        ttk.Button(balance_actions, text="计算器", command=self.balance_tools.toggle).pack(side="right", padx=4)
         detail_top = ttk.Frame(frames[1], padding=5)
         detail_top.pack(fill="x")
-        ttk.Label(detail_top, textvariable=self.account_label, wraplength=330, justify="left").pack(side="left")
-        ttk.Button(detail_top, text="显示全部科目", command=self.show_all_entries).pack(side="left", padx=10)
-        self.detail_more = ttk.Menubutton(detail_top, text="更多 ▾")
+        detail_scope = ttk.Frame(detail_top)
+        detail_actions = ttk.Frame(detail_top)
+        detail_scope.grid(row=0, column=0, sticky="w")
+        detail_actions.grid(row=0, column=1, sticky="e")
+        detail_top.columnconfigure(0, weight=1)
+        detail_top.bind("<Configure>", lambda event: self._flow_bar(detail_top, detail_scope, detail_actions))
+        ttk.Label(detail_scope, textvariable=self.account_label, wraplength=330, justify="left").pack(side="left")
+        ttk.Button(detail_scope, text="显示全部科目", command=self.show_all_entries).pack(side="left", padx=10)
+        self.detail_more = ttk.Menubutton(detail_actions, text="更多 ▾")
         self.detail_more.pack(side="right")
         detail_menu = tk.Menu(self.detail_more, tearoff=False)
         detail_menu.add_command(label="选择显示列…", command=lambda: self._open_columns(self, "detail"))
         detail_menu.add_command(label="导出当前明细 CSV…", command=self.export_csv)
         detail_menu.add_command(label="恢复日期顺序", command=self.reset_detail_sort)
         self.detail_more.configure(menu=detail_menu)
-        ttk.Button(detail_top, text="关注凭证 / 写备注", command=self.mark_selected_entry).pack(side="right", padx=6)
+        ttk.Button(detail_actions, text="关注凭证 / 写备注", command=self.mark_selected_entry).pack(side="right", padx=6)
         self.detail_controls = ttk.Frame(frames[1], padding=(5, 0, 5, 5))
         self.detail_controls.pack(fill="x")
-        ttk.Label(self.detail_controls, text="关键词").pack(side="left")
-        detail_entry = ttk.Entry(self.detail_controls, textvariable=self.search, width=16)
+        self.keyword_controls = ttk.Frame(self.detail_controls)
+        self.period_controls = ttk.Frame(self.detail_controls)
+        self.keyword_controls.grid(row=0, column=0, sticky="ew")
+        self.period_controls.grid(row=0, column=1, sticky="e")
+        self.detail_controls.columnconfigure(0, weight=1)
+        ttk.Label(self.keyword_controls, text="关键词").pack(side="left")
+        detail_entry = ttk.Entry(self.keyword_controls, textvariable=self.search, width=12)
         detail_entry.pack(side="left", fill="x", expand=True, padx=6)
         detail_entry.bind("<Return>", lambda _e: self.refresh_details())
-        ttk.Label(self.detail_controls, text="期间").pack(side="left")
-        self.period_from_combo = ttk.Combobox(self.detail_controls, textvariable=self.period_from, values=("不限",), state="readonly", width=11)
+        ttk.Button(self.keyword_controls, text="查找", command=self.refresh_details, style="Accent.TButton").pack(side="left")
+        ttk.Button(self.keyword_controls, text="重置筛选", command=self.clear_filter).pack(side="left", padx=(6, 0))
+        ttk.Label(self.period_controls, text="期间").pack(side="left", padx=(6, 0))
+        self.period_from_combo = ttk.Combobox(self.period_controls, textvariable=self.period_from, values=("不限",), state="readonly", width=11)
         self.period_from_combo.pack(side="left", padx=(6, 2))
         self.period_from_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
-        ttk.Label(self.detail_controls, text="至").pack(side="left")
-        self.period_to_combo = ttk.Combobox(self.detail_controls, textvariable=self.period_to, values=("不限",), state="readonly", width=11)
-        self.period_to_combo.pack(side="left", padx=(2, 6))
+        ttk.Label(self.period_controls, text="至").pack(side="left")
+        self.period_to_combo = ttk.Combobox(self.period_controls, textvariable=self.period_to, values=("不限",), state="readonly", width=11)
+        self.period_to_combo.pack(side="left", padx=(2, 0))
         self.period_to_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
-        ttk.Button(self.detail_controls, text="查找", command=self.refresh_details, style="Accent.TButton").pack(side="left")
-        ttk.Button(self.detail_controls, text="重置筛选", command=self.clear_filter).pack(side="left", padx=(6, 0))
-        ttk.Label(frames[1], textvariable=self.detail_info, style="Hint.TLabel", padding=(6, 2)).pack(fill="x")
+        self.detail_controls.bind("<Configure>", self._resize_detail_controls)
+        paging = ttk.Frame(frames[1], padding=(6, 2))
+        paging.pack(fill="x")
+        self.detail_prev = ttk.Button(paging, text="上一页", command=lambda: self.change_detail_page(-1), state="disabled")
+        self.detail_prev.pack(side="right")
+        self.detail_next = ttk.Button(paging, text="下一页", command=lambda: self.change_detail_page(1), state="disabled")
+        self.detail_next.pack(side="right", padx=5)
+        self.detail_page_label = tk.StringVar(value="第 1 / 1 页")
+        ttk.Label(paging, textvariable=self.detail_page_label).pack(side="right", padx=5)
+        ttk.Label(paging, textvariable=self.detail_info, style="Hint.TLabel", wraplength=380).pack(side="left", fill="x", expand=True)
         self.detail_view = tree(frames[1], VIEW_COLUMNS["detail"])
         self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"})
-        ttk.Button(detail_top, text="计算器", command=self.detail_tools.toggle).pack(side="right", padx=4)
+        ttk.Button(detail_actions, text="计算器", command=self.detail_tools.toggle).pack(side="right", padx=4)
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
         for key in ("date", "voucher", "code", "name", "summary", "debit", "credit"):
@@ -1689,7 +1933,7 @@ class App(tk.Toplevel):
         ttk.Label(source_choice, text="总览使用的科目余额表").pack(side="left")
         self.balance_combo = ttk.Combobox(source_choice, textvariable=self.balance_source, values=("无余额表",), state="readonly", width=45)
         self.balance_combo.pack(side="left", padx=8)
-        self.balance_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_all())
+        self.balance_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_summary())
         ttk.Label(source_choice, text="切换来源只影响显示，不会合并不同期间。", style="Hint.TLabel").pack(side="left")
         self.source_view = tree(frames[5], [("file", "文件", 220), ("sheet", "工作表", 130), ("kind", "类型", 85), ("rows", "有效行", 80), ("precheck", "导入预检", 170), ("hash", "SHA-256", 220), ("path", "原始路径", 430)])
         self.source_view.bind("<Double-1>", lambda _event: self.show_precheck_detail())
@@ -1797,6 +2041,8 @@ class App(tk.Toplevel):
         dialog = self.utility_windows[title]
         dialog.deiconify()
         dialog.lift()
+        if title == "核对提醒":
+            self.refresh_checks()
 
     def _register_column_view(self, kind: str, view: ttk.Treeview) -> None:
         self.column_views[kind].append(view)
@@ -1805,6 +2051,7 @@ class App(tk.Toplevel):
         view.dashed_grid.schedule()
 
     def _change_columns(self, kind: str, selected: list[str]) -> None:
+        selected = visible_columns(kind, selected)
         if self.store:
             self.store.save_display_columns(kind, selected)
         self.column_views[kind] = [view for view in self.column_views[kind] if view.winfo_exists()]
@@ -1823,6 +2070,9 @@ class App(tk.Toplevel):
         SettingsDialog(self)
 
     def open_review_rules(self) -> None:
+        if self.import_busy or self.review_panel.preparing:
+            self.status.set("请完成或取消当前本地处理后再修改账套设置。")
+            return
         if not self.store:
             messagebox.showinfo("请打开账套", "规则保存在当前账套，请先打开账套。", parent=self)
             return
@@ -1830,22 +2080,29 @@ class App(tk.Toplevel):
         ReviewRulesDialog(self)
 
     def open_reconciliation(self) -> None:
+        if self.import_busy or self.review_panel.preparing:
+            self.status.set("请完成或取消当前本地处理后再修改账套设置。")
+            return
         if not self.store:
             messagebox.showinfo("先选择项目", "请先新建或打开本地项目。", parent=self)
             return
         ReconciliationDialog(self)
 
     def open_related_parties(self) -> None:
+        if self.import_busy or self.review_panel.preparing:
+            self.status.set("请完成或取消当前本地处理后再修改账套设置。")
+            return
         if not self.store:
             messagebox.showinfo("先选择项目", "请先新建或打开本地项目。", parent=self)
             return
         RelatedPartiesDialog(self)
 
     def _close(self) -> None:
+        for dialog in list(self.voucher_windows | self.review_windows):
+            if dialog.winfo_exists() and not dialog.request_close():
+                return
         self.review_panel.cancel()
-        for dialog in list(self.voucher_windows):
-            if dialog.winfo_exists():
-                dialog.destroy()
+        self.tasks.cancel_all()
         if self.store:
             self.store.close()
             self.controller.book_windows.pop(self.store.path.resolve(), None)
@@ -1872,11 +2129,20 @@ class App(tk.Toplevel):
         if not self.store:
             self.status.set("当前没有打开的账套。")
             return
+        for dialog in list(self.voucher_windows | self.review_windows):
+            if dialog.winfo_exists() and not dialog.request_close():
+                return
         self.review_panel.cancel()
-        for dialog in list(self.voucher_windows):
-            if dialog.winfo_exists():
-                dialog.destroy()
         self.voucher_windows.clear()
+        for child in list(self.winfo_children()):
+            if isinstance(child, (ImportDialog, BatchImportDialog)):
+                child.destroy()
+        self.tasks.cancel_all()
+        self.import_busy = False
+        self.import_owner = None
+        self._checks_cache = None
+        self._check_render_token = None
+        self._summary_render_token = None
         self.controller.book_windows.pop(self.store.path.resolve(), None)
         self.store.close()
         self.store = None
@@ -1909,6 +2175,12 @@ class App(tk.Toplevel):
             messagebox.showerror("打开失败", str(exc), parent=self)
             return
         self.store = new_store
+        self.detail_offset = self.detail_total = 0
+        self._checks_cache = None
+        self._check_render_token = None
+        self._summary_render_token = None
+        self.review_panel._totals_cache = None
+        self.review_panel._stale_token = None
         name = path.stem
         self.book_name.set(name if len(name) <= 24 else name[:23] + "…")
         self.welcome.place_forget()
@@ -1932,6 +2204,9 @@ class App(tk.Toplevel):
         self._page_changed()
 
     def import_file(self) -> None:
+        if self.import_busy or self.review_panel.preparing:
+            self.status.set("请完成或取消当前本地处理后再导入其他表格。")
+            return
         chosen = filedialog.askopenfilenames(parent=self, title="选择表格（可多选文件）", filetypes=[("Excel/CSV", "*.xlsx *.xlsm *.xls *.csv"), ("所有文件", "*")])
         if chosen:
             if not self.store:
@@ -1982,6 +2257,9 @@ class App(tk.Toplevel):
             self.status.set(f"新账套将保存在：{self.controller.book_folder}")
 
     def delete_selected_source(self) -> None:
+        if self.import_busy or self.review_panel.preparing:
+            self.status.set("正在处理账套，请完成或取消当前任务后再移除来源。")
+            return
         if not self.store or not self.source_view.selection():
             messagebox.showinfo("先选择表格", "请在导入记录中选中要移除的工作表。", parent=self)
             return
@@ -1992,6 +2270,28 @@ class App(tk.Toplevel):
             return
         prompt = f'从当前账套移除“{source["filename"]} / {source["sheet"]}”的 {source["row_count"]} 行导入数据？\n\n原始文件不会删除；相关关注凭证的注释会保留，无法匹配时提示复核。'
         if not messagebox.askyesno("移除导入记录", prompt, parent=self):
+            return
+        if self.store.large_book():
+            self.import_busy = True
+            self.import_owner = self
+            path = self.store.path
+            self.status.set("正在移除所选来源；可继续浏览，退出账套可停止。")
+            def work(cancelled, report):
+                store = LedgerStore.connect_existing(path, readonly=False, cancelled=cancelled)
+                try:
+                    return store.delete_source(source_id)
+                finally:
+                    store.close()
+            def finish(_):
+                self.import_busy = False
+                self.import_owner = None
+                self.refresh_all()
+                self.status.set(f'已移除 {source["filename"]} / {source["sheet"]}；原始文件未改动。')
+            def failed(exc):
+                self.import_busy = False
+                self.import_owner = None
+                messagebox.showerror("移除失败", f"本次移除未完成，可重试。\n{exc}", parent=self)
+            self.tasks.submit('remove_source', work, finish, failed)
             return
         self.store.delete_source(source_id)
         self.refresh_all()
@@ -2024,15 +2324,40 @@ class App(tk.Toplevel):
         if not self.store:
             return
         chosen = filedialog.asksaveasfilename(parent=self, title="导出当前科目明细", defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if chosen:
+        if not chosen:
+            return
+        period_start, period_end = self._period_bounds()
+        filters = dict(account=self.account, search=self.search.get().strip(),
+            period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
+            sort_by=self.detail_sort, descending=self.detail_descending)
+        output, path = Path(chosen), self.store.path
+        def export(cancelled, report):
+            store = LedgerStore.connect_existing(path, cancelled=cancelled)
+            temporary = None
             try:
-                period_start, period_end = self._period_bounds()
-                count = self.store.export_entries(Path(chosen), self.account, self.search.get().strip(),
-                    period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
-                    sort_by=self.detail_sort, descending=self.detail_descending)
-                messagebox.showinfo("导出完成", f"已导出 {count} 行。", parent=self)
+                store.db.execute("BEGIN")
+                with tempfile.NamedTemporaryFile(dir=output.parent, suffix=".csv", delete=False) as handle:
+                    temporary = Path(handle.name)
+                count = store.export_entries(temporary, **filters)
+                check_cancelled(cancelled)
+                os.replace(temporary, output)
+                return count
+            finally:
+                store.close()
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        def done(count):
+            self.status.set(f"已导出全部 {count:,} 条匹配明细。")
+            messagebox.showinfo("导出完成", f"已导出 {count:,} 行。", parent=self)
+        if self.store.large_book():
+            self.status.set("正在导出全部匹配明细…")
+            self.tasks.submit('export', export, done,
+                lambda exc: messagebox.showerror("导出失败", f"原文件已保留。\n{exc}", parent=self))
+        else:
+            try:
+                done(export(Event(), lambda _: None))
             except Exception as exc:
-                messagebox.showerror("导出失败", str(exc), parent=self)
+                messagebox.showerror("导出失败", f"原文件已保留。\n{exc}", parent=self)
 
     def mark_selected_entry(self) -> None:
         if not self.store:
@@ -2044,6 +2369,13 @@ class App(tk.Toplevel):
         self.open_voucher(None, edit_attention=True)
 
     def refresh_marks(self, select_key: str | None = None) -> None:
+        self.tasks.cancel("marks")
+        if self.store and self.store.large_book():
+            self._read_task("marks", list_marks, lambda marks: self._render_marks(marks, select_key))
+        else:
+            self._render_marks(list_marks(self.store) if self.store else [], select_key)
+
+    def _render_marks(self, marks, select_key):
         self.mark_view.delete(*self.mark_view.get_children())
         self.mark_keys = {}
         self.mark_entry_ids = {}
@@ -2052,7 +2384,7 @@ class App(tk.Toplevel):
         if not self.store:
             return
         needle = self.mark_search.get().strip().lower()
-        for index, mark in enumerate(list_marks(self.store)):
+        for index, mark in enumerate(marks):
             lines = mark["lines"]
             if lines:
                 first = lines[0]
@@ -2144,7 +2476,7 @@ class App(tk.Toplevel):
 
     def clear_summary_filter(self) -> None:
         self.summary_search.set("")
-        self.refresh_all()
+        self.refresh_summary()
 
     def clear_filter(self) -> None:
         self.search.set("")
@@ -2203,13 +2535,16 @@ class App(tk.Toplevel):
         self.refresh_details()
 
     def refresh_all(self) -> None:
-        self.balance_tools.reset_selection()
-        self.balance_calc_sources.clear()
-        for view in (self.summary_view, self.detail_view, self.check_view, self.source_view, self.mark_view):
+        for view in (self.source_view, self.mark_view):
             view.delete(*view.get_children())
         for view in self.report_views.values():
             view.delete(*view.get_children())
         if not self.store:
+            for view in (self.summary_view, self.detail_view, self.check_view):
+                view.delete(*view.get_children())
+            self.detail_tools.reset_selection()
+            self.balance_tools.reset_selection()
+            self.balance_calc_sources.clear()
             return
         self.period_options = {f"{year}年{period}期": (year, period) for year, period in self.store.periods()}
         period_values = ("不限", *self.period_options)
@@ -2223,8 +2558,56 @@ class App(tk.Toplevel):
         self.balance_combo.configure(values=tuple(self.balance_options) if self.balance_options else ("无余额表",))
         if self.balance_source.get() not in self.balance_options:
             self.balance_source.set(next(reversed(self.balance_options)) if self.balance_options else "无余额表")
+        self.refresh_summary()
+        self.refresh_details()
+        for kind in REPORT_KINDS:
+            report_sources = [source for source in self.store.sources() if source["kind"] == kind]
+            self.report_options[kind] = {f'{source["id"]}: {source["filename"]} / {source["sheet"]}': source["id"] for source in report_sources}
+            self.report_combos[kind].configure(values=tuple(self.report_options[kind]) if self.report_options[kind] else ("无报表",))
+            if self.report_source[kind].get() not in self.report_options[kind]:
+                self.report_source[kind].set(next(reversed(self.report_options[kind])) if self.report_options[kind] else "无报表")
+            self.refresh_report(kind)
+        self.refresh_checks()
+        for row in self.store.sources():
+            kind_label = {"entry": "明细", "balance": "科目余额", **REPORT_LABELS}.get(row["kind"], row["kind"])
+            record = self.store.precheck_for_source(row["id"])
+            precheck_label = record["verdict"] if record is not None else "无历史预检报告（旧版导入）"
+            self.source_view.insert("", "end", iid=str(row["id"]), values=(row["filename"], row["sheet"], kind_label, row["row_count"], precheck_label, row["sha256"], row["original_path"]))
+        self.refresh_marks()
+        self.status.set(f"当前项目：{self.store.path.name}  ·  已导入 {len(self.store.sources())} 张表  ·  双击科目看明细，双击明细看凭证")
+
+    def _read_task(self, key, operation, done):
+        path = self.store.path
+        def work(cancelled, report):
+            store = LedgerStore.connect_existing(path, cancelled=cancelled)
+            try:
+                store.db.execute("BEGIN")
+                return operation(store)
+            finally:
+                store.close()
+        self.tasks.submit(key, work, done,
+            lambda exc: self.status.set(f"读取失败，可重试：{exc}"))
+
+    def refresh_summary(self):
+        if not self.store:
+            return
         selected_balance = self.balance_options.get(self.balance_source.get())
-        summary_rows = self.store.summary(self.summary_search.get().strip(), selected_balance)
+        search = self.summary_search.get().strip()
+        self.balance_tools.reset_selection()
+        self._summary_render_token = None
+        self.tasks.cancel("summary")
+        def render(found):
+            self._render_summary(found)
+        if self.store.large_book():
+            self._read_task("summary", lambda store: store.summary(search, selected_balance), render)
+        else:
+            render(self.store.summary(search, selected_balance))
+
+    def _render_summary(self, summary_rows):
+        self.summary_view.delete(*self.summary_view.get_children())
+        self.balance_calc_sources.clear()
+        expansion_mode = self.store.setting("account_expansion_mode", "none")
+        expanded = set(json.loads(self.store.setting("expanded_accounts", "[]"))) if expansion_mode == "custom" else set()
         by_code = {row["code"]: row for row in summary_rows if row["code"]}
         parent_keys = {}
         counts = {row["key"]: row["detail_count"] for row in summary_rows}
@@ -2237,37 +2620,59 @@ class App(tk.Toplevel):
             while ancestor:
                 counts[ancestor] += row["detail_count"]
                 ancestor = parent_keys[ancestor]
-        expansion_mode = self.store.setting("account_expansion_mode", "none")
-        expanded = set(json.loads(self.store.setting("expanded_accounts", "[]"))) if expansion_mode == "custom" else set()
-        for row in summary_rows:
-            # When no supplied balance table exists, show computed period movement only.
-            origin = self.balance_source.get() if row["balance_count"] else "已导入明细汇总"
-            self.balance_calc_sources[row["key"]] = f'{origin} · 科目 {row["code"]} {row["name"]}'
-            pd = row["reported_debit"] if row["balance_count"] else row["detail_debit"]
-            pc = row["reported_credit"] if row["balance_count"] else row["detail_credit"]
-            side_tag = "debit_row" if row["closing_debit"] and not row["closing_credit"] else "credit_row" if row["closing_credit"] and not row["closing_debit"] else ""
-            tags = tuple(filter(None, ("account_parent" if counts[row["key"]] > row["detail_count"] else "", side_tag)))
-            self.summary_view.insert(parent_keys[row["key"]], "end", iid=row["key"], open=expansion_mode == "all" or row["key"] in expanded,
-                                     values=(row["code"], row["name"], amount(row["opening_debit"]), amount(row["opening_credit"]), amount(pd), amount(pc), amount(row["year_debit"]), amount(row["year_credit"]), amount(row["closing_debit"]), amount(row["closing_credit"]), counts[row["key"]]), tags=tags)
-        self._expansion_labels()
-        self.refresh_details()
-        for kind in REPORT_KINDS:
-            report_sources = [source for source in self.store.sources() if source["kind"] == kind]
-            self.report_options[kind] = {f'{source["id"]}: {source["filename"]} / {source["sheet"]}': source["id"] for source in report_sources}
-            self.report_combos[kind].configure(values=tuple(self.report_options[kind]) if self.report_options[kind] else ("无报表",))
-            if self.report_source[kind].get() not in self.report_options[kind]:
-                self.report_source[kind].set(next(reversed(self.report_options[kind])) if self.report_options[kind] else "无报表")
-            self.refresh_report(kind)
-        for f in run_checks(self.store):
-            tag = "difference" if f.level == "差异" else "pending" if f.level == "待核" else ""
-            self.check_view.insert("", "end", values=(f.level, f.category, f.subject, f.detail), tags=(tag,) if tag else ())
-        for row in self.store.sources():
-            kind_label = {"entry": "明细", "balance": "科目余额", **REPORT_LABELS}.get(row["kind"], row["kind"])
-            record = self.store.precheck_for_source(row["id"])
-            precheck_label = record["verdict"] if record is not None else "无历史预检报告（旧版导入）"
-            self.source_view.insert("", "end", iid=str(row["id"]), values=(row["filename"], row["sheet"], kind_label, row["row_count"], precheck_label, row["sha256"], row["original_path"]))
-        self.refresh_marks()
-        self.status.set(f"当前项目：{self.store.path.name}  ·  已导入 {len(self.store.sources())} 张表  ·  双击科目看明细，双击明细看凭证")
+        chunk_size = len(summary_rows) if len(summary_rows) <= 1000 else 150
+        self._summary_render_token = token = object()
+        parents = set(parent_keys.values())
+        def append(start=0):
+            if not self.winfo_exists() or self._summary_render_token is not token:
+                return
+            for row in summary_rows[start:start + chunk_size]:
+                # When no supplied balance table exists, show computed period movement only.
+                origin = self.balance_source.get() if row["balance_count"] else "已导入明细汇总"
+                self.balance_calc_sources[row["key"]] = f'{origin} · 科目 {row["code"]} {row["name"]}'
+                pd = row["reported_debit"] if row["balance_count"] else row["detail_debit"]
+                pc = row["reported_credit"] if row["balance_count"] else row["detail_credit"]
+                side_tag = "debit_row" if row["closing_debit"] and not row["closing_credit"] else "credit_row" if row["closing_credit"] and not row["closing_debit"] else ""
+                tags = tuple(filter(None, ("account_parent" if counts[row["key"]] > row["detail_count"] else "", side_tag)))
+                self.summary_view.insert(parent_keys[row["key"]], "end", iid=row["key"], text=("收起" if expansion_mode == "all" or row["key"] in expanded else "展开") if row["key"] in parents else "", open=expansion_mode == "all" or row["key"] in expanded,
+                                         values=(row["code"], row["name"], amount(row["opening_debit"]), amount(row["opening_credit"]), amount(pd), amount(pc), amount(row["year_debit"]), amount(row["year_credit"]), amount(row["closing_debit"]), amount(row["closing_credit"]), counts[row["key"]]), tags=tags)
+            if start + chunk_size < len(summary_rows):
+                self.after(1, append, start + chunk_size)
+            else:
+                self.summary_view.dashed_grid.schedule()
+                self.balance_tools.structure_changed()
+        append()
+
+    def refresh_checks(self):
+        if not self.store:
+            return
+        token = (self.store.setting("data_revision", "0"), tuple((row["id"], row["sha256"], row["row_count"], row["imported_at"]) for row in self.store.sources()),
+                 self.store.setting("reconciliation_plan"))
+        if self._checks_cache and self._checks_cache[0] == token:
+            if not self.store.large_book() or self.utility_windows["核对提醒"].winfo_ismapped():
+                self._render_checks(self._checks_cache[1])
+            return
+        def render(findings):
+            self._checks_cache = (token, findings)
+            if not self.store.large_book() or self.utility_windows["核对提醒"].winfo_ismapped():
+                self._render_checks(findings)
+        if self.store.large_book():
+            self._read_task("checks", run_checks, render)
+        else:
+            render(run_checks(self.store))
+
+    def _render_checks(self, findings):
+        self.check_view.delete(*self.check_view.get_children())
+        self._check_render_token = token = object()
+        def append(start=0):
+            if not self.winfo_exists() or self._check_render_token is not token:
+                return
+            for f in findings[start:start + 150]:
+                tag = "difference" if f.level == "差异" else "pending" if f.level == "待核" else ""
+                self.check_view.insert("", "end", values=(f.level, f.category, f.subject, f.detail), tags=(tag,) if tag else ())
+            if start + 150 < len(findings):
+                self.after(1, append, start + 150)
+        append()
 
     def refresh_report(self, kind: str) -> None:
         view = self.report_views[kind]
@@ -2373,26 +2778,71 @@ class App(tk.Toplevel):
         self.refresh_details()
         self.tabs.select(1)
 
+    @staticmethod
+    def _flow_bar(container, first, second):
+        if container.winfo_width() < first.winfo_reqwidth() + second.winfo_reqwidth() + 12:
+            second.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        else:
+            second.grid(row=0, column=1, columnspan=1, sticky="e", pady=0)
+
+    def _resize_detail_controls(self, event=None):
+        width = self.detail_controls.winfo_width()
+        required = self.keyword_controls.winfo_reqwidth() + self.period_controls.winfo_reqwidth() + 12
+        if width < required:
+            self.period_controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        else:
+            self.period_controls.grid(row=0, column=1, columnspan=1, sticky="e", pady=0)
+
+    def change_detail_page(self, direction):
+        self.detail_offset = max(0, self.detail_offset + direction * 500)
+        self.refresh_details()
+
     def refresh_details(self) -> None:
+        self.tasks.cancel("details")
         self.detail_tools.reset_selection()
         self.detail_view.delete(*self.detail_view.get_children())
         if not self.store:
             return
         period_start, period_end = self._period_bounds()
-        rows_found = self.store.entries(account=self.account, search=self.search.get().strip(),
+        filters = dict(account=self.account, search=self.search.get().strip(),
             period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
             sort_by=self.detail_sort, descending=self.detail_descending)
-        marked_keys = {row["voucher_key"] for row in self.store.db.execute("SELECT voucher_key FROM voucher_marks")}
-        parties = self.store.related_parties()
+        scope = json.dumps(filters, sort_keys=True)
+        if scope != getattr(self, "_detail_scope", None):
+            self.detail_offset = 0
+        self._detail_scope = scope
+        offset = self.detail_offset
+        def query(store):
+            page = store.entries_page(**filters, offset=offset)
+            marked = {row["voucher_key"] for row in store.db.execute("SELECT voucher_key FROM voucher_marks")}
+            parties = build_party_index(store.related_parties())
+            return page, marked, parties
+        self.detail_prev.configure(state="disabled")
+        self.detail_next.configure(state="disabled")
+        if self.store.large_book():
+            self.detail_info.set("正在读取明细…")
+            self._read_task("details", query, self._render_details)
+        else:
+            self._render_details(query(self.store))
+
+    def _render_details(self, result):
+        (rows_found, total, offset), marked_keys, party_index = result
+        self.detail_total, self.detail_offset = total, offset
+        self.detail_view.delete(*self.detail_view.get_children())
         for row in rows_found:
             side_tag = "debit_row" if row["debit_cents"] and not row["credit_cents"] else "credit_row" if row["credit_cents"] and not row["debit_cents"] else ""
             marked = voucher_key(row) in marked_keys
-            self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], related_party_match(row, parties), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
+            self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
         for key, title, _ in VIEW_COLUMNS["detail"]:
             arrow = (" ↓" if self.detail_descending else " ↑") if key == self.detail_sort else ""
             self.detail_view.heading(key, text=title + arrow)
-        count_label = "已显示前 3000 条，请缩小范围；导出包含全部匹配项" if len(rows_found) == 3000 else f"{len(rows_found)} 条明细"
-        self.detail_info.set(f"{count_label} · {self._period_label()} · 拖动框选合计、计数；Ctrl+C 复制；双击看凭证")
+        pages = max(1, (total + 499) // 500)
+        self.detail_page_label.set(f"第 {offset // 500 + 1} / {pages} 页")
+        self.detail_prev.configure(state="normal" if offset else "disabled")
+        self.detail_next.configure(state="normal" if offset + 500 < total else "disabled")
+        end = offset + len(rows_found)
+        shown = f"显示 {offset + 1}—{end} 条" if rows_found else "暂无匹配明细"
+        self.detail_info.set(f"共 {total:,} 条 · {shown} · {self._period_label()} · 选区统计仅含当前页，导出含全部匹配项")
 
     def open_account(self, _event: object) -> None:
         if _event is not None and self.summary_view.identify_column(_event.x) == '#0':
@@ -2446,7 +2896,7 @@ class App(tk.Toplevel):
                 visit(item)
         visit()
         self.summary_view.dashed_grid.schedule()
-        self.balance_tools.schedule()
+        self.balance_tools.structure_changed()
 
     def set_expansion(self, expanded: bool) -> None:
         if not self.store:
@@ -2478,8 +2928,8 @@ class App(tk.Toplevel):
             return
         if self.store.setting("voucher_open_mode", "replace") != "multiple":
             for old in list(self.voucher_windows):
-                if old.winfo_exists():
-                    old.destroy()
+                if old.winfo_exists() and not old.request_close():
+                    return
             self.voucher_windows.clear()
         target = lines[0]
         existing_mark = mark_for_entry(self.store, entry_id)
@@ -2523,18 +2973,20 @@ class App(tk.Toplevel):
         editor.pack(fill="x")
         if existing_mark:
             editor.insert("1.0", existing_mark["note"])
+        saved_state = (attention.get(), editor.get("1.0", "end-1c"))
         actions = ttk.Frame(note_area)
         actions.pack(fill="x", pady=(7, 0))
         feedback = tk.StringVar()
         ttk.Label(actions, textvariable=feedback, style="Hint.TLabel").pack(side="left")
-        def save_attention() -> None:
+        def save_attention() -> bool:
+            nonlocal saved_state
             try:
                 current = mark_for_entry(self.store, entry_id)
                 if attention.get():
                     if current:
                         current_status = next((item["status"] for item in list_marks(self.store) if item["key"] == current["voucher_key"]), "正常")
                         if current_status == "内容变化" and not messagebox.askyesno("确认凭证内容", "凭证内容与原标注时不同。确认已核对当前分录并继续关注吗？", parent=dialog):
-                            return
+                            return False
                     save_mark(self.store, entry_id, editor.get("1.0", "end-1c"))
                     feedback.set("已保存至关注凭证")
                 elif current:
@@ -2544,11 +2996,27 @@ class App(tk.Toplevel):
                     feedback.set("未关注此凭证")
             except Exception as exc:
                 messagebox.showerror("保存失败", str(exc), parent=dialog)
-                return
+                return False
             for item in view.get_children():
                 view.item(item, tags=("marked",) if attention.get() else ())
             self.refresh_details()
             self.refresh_marks(select_key=voucher_key(target) if attention.get() else None)
+            saved_state = (attention.get(), editor.get("1.0", "end-1c"))
+            return True
+
+        def request_close() -> bool:
+            current_state = (attention.get(), editor.get("1.0", "end-1c"))
+            if current_state != saved_state:
+                decision = messagebox.askyesnocancel("注释尚未保存",
+                    "这张凭证的关注或注释尚未保存。\n选择“是”保存，“否”放弃，“取消”继续编辑。", parent=dialog)
+                if decision is None or (decision and not save_attention()):
+                    return False
+            dialog.destroy()
+            return True
+
+        dialog.request_close = request_close
+        dialog.note_editor = editor
+        dialog.protocol("WM_DELETE_WINDOW", request_close)
         ttk.Button(actions, text="保存关注与注释", command=save_attention, style="Accent.TButton").pack(side="right")
         collapsed_label = "查看 / 编辑关注备注" if existing_mark else "关注这张凭证"
         note_height = 0
@@ -2572,8 +3040,8 @@ class App(tk.Toplevel):
                 editor.focus_set()
         toggle = ttk.Button(quick_actions, text=collapsed_label, command=toggle_notes)
         toggle.pack(side="left")
-        ttk.Button(quick_actions, text="关闭", command=dialog.destroy).pack(side="right")
-        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        ttk.Button(quick_actions, text="关闭", command=request_close).pack(side="right")
+        dialog.bind("<Escape>", lambda _event: request_close())
         dialog.update_idletasks()
         compact_height = min(440, max(240, dialog.winfo_reqheight()))
         dialog.geometry(f"760x{compact_height}")

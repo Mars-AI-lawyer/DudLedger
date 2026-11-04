@@ -5,7 +5,7 @@ from pathlib import Path
 from ledger_viewer.importer import ImportSpec, guess_header
 from ledger_viewer.related_parties import (party_names, party_entries_from_file, party_names_from_file,
                                            parse_party_lines, parse_party_names, parse_roles, party_roles,
-                                           related_party_match, role_grouped_names)
+                                           related_party_match, build_party_index, indexed_party_match, role_grouped_names)
 from ledger_viewer.store import LedgerStore
 
 
@@ -51,6 +51,19 @@ class RelatedPartiesTest(unittest.TestCase):
             self.assertEqual(other.related_parties(), [])
         finally:
             other.close()
+
+    def test_indexed_batch_matching_preserves_existing_match_semantics(self):
+        parties = [
+            {"name": "甲公司", "aliases_json": '["Ａ公司", "共同别名"]'},
+            {"name": "乙公司", "aliases_json": '["共同别名", "乙集团"]'},
+            {"name": "丙公司", "aliases_json": "无效 JSON"},
+        ]
+        index = build_party_index(parties)
+        for counterparty, auxiliary in (("a公司", ""), ("VEN00001/乙集团", ""),
+                                         ("共同别名", ""), ("甲公司", "乙公司"),
+                                         ("丙公司", "丙公司"), ("", ""), ("未知", "")):
+            row = {"counterparty": counterparty, "auxiliary": auxiliary}
+            self.assertEqual(indexed_party_match(row, index), related_party_match(row, parties))
 
     def test_party_names_flatten_aliases_without_notes_for_cloud_requests(self):
         self.store.save_related_party("乙公司", [])

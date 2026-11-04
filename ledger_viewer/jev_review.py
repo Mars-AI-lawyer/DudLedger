@@ -16,11 +16,12 @@ from queue import Queue
 from typesafe_sdk import Noul, TypeSafeClient, RetryPolicy
 
 from .analysis_api import iter_entries
+from .background import check_cancelled, cooperate
 from .dd_features import FeatureContext, closing_voucher, low_value_voucher, voucher_feature
 from .importer import format_money
 from .jev_rules import load_rules
 from .related_parties import party_names, role_grouped_names
-from .voucher_notes import voucher_key
+from .voucher_notes import voucher_key, voucher_lines_for_key
 from .jev_runtime import REQUEST_SLOTS
 
 SCHEMA = '''
@@ -195,7 +196,7 @@ def recover_interrupted(store):
         store.db.execute("UPDATE jev_batches SET status='interrupted' WHERE status='running'")
 
 
-def prepare_batch(store, scope: dict) -> int:
+def prepare_batch(store, scope: dict, *, cancelled=None, progress=None) -> int:
     """Save a complete local snapshot; never invokes the network or credentials."""
     version, rules = load_rules(store)
     feature_context = FeatureContext(store)
@@ -208,19 +209,29 @@ def prepare_batch(store, scope: dict) -> int:
         batch_id = store.db.execute('INSERT INTO jev_batches(rule_id,model,scope_json,snapshot_hash) VALUES(?,?,?,?)',
             (version, rules['model'], encode(scope), '')).lastrowid
         for row in iter_entries(store, **scope):
+            if cancelled is not None:
+                check_cancelled(cancelled)
             payload = send_fields(row)
             fp = fingerprint(row, payload)
             hashes.append(fp)
+            if cancelled is not None and len(hashes) % 250 == 0:
+                cooperate(cancelled)
+            if progress and len(hashes) % 1000 == 0:
+                progress(f"已整理 {len(hashes):,} 条分录")
             cache = ''
             store.db.execute('''INSERT INTO jev_results(batch_id,entry_id,voucher_key,local_json,input_json,fingerprint,cache_key)
                 VALUES(?,?,?,?,?,?,?)''', (batch_id, row['id'], voucher_key(row), encode(row), encode(payload), fp, cache))
         if not hashes:
             raise ValueError('选定范围没有分录')
-        all_groups = {}
-        for row in iter_entries(store):
-            all_groups.setdefault(voucher_key(row), []).append(row)
-        for group in iter_voucher_groups(store, batch_id):
-            voucher_rows = all_groups[group[0]['voucher_key']]
+        for number, group in enumerate(iter_voucher_groups(store, batch_id), 1):
+            if cancelled is not None:
+                check_cancelled(cancelled)
+                if number % 50 == 0:
+                    cooperate(cancelled)
+            if progress and number % 500 == 0:
+                progress(f"已计算 {number:,} 张凭证特征")
+            voucher_rows = ([json.loads(row['local_json']) for row in group] if not scope
+                            else voucher_lines_for_key(store, group[0]['voucher_key']))
             feature = voucher_feature(feature_context, voucher_rows)
             context = [json.loads(row['input_json']) for row in group]
             group_hash = digest([REQUEST_VERSION, context, grouped_parties, feature['facts'], basis_hash, version, rules, rules['model']])
@@ -237,6 +248,8 @@ def prepare_batch(store, scope: dict) -> int:
                     [(r['id'],) for r in group])
         store.db.execute('UPDATE jev_batches SET snapshot_hash=? WHERE id=?',
             (digest({'entries': hashes, 'parties': parties}), batch_id))
+        if cancelled is not None:
+            check_cancelled(cancelled)
     return batch_id
 
 
@@ -279,7 +292,10 @@ def batch_counts(store, batch_id) -> dict:
 
 
 def refresh_staleness(store, batch_id):
-    current = {row['id']: fingerprint(row, send_fields(row)) for row in iter_entries(store)}
+    current = {row['id']: fingerprint(row, send_fields(row)) for row in store.db.execute('''
+        SELECT e.*,a.code,a.name,s.sha256,s.original_path,s.sheet FROM jev_results r
+        JOIN entries e ON e.id=r.entry_id JOIN accounts a ON a.key=e.account_key
+        JOIN sources s ON s.id=e.source_id WHERE r.batch_id=?''', (batch_id,))}
     with store.db:
         for result in store.db.execute('SELECT id,entry_id,fingerprint,stale FROM jev_results WHERE batch_id=?', (batch_id,)).fetchall():
             stale = int(current.get(result['entry_id']) != result['fingerprint'])
@@ -706,27 +722,50 @@ def needs_review(row, threshold, tier=None):
     return has_topic_hit(row, threshold) or is_uncertain(row)
 
 
-def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', category='', period='', include_ignored=False):
+def voucher_totals(store):
+    """Count voucher membership in SQLite, without loading every ledger row."""
+    revision = store.setting('data_revision', '0')
+    cached = getattr(store, '_voucher_total_cache', None)
+    if cached and cached[0] == revision:
+        return cached[1]
+    expression = """CASE WHEN e.voucher_no<>'' AND e.fiscal_year<>'' AND e.period<>''
+        THEN json_array('period',e.fiscal_year,e.period,e.voucher_type,e.voucher_no)
+        WHEN e.voucher_no<>'' AND e.entry_date<>''
+        THEN json_array('date',e.entry_date,e.voucher_type,e.voucher_no)
+        ELSE json_array('row',s.original_path,s.sheet,e.row_no) END"""
+    totals = {row['key']: row['n'] for row in store.db.execute(
+        f"SELECT {expression} key,COUNT(*) n FROM entries e JOIN sources s ON s.id=e.source_id GROUP BY key")}
+    store._voucher_total_cache = (revision, totals)
+    return totals
+
+
+def voucher_result_context(store, batch_id, totals=None):
     info = batch_info(store, batch_id)
     if not info:
-        return []
+        return None
     rules = json.loads(info['body_json'])
-    # Threshold edits are local display controls; historical question/advice versions stay intact.
     _, display_rules = load_rules(store)
-    thresholds = display_rules['thresholds']
-    threshold = thresholds[tier]
-    notes = {r['voucher_key']: dict(r) for r in store.db.execute('SELECT * FROM jev_reviews')}
-    overrides = category_overrides(store)
-    totals = {}
-    for row in iter_entries(store):
-        key = voucher_key(row)
-        totals[key] = totals.get(key, 0) + 1
     groups = {}
-    for raw in store.db.execute('SELECT * FROM jev_results WHERE batch_id=? ORDER BY id', (batch_id,)):
+    for number, raw in enumerate(store.db.execute('SELECT * FROM jev_results WHERE batch_id=? ORDER BY id', (batch_id,)), 1):
+        cancelled = getattr(store, 'cancelled', None)
+        if cancelled is not None and number % 250 == 0:
+            cooperate(cancelled)
         row = dict(raw)
         row['local'] = json.loads(row['local_json'])
         row['themes'] = topic_labels(row, rules)
         groups.setdefault(row['voucher_key'], []).append(row)
+    return dict(info=dict(info), rules=rules, thresholds=display_rules['thresholds'],
+        notes={r['voucher_key']: dict(r) for r in store.db.execute('SELECT * FROM jev_reviews')},
+        overrides=category_overrides(store), totals=voucher_totals(store) if totals is None else totals, groups=groups)
+
+
+def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', category='', period='', include_ignored=False, *, context=None):
+    context = context if context is not None else voucher_result_context(store, batch_id)
+    if context is None:
+        return []
+    rules, thresholds = context['rules'], context['thresholds']
+    threshold = thresholds[tier]
+    notes, overrides, totals, groups = (context[key] for key in ('notes', 'overrides', 'totals', 'groups'))
     result = []
     for key, lines in groups.items():
         successful = [r for r in lines if r['status'] == 'success' and not r['stale']]

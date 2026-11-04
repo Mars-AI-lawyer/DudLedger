@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from queue import Empty, Queue
 from threading import Thread
 
+from .background import check_cancelled
+from .store import LedgerStore
 from .importer import format_money
 from .dd_features import load_basis_overrides, load_config, materiality_bases, save_basis_overrides, save_config
 from .jev_mapping import get_api_key
@@ -16,7 +19,7 @@ from .related_parties import party_names, role_grouped_names
 from .jev_review import (BOUNDARY, PRIORITY_LABELS, STATUS_LABELS, SEND_FIELDS,
     ReviewJob, active_job, batch_counts, batch_info, discard_preview,
     is_uncertain, prepare_batch, preview_page, recover_interrupted,
-    refresh_staleness, save_feedback, test_connection, voucher_results)
+    refresh_staleness, save_feedback, test_connection, voucher_results, voucher_result_context)
 
 CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、往来单位、辅助核算、非零一侧的借贷金额，'
     '以及当前账套尽调主体名单中的名称与身份（不含备注），发送至 TypeSafe 的 Jev 服务，'
@@ -325,6 +328,12 @@ class ReviewPanel(ttk.Frame):
         from .ui import tree
         self.app = app
         self.batch_id = None
+        self.preparing = False
+        self._totals_cache = None
+        self._stale_token = None
+        self._last_refresh = 0
+        self._rows_dirty = False
+        self.result_offset = 0
         self.job = None
         self.rows = {}
         self.batch_options = {}
@@ -389,6 +398,10 @@ class ReviewPanel(ttk.Frame):
         self.count_label = tk.StringVar()
         wrapped_label(bottom, textvariable=self.count_label).pack(side='left', fill='x', expand=True)
         ttk.Button(bottom, text='查看详情', command=self.open_detail).pack(side='right')
+        self.result_prev = ttk.Button(bottom, text='上一页', command=lambda: self._result_page(-1), state='disabled')
+        self.result_prev.pack(side='right', padx=3)
+        self.result_next = ttk.Button(bottom, text='下一页', command=lambda: self._result_page(1), state='disabled')
+        self.result_next.pack(side='right', padx=3)
         self._poll_id = self.after(200, self._poll)
         self.bind("<Destroy>", self._destroyed, add="+")
 
@@ -444,20 +457,56 @@ class ReviewPanel(ttk.Frame):
         if not self.app.store:
             messagebox.showinfo('请打开账套', '请先新建或打开账套并导入明细账。', parent=self)
             return
+        if self.app.import_busy or self.preparing:
+            self.progress.set('请完成或取消当前本地处理后再开始审查。')
+            return
         if active_job(self.app.store.path):
             messagebox.showinfo('审查正在运行', '当前账套同一时间只运行一个批次。', parent=self)
             return
         self.prepare({})
 
     def prepare(self, scope):
-        try:
-            batch_id = prepare_batch(self.app.store, scope)
-        except Exception as exc:
-            messagebox.showerror('无法生成预览', str(exc), parent=self)
+        if self.preparing or self.app.import_busy:
             return
-        ConsentDialog(self, batch_id)
+        if not self.app.store.large_book():
+            try:
+                batch_id = prepare_batch(self.app.store, scope)
+            except Exception as exc:
+                messagebox.showerror('无法生成预览', str(exc), parent=self)
+                return
+            ConsentDialog(self, batch_id)
+            return
+        self.preparing = True
+        self.start_button.configure(state='disabled')
+        self.cancel_button.configure(state='normal')
+        self.progress.set('正在本机生成完整发送预览；此阶段不会发送数据，可停止。')
+        path = self.app.store.path
+        def work(cancelled, report):
+            store = LedgerStore.connect_existing(path, readonly=False, cancelled=cancelled)
+            try:
+                return prepare_batch(store, scope, cancelled=cancelled, progress=report)
+            finally:
+                store.close()
+        def finish(batch_id):
+            self.preparing = False
+            self.start_button.configure(state='normal')
+            self.cancel_button.configure(state='disabled')
+            ConsentDialog(self, batch_id)
+        def failed(exc):
+            self.preparing = False
+            self.start_button.configure(state='normal')
+            self.cancel_button.configure(state='disabled')
+            self.progress.set(f'预览未完成，可重试：{exc}')
+        self.app.tasks.submit('review_prepare', work, finish, failed,
+            lambda value: self.progress.set(f'正在本机生成预览：{value}；尚未发送数据'))
 
     def cancel(self):
+        if self.preparing:
+            self.app.tasks.cancel('review_prepare')
+            self.preparing = False
+            self.start_button.configure(state='normal')
+            self.cancel_button.configure(state='disabled')
+            self.progress.set('已停止生成预览；未发送数据。')
         if self.app.store:
             job = active_job(self.app.store.path)
             if job:
@@ -475,7 +524,7 @@ class ReviewPanel(ttk.Frame):
 
     def refresh(self):
         store = self.app.store
-        if not store:
+        if not store or self.preparing or self.app.import_busy:
             return
         recover_interrupted(store)
         batches = store.db.execute("SELECT * FROM jev_batches WHERE status<>'preview' ORDER BY id DESC").fetchall()
@@ -485,16 +534,36 @@ class ReviewPanel(ttk.Frame):
             self.batch_id = batches[0]['id'] if batches else None
         self.batch.set(next((label for label, value in self.batch_options.items() if value == self.batch_id), '尚无审查批次'))
         self.tier.set(store.setting('jev_tier', '谨慎'))
+        if store.large_book() and not self._visible():
+            self._rows_dirty = True
+            return
         if self.batch_id is not None:
-            refresh_staleness(store, self.batch_id)
-            self._counts()
+            token = (store.path, self.batch_id, store.setting('data_revision', '0'))
+            if token != self._stale_token:
+                self._stale_token = token
+                if store.large_book():
+                    # Import/removal already invalidates affected snapshots. The
+                    # full fingerprint check is background-only and once per revision.
+                    path, batch_id = store.path, self.batch_id
+                    def work(cancelled, report):
+                        reader = LedgerStore.connect_existing(path, readonly=False, cancelled=cancelled)
+                        try:
+                            refresh_staleness(reader, batch_id)
+                        finally:
+                            reader.close()
+                    self.app.tasks.submit('review_stale', work, lambda _: self.refresh_rows(),
+                        lambda exc: self.progress.set(f'历史结果校验未完成：{exc}'))
+                else:
+                    refresh_staleness(store, self.batch_id)
         self.refresh_rows()
 
-    def _counts(self):
-        counts = batch_counts(self.app.store, self.batch_id)
-        info = batch_info(self.app.store, self.batch_id)
+    def _counts(self, counts=None, info=None):
+        counts = counts if counts is not None else batch_counts(self.app.store, self.batch_id)
+        info = info if info is not None else batch_info(self.app.store, self.batch_id)
+        if not info:
+            return
         running = active_job(self.app.store.path) is not None
-        self.start_button.configure(state='disabled' if running else 'normal')
+        self.start_button.configure(state='disabled' if running or self.preparing else 'normal')
         self.cancel_button.configure(state='normal' if running else 'disabled')
         total = counts['vouchers']
         done = counts['finished_vouchers']
@@ -506,29 +575,67 @@ class ReviewPanel(ttk.Frame):
         unfinished = counts['total'] - counts.get('success', 0) - counts.get('skipped', 0)
         self.lane_buttons['unfinished'].configure(text=f"失败／未分析（{unfinished}）／过期（{counts['stale']}）")
 
-    def refresh_rows(self):
-        old_items = set(self.view.get_children())
-        self.rows = {}
+    def _result_page(self, direction):
+        self.result_offset = max(0, self.result_offset + direction * 500)
+        self.refresh_rows(keep_page=True)
+
+    def refresh_rows(self, keep_page=False):
+        self.app.tasks.cancel('review_rows')
         if not self.app.store or self.batch_id is None:
-            self.view.delete(*old_items)
+            self.view.delete(*self.view.get_children())
+            self.rows = {}
             self.progress_bar.configure(maximum=1, value=0)
             self.count_label.set('尚无结果，点击“筛选全部凭证”开始。')
+            self.result_prev.configure(state='disabled')
+            self.result_next.configure(state='disabled')
             for child in self.category_frame.winfo_children():
                 child.destroy()
             return
-        info = batch_info(self.app.store, self.batch_id)
-        rules = json.loads(info['body_json']) if info else None
-        show_ignored = self.show_ignored.get()
-        category = self.category_ids.get(self.category.get(), '') if rules else ''
-        groups = voucher_results(self.app.store, self.batch_id, self.tier.get(), self.lane.get(), self.account.get().strip(),
-            category, '' if self.period.get() == '全部期间' else self.period.get(), show_ignored)
-        if rules:
-            # 分类计数始终按未选分类的候选全集计算，避免点击分类后计数条塌缩。
-            candidates = voucher_results(self.app.store, self.batch_id, self.tier.get(), 'candidates',
-                self.account.get().strip(), '', '' if self.period.get() == '全部期间' else self.period.get(), show_ignored)
-            self._render_category_bar(rules, self._category_counts(rules, candidates))
-        periods = [r[0] for r in self.app.store.db.execute("SELECT DISTINCT json_extract(local_json,'$.fiscal_year') || '/' || json_extract(local_json,'$.period') FROM jev_results WHERE batch_id=?", (self.batch_id,))]
-        self.period_combo.configure(values=['全部期间', *sorted(periods)])
+        if not keep_page:
+            self.result_offset = 0
+        self._last_refresh = time.monotonic()
+        self._rows_dirty = False
+        store, batch_id = self.app.store, self.batch_id
+        options = (self.tier.get(), self.lane.get(), self.account.get().strip(),
+            self.category_ids.get(self.category.get(), ''),
+            '' if self.period.get() == '全部期间' else self.period.get(), self.show_ignored.get())
+        cache = self._totals_cache
+        def query(reader):
+            revision = (reader.path, reader.setting('data_revision', '0'))
+            totals = cache[1] if cache and cache[0] == revision else None
+            context = voucher_result_context(reader, batch_id, totals)
+            if context is None:
+                return None
+            groups = voucher_results(reader, batch_id, *options, context=context)
+            tier, lane, account, category, period, ignored = options
+            candidates = groups if lane == 'candidates' and not category else voucher_results(
+                reader, batch_id, tier, 'candidates', account, '', period, ignored, context=context)
+            periods = sorted({f"{r['local']['fiscal_year']}/{r['local']['period']}"
+                for lines in context['groups'].values() for r in lines})
+            return groups, candidates, context['rules'], periods, batch_counts(reader, batch_id), context['info'], (revision, context['totals'])
+        if store.large_book():
+            self.count_label.set('正在本机更新线索…')
+            self.app._read_task('review_rows', query, self._render_rows)
+        else:
+            self._render_rows(query(store))
+
+    def _render_rows(self, result):
+        if result is None:
+            return
+        groups, candidates, rules, periods, counts, info, self._totals_cache = result
+        self._counts(counts, info)
+        if self.app.store.large_book() and not self._visible():
+            self._rows_dirty = True
+            return
+        self._render_category_bar(rules, self._category_counts(rules, candidates))
+        self.period_combo.configure(values=['全部期间', *periods])
+        total = len(groups)
+        self.result_offset = min(self.result_offset, max(0, (total - 1) // 500 * 500))
+        groups = groups[self.result_offset:self.result_offset + 500]
+        self.result_prev.configure(state='normal' if self.result_offset else 'disabled')
+        self.result_next.configure(state='normal' if self.result_offset + 500 < total else 'disabled')
+        old_items = set(self.view.get_children())
+        self.rows = {}
         for index, group in enumerate(groups):
             item = group['key']
             self.rows[item] = group
@@ -553,12 +660,15 @@ class ReviewPanel(ttk.Frame):
                 self.view.insert('', 'end', iid=item, values=values)
             self.view.move(item, '', index)
         self.view.delete(*old_items)
-        self.count_label.set(f'显示 {len(groups)} 张 · 双击查看分类、完整凭证与 AI 返回结果，并可关注凭证。查看优先级是尽调相关程度，不是法律风险评级。')
+        self.count_label.set(f'共 {total:,} 张 · 第 {self.result_offset // 500 + 1}/{max(1, (total + 499) // 500)} 页 · 双击查看完整凭证。查看优先级不是法律风险评级。')
 
     def open_detail(self, _event=None):
         selected = self.view.selection()
         if selected:
             ReviewDetail(self, self.rows[selected[0]])
+
+    def _visible(self):
+        return self.app.tabs.index('current') == 5
 
     def _poll(self):
         if self.app.store:
@@ -575,12 +685,19 @@ class ReviewPanel(ttk.Frame):
                             messagebox.showerror('审查中断', value, parent=self)
                 except Empty:
                     pass
+                self._rows_dirty |= changed
                 if done:
                     self.job = None
-                    self.refresh()
-                elif changed and self.batch_id == job.batch_id:
-                    self._counts()
-                    self.refresh_rows()
+                    if self._visible():
+                        self.refresh()
+                    else:
+                        self.progress.set('本批次已结束；打开 AI 尽调线索可查看最新结果。')
+                elif self._rows_dirty and self.batch_id == job.batch_id and time.monotonic() - self._last_refresh >= 1:
+                    if self._visible():
+                        if not self.app.tasks.busy('review_rows'):
+                            self.refresh_rows(keep_page=True)
+                    else:
+                        self.progress.set('正在后台审查；返回本页后更新线索。')
         self._poll_id = self.after(250, self._poll)
 
 
@@ -593,6 +710,8 @@ class ReviewDetail(tk.Toplevel):
         from .voucher_notes import list_marks, mark_for_entry, remove_mark, save_mark
         self._mark_tools = (mark_for_entry, remove_mark, save_mark, list_marks)
         self.panel, self.app, self.group = panel, panel.app, group
+        self.app.review_windows.add(self)
+        self.bind('<Destroy>', lambda event: self.app.review_windows.discard(self) if event.widget is self else None, add='+')
         self.store = self.app.store
         local = group['hits'][0]['local']
         voucher_title = f"{local['fiscal_year']}年{local['period']}期 {local['voucher_type']}{local['voucher_no']}" if local['voucher_no'] else '无凭证号来源行'
@@ -627,7 +746,7 @@ class ReviewDetail(tk.Toplevel):
         self.json_button.pack(side='left')
         self.ignore_var = tk.BooleanVar(value=group['feedback'] == 'ignore')
         ttk.Checkbutton(self.actions, text='忽略此线索', variable=self.ignore_var, command=self._save_ignore).pack(side='left', padx=(16, 0))
-        ttk.Button(self.actions, text='关闭', command=self.destroy).pack(side='right')
+        ttk.Button(self.actions, text='关闭', command=self.request_close).pack(side='right')
         collapsed = '查看 / 编辑关注备注' if existing_mark else '关注这张凭证'
         self.note_toggle = ttk.Button(self.actions, text=collapsed, command=self._toggle_notes, style='Accent.TButton')
         self.note_toggle.pack(side='right', padx=8)
@@ -638,12 +757,23 @@ class ReviewDetail(tk.Toplevel):
         self.note.pack(fill='x')
         if existing_mark:
             self.note.insert('1.0', existing_mark['note'])
+        self._saved_note = (self.attention.get(), self.note.get('1.0', 'end-1c'))
         self.feedback = tk.StringVar()
         ttk.Label(self.note_area, textvariable=self.feedback, foreground='#555').pack(anchor='w')
         ttk.Button(self.note_area, text='保存关注与注释', command=self._save_attention, style='Accent.TButton').pack(anchor='e', pady=(6, 0))
         self.json_area = ttk.Frame(self)
         self.json_text = None
-        self.bind('<Escape>', lambda _event: self.destroy())
+        self.bind('<Escape>', lambda _event: self.request_close())
+        self.protocol('WM_DELETE_WINDOW', self.request_close)
+
+    def request_close(self):
+        if (self.attention.get(), self.note.get('1.0', 'end-1c')) != self._saved_note:
+            decision = messagebox.askyesnocancel('注释尚未保存',
+                '这张凭证的关注或注释尚未保存。\n选择“是”保存，“否”放弃，“取消”继续编辑。', parent=self)
+            if decision is None or (decision and not self._save_attention()):
+                return False
+        self.destroy()
+        return True
 
     def _toggle_json(self):
         if self.json_text is not None and self.json_text.winfo_manager():
@@ -697,7 +827,7 @@ class ReviewDetail(tk.Toplevel):
                 if current:
                     status = next((item['status'] for item in _list_marks(self.store) if item['key'] == current['voucher_key']), '正常')
                     if status == '内容变化' and not messagebox.askyesno('确认凭证内容', '凭证内容与原标注时不同。确认已核对当前分录并继续关注吗？', parent=self):
-                        return
+                        return False
                 save_mark(self.store, self.entry_id, self.note.get('1.0', 'end-1c'))
                 self.feedback.set('已保存至关注凭证')
             elif current:
@@ -707,11 +837,13 @@ class ReviewDetail(tk.Toplevel):
                 self.feedback.set('未关注此凭证')
         except Exception as exc:
             messagebox.showerror('保存失败', str(exc), parent=self)
-            return
+            return False
         self.app.refresh_details()
         self.app.refresh_marks()
         for item in self.voucher_view.get_children():
             self.voucher_view.item(item, tags=('marked',) if self.attention.get() else ())
+        self._saved_note = (self.attention.get(), self.note.get('1.0', 'end-1c'))
+        return True
 
     def _save_ignore(self):
         save_feedback(self.store, self.group['key'], 'ignore' if self.ignore_var.get() else '')

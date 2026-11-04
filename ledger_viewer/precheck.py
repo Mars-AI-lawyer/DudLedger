@@ -140,7 +140,7 @@ def _row_excerpt(row: list[object], limit: int = 6) -> str:
     return " | ".join(cell for cell in cells if cell) or "（空行）"
 
 
-def _raw_excerpts(spec: ImportSpec, wanted: set[int]) -> dict[int, str]:
+def _raw_excerpts(spec: ImportSpec, wanted: set[int], cancelled=None) -> dict[int, str]:
     """单次扫描收集指定行的原单元格摘录，供疑点表展示“原单元格”。"""
     excerpts: dict[int, str] = {}
     if not wanted:
@@ -148,6 +148,11 @@ def _raw_excerpts(spec: ImportSpec, wanted: set[int]) -> dict[int, str]:
     last = max(wanted)
     try:
         for row_no, row in rows(spec.path, spec.sheet):
+            if cancelled is not None:
+                from .background import check_cancelled, cooperate
+                check_cancelled(cancelled)
+                if row_no % 250 == 0:
+                    cooperate(cancelled)
             if row_no in wanted:
                 excerpts[row_no] = _row_excerpt(row)
             if row_no >= last:
@@ -157,10 +162,10 @@ def _raw_excerpts(spec: ImportSpec, wanted: set[int]) -> dict[int, str]:
     return excerpts
 
 
-def precheck(spec: ImportSpec) -> PrecheckResult:
+def precheck(spec: ImportSpec, *, cancelled=None, progress=None) -> PrecheckResult:
     """完整解析所选表格：每一行都有去向；关键解析错误记为 critical 疑点。"""
-    fingerprint = file_hash(spec.path)
-    formulas = formula_cells(spec.path, spec.sheet) if spec.path.suffix.lower() in (".xlsx", ".xlsm") else {}
+    fingerprint = file_hash(spec.path, cancelled=cancelled)
+    formulas = formula_cells(spec.path, spec.sheet, cancelled=cancelled) if spec.path.suffix.lower() in (".xlsx", ".xlsm") else {}
     stats = PrecheckStats(header_row=spec.header_row)
     issues: list[PrecheckIssue] = []
     pending_rows: list[int] = []
@@ -170,8 +175,10 @@ def precheck(spec: ImportSpec) -> PrecheckResult:
     debit_total = credit_total = 0
     pending_decisions: list[RowDecision] = []
     warning_decisions: list[tuple[RowDecision, str]] = []
-    for decision in classify_rows(spec, formulas):
+    for decision in classify_rows(spec, formulas, cancelled=cancelled):
         stats.rows_seen += 1
+        if progress and stats.rows_seen % 1000 == 0:
+            progress(stats.rows_seen)
         if decision.disposition == DISPOSITION_IMPORT:
             stats.imported_rows += 1
             stats.first_row = stats.first_row or decision.row_no
@@ -203,7 +210,7 @@ def precheck(spec: ImportSpec) -> PrecheckResult:
                 samples.append(decision)
     stats.debit_cents, stats.credit_cents = debit_total, credit_total
 
-    excerpts = _raw_excerpts(spec, {decision.row_no for decision in pending_decisions} | {decision.row_no for decision, _ in warning_decisions})
+    excerpts = _raw_excerpts(spec, {decision.row_no for decision in pending_decisions} | {decision.row_no for decision, _ in warning_decisions}, cancelled)
     for decision in pending_decisions:
         issues.append(PrecheckIssue(SEVERITY_CRITICAL, decision.reason, row_no=decision.row_no,
                                     raw=excerpts.get(decision.row_no, ""), interpretation="暂不导入，等待处理",
@@ -214,7 +221,10 @@ def precheck(spec: ImportSpec) -> PrecheckResult:
                                     action="请核对原表；也可返回调整列设置"))
 
     if spec.kind not in REPORT_KINDS:
-        issues.extend(_unmapped_amount_columns(spec, header_labels))
+        issues.extend(_unmapped_amount_columns(spec, header_labels, cancelled))
+    if cancelled is not None:
+        from .background import check_cancelled
+        check_cancelled(cancelled)
     if stats.imported_rows == 0 and stats.pending_rows == 0:
         issues.append(PrecheckIssue(SEVERITY_CRITICAL, "没有识别到任何可导入的数据行，请检查表头和列映射", action="返回调整表头行或列设置"))
     return PrecheckResult(spec, fingerprint, stats, issues, pending_rows, samples)
@@ -230,7 +240,7 @@ def _header_labels(spec: ImportSpec) -> dict[int, str]:
     return {index: f"第 {index + 1} 列「{name or '(空)'}」" for index, name in enumerate(headers)}
 
 
-def _unmapped_amount_columns(spec: ImportSpec, header_labels: dict[int, str]) -> list[PrecheckIssue]:
+def _unmapped_amount_columns(spec: ImportSpec, header_labels: dict[int, str], cancelled=None) -> list[PrecheckIssue]:
     """未映射但看起来装着金额的列：可能是漏掉的借贷/余额列，提示核对。"""
     issues: list[PrecheckIssue] = []
     from .importer import _norm
@@ -244,6 +254,11 @@ def _unmapped_amount_columns(spec: ImportSpec, header_labels: dict[int, str]) ->
     stats: dict[int, list[int]] = {}
     try:
         for _row_no, row in rows(spec.path, spec.sheet):
+            if cancelled is not None:
+                from .background import check_cancelled, cooperate
+                check_cancelled(cancelled)
+                if _row_no % 250 == 0:
+                    cooperate(cancelled)
             for index in range(min(len(row), 60)):
                 if index in mapped or index in numeric_only:
                     continue

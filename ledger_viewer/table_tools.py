@@ -109,6 +109,7 @@ class TableTools:
         self.anchor: tuple[str, str] | None = None
         self.column_order = ()
         self.summary = SelectionSummary()
+        self.summary_dirty = False
         self.dragging = False
         self.drag_point = (0, 0)
         self.scroll_job = None
@@ -321,6 +322,7 @@ class TableTools:
             self.anchor = (row, column)
             self.column_order = self.columns()
         self.active = (row, column)
+        self.summary_dirty = True
         if refresh:
             self.row_cache.clear()
             self._update_summary()
@@ -378,6 +380,7 @@ class TableTools:
                     summary.numbers += 1
         summary.total = numbers.total
         self.summary = summary
+        self.summary_dirty = False
         stats = f"合计 {display_number(summary.total)}   计数 {summary.count}   金额 {summary.numbers} 项"
         self.stats.set(stats)
         self.selected.set(f"已选 {summary.numbers} 项金额 · 计数 {summary.count}")
@@ -531,6 +534,7 @@ class TableTools:
         self.anchor = None
         self.row_cache.clear()
         self.summary = SelectionSummary()
+        self.summary_dirty = False
         self.stats.set("拖动框选，自动合计与计数；Ctrl+C / ⌘C 复制选区")
         self.selected.set("拖动框选一段金额")
         self.selection_total.set("—")
@@ -545,24 +549,39 @@ class TableTools:
         if self.job is None:
             self.job = self.view.after_idle(self._draw)
 
+    def structure_changed(self):
+        """Invalidate statistics when visible rows change, without taxing scrolling."""
+        self.row_cache.clear()
+        self.summary_dirty = True
+        self.schedule()
+
     def _draw(self):
         self.job = None
         for border in self.borders:
             border.place_forget()
-        self._update_summary()
+        if self.summary_dirty:
+            self._update_summary()
         rows, columns = self.selection_range()
         if not rows:
+            if self.anchor is not None:
+                self.reset_selection()
             return
-        visible = [self.view.bbox(row, columns[0]) for row in rows]
-        visible = [box for box in visible if box and box[1] < self.view.winfo_height() and box[1] + box[3] > 0]
+        selected_rows = set(rows)
+        visible = []
+        for point in range(1, self.view.winfo_height(), 4):
+            row = self.view.identify_row(point)
+            if row in selected_rows and (not visible or row != visible[-1]):
+                visible.append(row)
         if not visible:
             return
-        x, y, width, _ = visible[0]
-        last_box = self.view.bbox(self.view.identify_row(y + 2), columns[-1])
-        if not last_box:
+        first_box = self.view.bbox(visible[0], columns[0])
+        last_box = self.view.bbox(visible[0], columns[-1])
+        bottom_box = self.view.bbox(visible[-1], columns[0])
+        if not first_box or not last_box or not bottom_box:
             return
+        x, y, width, _ = first_box
         width = last_box[0] + last_box[2] - x
-        height = min(self.view.winfo_height() - 1, visible[-1][1] + visible[-1][3]) - y
+        height = min(self.view.winfo_height() - 1, bottom_box[1] + bottom_box[3]) - y
         # Clip borders to the viewport, including partially scrolled cells.
         right = min(self.view.winfo_width() - 1, x + width)
         x = max(1, x)

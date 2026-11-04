@@ -78,6 +78,28 @@ def related_party_match(row, parties: list) -> str:
     return matched[0]["name"] if matched else ""
 
 
+def build_party_index(parties: list) -> dict[str, list[tuple[int, str]]]:
+    """Prepare names once for a batch of rows, preserving ambiguous matches."""
+    index: dict[str, list[tuple[int, str]]] = {}
+    for number, party in enumerate(parties):
+        try:
+            aliases = json.loads(party["aliases_json"])
+        except (TypeError, ValueError):
+            aliases = []
+        names = {normalized_name(party["name"]), *(normalized_name(alias) for alias in aliases if isinstance(alias, str))}
+        for name in names:
+            index.setdefault(name, []).append((number, party["name"]))
+    return index
+
+
+def indexed_party_match(row, index: dict[str, list[tuple[int, str]]]) -> str:
+    matched = {number: name for token in party_tokens(row["counterparty"]) | party_tokens(row["auxiliary"])
+               for number, name in index.get(token, ())}
+    if len(matched) > 1:
+        return "多方匹配·待核"
+    return next(iter(matched.values()), "")
+
+
 def party_names(parties: list) -> list[str]:
     """Flatten stored parties into a deduplicated name list for cloud requests."""
     names: list[str] = []

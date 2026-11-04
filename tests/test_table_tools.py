@@ -377,6 +377,29 @@ class TableToolsUiTest(unittest.TestCase):
         self.tools.calculate(1)
         self.assertEqual(self.tools.result.get(), "0.10")
 
+    def test_old_and_updated_column_preferences_keep_focus_last(self):
+        from ledger_viewer.ui import visible_columns
+        saved = ["marked", "date", "summary", "debit"]
+        self.assertEqual(visible_columns("detail", saved), ["date", "summary", "debit", "marked"])
+        self.assertNotIn("marked", visible_columns("detail", ["date", "debit"]))
+        self.window._change_columns("detail", saved)
+        self.assertEqual(tuple(self.view.cget("displaycolumns")), ("date", "summary", "debit", "marked"))
+        self.assertEqual(self.window.store.display_columns("detail"), ["date", "summary", "debit", "marked"])
+
+    def test_scrolling_large_selected_range_does_not_recalculate_its_sum(self):
+        for index in range(200):
+            self.view.insert("", "end", iid=f"perf{index}", values=("",) * 13 + ("1.00", "", "", ""))
+        first = self.view.get_children()[0]
+        self.tools.select(first, "debit")
+        self.tools.select("perf199", "debit", extend=True)
+        self.root.update()
+        total = self.tools.selection_total.get()
+        with patch.object(self.tools, "_update_summary", wraps=self.tools._update_summary) as update:
+            self.view.yview_scroll(10, "units")
+            self.root.update()
+            update.assert_not_called()
+        self.assertEqual(self.tools.selection_total.get(), total)
+
 
 if __name__ == "__main__":
     unittest.main()

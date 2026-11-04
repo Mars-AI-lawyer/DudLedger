@@ -19,6 +19,13 @@ class DashedGrid:
         self.draw_job: str | None = None
         self.enabled = True
         self.scroll_job: str | None = None
+        self.event_tag = f"DudGrid:{view}"
+        self.event_bindings = []
+        for sequence in ("<Button-1>", "<Double-1>", "<ButtonRelease-1>", "<B1-Motion>",
+                         "<Button-2>", "<Button-3>", "<Control-Button-1>",
+                         "<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>"):
+            command = view.bind_class(self.event_tag, sequence, lambda event, seq=sequence: self._forward(event, seq))
+            self.event_bindings.append((sequence, command))
         view.bind("<Destroy>", self._destroy, add="+")
         for event in ("<Configure>", "<Map>", "<ButtonRelease-1>"):
             view.bind(event, self.schedule, add="+")
@@ -38,6 +45,10 @@ class DashedGrid:
         self.scroll_job = self.draw_job = None
         self.pending = False
         self.enabled = False
+        for sequence, command in self.event_bindings:
+            self.view.unbind_class(self.event_tag, sequence)
+            self.view._root().deletecommand(command)
+        self.event_bindings.clear()
 
     def schedule_scroll(self) -> None:
         """Repaint once scrolling settles so a long table stays responsive."""
@@ -65,8 +76,23 @@ class DashedGrid:
 
     def _line(self, pool: list[tk.Canvas], index: int) -> tk.Canvas:
         while len(pool) <= index:
-            pool.append(tk.Canvas(self.view, highlightthickness=0, borderwidth=0, background=self.background))
+            line = tk.Canvas(self.view, highlightthickness=0, borderwidth=0, background=self.background)
+            line.bindtags((self.event_tag, *line.bindtags()))
+            pool.append(line)
         return pool[index]
+
+    def _forward(self, event, sequence):
+        options = dict(x=event.x_root - self.view.winfo_rootx(),
+                       y=event.y_root - self.view.winfo_rooty(), state=event.state)
+        options["time"] = event.time
+        if "MouseWheel" in sequence:
+            options["delta"] = event.delta
+        # Tk disallows synthesizing Double modifiers; the forwarded button
+        # presses themselves retain Tk's native double-click recognition.
+        if sequence == "<Double-1>":
+            sequence = "<Button-1>"
+        self.view.event_generate(sequence, **options)
+        return "break"
 
     def draw(self) -> None:
         self.draw_job = None
@@ -79,14 +105,14 @@ class DashedGrid:
             self._hide_all()
             return
         visible = []
-        item = first
-        while item and len(visible) < 80:
-            box = self.view.bbox(item)
-            if box and box[1] > height:
-                break
-            if box and box[1] + box[3] > 0:
-                visible.append((item, box))
-            item = self.view.next(item)
+        seen = set()
+        for y in range(1, height, 4):
+            item = self.view.identify_row(y)
+            if item and item not in seen:
+                seen.add(item)
+                box = self.view.bbox(item)
+                if box:
+                    visible.append((item, box))
         if not visible:
             self._hide_all()
             return

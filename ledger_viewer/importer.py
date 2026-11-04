@@ -14,13 +14,21 @@ import datetime as dt
 import hashlib
 import json
 import re
+import posixpath
+import time
+import xml.etree.ElementTree as ET
+from zipfile import ZipFile
+from threading import current_thread, main_thread
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
 from openpyxl import load_workbook
+from openpyxl.utils.cell import range_boundaries
 import xlrd
+from .background import check_cancelled, cooperate
 
 
 FIELDS = {
@@ -190,10 +198,13 @@ def text_value(value: object) -> str:
     return str(value).strip()
 
 
-def file_hash(path: Path) -> str:
+def file_hash(path: Path, cancelled=None) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if cancelled is not None:
+                from .background import check_cancelled
+                check_cancelled(cancelled)
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -311,7 +322,7 @@ def rows(path: Path, sheet: str) -> Iterator[tuple[int, list[object]]]:
         book.close()
 
 
-def formula_cells(path: Path, sheet: str) -> dict[tuple[int, int], str]:
+def formula_cells(path: Path, sheet: str, cancelled=None) -> dict[tuple[int, int], str]:
     """xlsx 公式坐标表（data_only=False 一次扫描）。openpyxl 不计算公式；
     若文件未保存计算缓存，data_only 读取会得到空值，必须作为疑点暴露。"""
     if path.suffix.lower() not in (".xlsx", ".xlsm"):
@@ -322,6 +333,10 @@ def formula_cells(path: Path, sheet: str) -> dict[tuple[int, int], str]:
         if sheet not in book.sheetnames:
             return found
         for row_no, row in enumerate(book[sheet].iter_rows(), 1):
+            if cancelled is not None:
+                check_cancelled(cancelled)
+                if row_no % 250 == 0:
+                    cooperate(cancelled)
             for col_no, cell in enumerate(row):
                 if cell.data_type == "f" and cell.value is not None:
                     found[(row_no, col_no)] = str(cell.value)
@@ -338,7 +353,7 @@ _MERGED_CACHE: dict[tuple[str, int, int, str], list[tuple[int, int, int, int]]] 
 
 
 def merged_ranges(path: Path, sheet: str) -> list[tuple[int, int, int, int]]:
-    """返回 1 基、闭区间的合并区域 (row1,row2,col1,col2)。只读模式拿不到，需完整加载，故按文件缓存。"""
+    """Read merge metadata without materializing all workbook cells."""
     stat = path.stat()
     key = (str(path), stat.st_mtime_ns, stat.st_size, sheet)
     cached = _MERGED_CACHE.get(key)
@@ -355,12 +370,23 @@ def merged_ranges(path: Path, sheet: str) -> list[tuple[int, int, int, int]]:
         finally:
             book.release_resources()
     else:
-        book = load_workbook(path, read_only=False, data_only=True)
-        try:
-            if sheet in book.sheetnames:
-                ranges = [(rng.min_row, rng.max_row, rng.min_col, rng.max_col) for rng in book[sheet].merged_cells.ranges]
-        finally:
-            book.close()
+        with ZipFile(path) as archive:
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            relation_id = next((next((value for key, value in item.attrib.items() if key.endswith("}id")), None)
+                for item in workbook.iter() if item.tag.rsplit("}", 1)[-1] == "sheet" and item.get("name") == sheet), None)
+            relations = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            target = next((item.get("Target") for item in relations if item.get("Id") == relation_id), None)
+            if target:
+                target = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
+                background = current_thread() is not main_thread()
+                with archive.open(target) as handle:
+                    for number, (_, item) in enumerate(ET.iterparse(handle, events=("end",)), 1):
+                        if item.tag.rsplit("}", 1)[-1] == "mergeCell":
+                            left, top, right, bottom = range_boundaries(item.attrib["ref"])
+                            ranges.append((top, bottom, left, right))
+                        item.clear()
+                        if background and number % 10000 == 0:
+                            time.sleep(0.002)
     if len(_MERGED_CACHE) > 8:
         _MERGED_CACHE.clear()
     _MERGED_CACHE[key] = ranges
@@ -579,8 +605,8 @@ class _Pending(ValueError):
     """关键解析错误：导入前必须人工处理（调整列、排除该行或修正数据区域）。"""
 
 
-def _looks_like_header(row: list[object], kind: str, width: int) -> int:
-    """统计一行中命中的已知表头别名个数，用于识别重复表头/结构变化。"""
+@lru_cache(maxsize=4)
+def _header_aliases(kind: str):
     aliases = set()
     if kind in REPORT_KINDS:
         aliases |= {_norm(name) for name in REPORT_ITEM_HEADERS} | {_norm(name) for name in REPORT_AMOUNT_HEADERS}
@@ -588,7 +614,12 @@ def _looks_like_header(row: list[object], kind: str, width: int) -> int:
         fields = ("date", "voucher_no", "voucher_type", "account_code", "account_name", "summary", "debit", "credit", "amount", "direction") if kind == "entry" else ("account_code", "account_name", "opening_debit", "opening_credit", "period_debit", "period_credit", "year_debit", "year_credit", "closing_debit", "closing_credit", "direction")
         for field in fields:
             aliases |= {_norm(alias) for alias in FIELDS[field]}
-    return len({_norm(value) for value in row[:width] if value is not None} & aliases)
+    return frozenset(aliases)
+
+
+def _looks_like_header(row: list[object], kind: str, width: int) -> int:
+    """Reuse immutable aliases for repeated-header detection across rows."""
+    return len({_norm(value) for value in row[:width] if value is not None} & _header_aliases(kind))
 
 
 def _row_signature(row: list[object], width: int) -> tuple[str, ...]:
@@ -605,7 +636,7 @@ def _direction_side(raw: object, label: str = "借贷方向") -> str:
     raise ValueError(f"{label}无法识别：{text!r}")
 
 
-def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None = None) -> Iterator[RowDecision]:
+def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None = None, cancelled=None) -> Iterator[RowDecision]:
     """逐行给出导入去向。``formulas`` 为公式坐标表：公式结果缺失时标记待处理而不是当空值。"""
     spec.validate()
     formulas = formulas or {}
@@ -629,6 +660,10 @@ def classify_rows(spec: ImportSpec, formulas: dict[tuple[int, int], str] | None 
         return value
 
     for row_no, row in rows(spec.path, spec.sheet):
+        if cancelled is not None:
+            check_cancelled(cancelled)
+            if row_no % 250 == 0:
+                cooperate(cancelled)
         if spec.kind in REPORT_KINDS and row_no < spec.header_row:
             title = "  ".join(text_value(value) for value in row if value is not None and str(value).strip())
             if title:
