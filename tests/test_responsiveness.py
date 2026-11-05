@@ -150,7 +150,7 @@ class ResponsivenessTest(unittest.TestCase):
         self.assertEqual(len(self.app.detail_view.get_children()), 105)
         self.assertEqual(self.app.detail_total, 1105)
         self.app.search.set('needle')
-        self.app.refresh_details()
+        self.app.submit_detail_search()
         self.assertEqual(self.app.detail_offset, 0)
         self.assertEqual(self.app.detail_total, 3)
         output = self.base / 'export.csv'
@@ -303,7 +303,7 @@ class ResponsivenessTest(unittest.TestCase):
             buttons = []
             while pending:
                 widget = pending.pop()
-                if widget is self.app.detail_tools.panel:
+                if widget in (self.app.detail_tools.panel, self.app.detail_paging):
                     continue
                 pending.extend(widget.winfo_children())
                 if isinstance(widget, (ttk.Button, ttk.Menubutton)):
@@ -311,7 +311,16 @@ class ResponsivenessTest(unittest.TestCase):
             for button in buttons:
                 self.assertTrue(button.winfo_ismapped(), (size, button.cget('text')))
                 self.assertGreaterEqual(button.winfo_width(), button.winfo_reqwidth() - 8, (size, button.cget('text')))
-            self.assertEqual(self.app.period_controls.grid_info()['row'], 1 if size >= 17 else self.app.period_controls.grid_info()['row'])
+            self.assertTrue(self.app.detail_entry.winfo_ismapped())
+            self.assertFalse(self.app.detail_paging.winfo_ismapped())
+        self.app.account_label.set("名称较长的明细科目，用于验证展开侧栏时的布局 · 含子科目")
+        self.app.sidebar_toggle.invoke()
+        self.root.update()
+        for widget in (self.app.detail_mark, self.app.detail_entry, self.app.detail_more, *self.app.sidebar_buttons):
+            self.assertTrue(widget.winfo_ismapped())
+            self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(),
+                                 self.app.winfo_rootx() + self.app.winfo_width())
+            self.assertGreaterEqual(widget.winfo_height(), widget.winfo_reqheight())
 
     def test_result_queries_share_context_and_count_membership_without_full_rows(self):
         batch = prepare_batch(self.app.store, {})

@@ -100,11 +100,13 @@ class SelectionSummary:
 class TableTools:
     """Track a rectangular range in displayed order, independently of row focus."""
 
-    def __init__(self, view: ttk.Treeview, money_columns: set[str], *, source_for_row=None):
+    def __init__(self, view: ttk.Treeview, money_columns: set[str], *, source_for_row=None,
+                 on_visibility_changed=None):
         self.view = view
         view.cell_tools = self
         self.money_columns = money_columns
         self.source_for_row = source_for_row
+        self.on_visibility_changed = on_visibility_changed
         self.active: tuple[str, str] | None = None
         self.anchor: tuple[str, str] | None = None
         self.column_order = ()
@@ -115,6 +117,7 @@ class TableTools:
         self.scroll_job = None
         self.row_cache = {}
         self.calculation = Calculation()
+        self._compact_width: int | None = None
         self._height_before_open = None
         self._grown_height = None
         self.job = None
@@ -134,7 +137,8 @@ class TableTools:
         selection.grid(row=1, column=0, sticky="ew", pady=(8, 6))
         ttk.Label(selection, text="当前选区", font=("", 11, "bold")).pack(anchor="w")
         self.selected = tk.StringVar(value="拖动框选一段金额")
-        ttk.Label(selection, textvariable=self.selected, wraplength=245, justify="left").pack(anchor="w", pady=(3, 5))
+        self.selection_label = ttk.Label(selection, textvariable=self.selected, wraplength=245, justify="left")
+        self.selection_label.pack(anchor="w", pady=(3, 5))
         self.selection_total = tk.StringVar(value="—")
         self.selection_total_entry = ttk.Entry(selection, textvariable=self.selection_total,
                                                 state="readonly", justify="right", width=24)
@@ -178,8 +182,8 @@ class TableTools:
         self.undo_button.pack(side="left")
         self.clear_button = ttk.Button(actions, text="清空", width=6, command=self.clear, state="disabled")
         self.clear_button.pack(side="right")
-        ttk.Label(self.panel, text="换选区只更新预览，点击加减后累计。", foreground="#666", wraplength=245).grid(
-            row=9, column=0, sticky="w", pady=(8, 0))
+        self.hint = ttk.Label(self.panel, text="换选区只更新预览，点击加减后累计。", foreground="#666", wraplength=245)
+        self.hint.grid(row=9, column=0, sticky="w", pady=(8, 0))
         self.borders = [tk.Frame(view, background="#587A67", borderwidth=0) for _ in range(4)]
         for border in self.borders:
             border.bind("<Button-1>", self._click)
@@ -489,22 +493,52 @@ class TableTools:
         self.calculation.clear()
         self._render()
 
-    def toggle(self):
-        if self.panel.winfo_manager():
-            self.panel.grid_remove()
-            owner = self.view.winfo_toplevel()
-            if self._grown_height is not None and abs(owner.winfo_height() - self._grown_height) <= 2:
-                owner.geometry(f"{owner.winfo_width()}x{self._height_before_open}")
-            self._height_before_open = self._grown_height = None
+    def set_compact_width(self, width: int | None) -> None:
+        """Fit the calculator into the width reclaimed from the navigation sidebar."""
+        if width == self._compact_width:
+            return
+        self._compact_width = width
+        compact = width is not None
+        self.panel.configure(padding=(8, 8) if compact else (12, 8))
+        for label in (self.selection_label, self.hint):
+            label.configure(wraplength=width - 20 if compact else 245)
+        for entry in (self.selection_total_entry, self.result_entry):
+            entry.configure(width=1 if compact else 24)
+        self.history_detail.configure(width=1 if compact else 28)
+        for button in (self.plus, self.minus):
+            button.configure(width=0 if compact else 8)
+        self.undo_button.configure(text="撤销" if compact else "撤销上一步", width=0 if compact else 10)
+        self.clear_button.configure(width=0 if compact else 6)
+        if compact:
+            # Leave room for the history scrollbar, borders, and panel padding.
+            history_width = width - 40
+            operation_width = history_width // 2
+            self.history.column("operation", width=operation_width, minwidth=24, stretch=False)
+            self.history.column("amount", width=history_width - operation_width, minwidth=24, stretch=False)
         else:
+            self.history.column("operation", width=145, minwidth=120, stretch=True)
+            self.history.column("amount", width=115, minwidth=95, stretch=True)
+
+    def toggle(self):
+        visible = not bool(self.panel.winfo_manager())
+        if visible:
             self.panel.grid()
-            owner = self.view.winfo_toplevel()
+        else:
+            self.panel.grid_remove()
+        if self.on_visibility_changed is not None:
+            self.on_visibility_changed(visible)
+        owner = self.view.winfo_toplevel()
+        if visible:
             owner.update_idletasks()
             desired = min(owner.winfo_reqheight(), owner.winfo_screenheight() - 100)
             if desired > owner.winfo_height():
                 self._height_before_open = owner.winfo_height()
                 self._grown_height = desired
                 owner.geometry(f"{owner.winfo_width()}x{desired}")
+        else:
+            if self._grown_height is not None and abs(owner.winfo_height() - self._grown_height) <= 2:
+                owner.geometry(f"{owner.winfo_width()}x{self._height_before_open}")
+            self._height_before_open = self._grown_height = None
         self.schedule()
 
     def _move(self, direction, extend=False):

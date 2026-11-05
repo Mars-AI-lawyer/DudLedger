@@ -22,9 +22,12 @@ from .import_work import inventory, prepare_sheets, preview_data, requires_backg
 from .background import BackgroundTasks, Cancelled, check_cancelled
 from .checks import run_checks
 from .deepseek_mapping import delete_api_key as deepseek_delete_api_key, get_api_key as deepseek_get_api_key, key_memory_only as deepseek_memory_only, save_api_key as deepseek_save_api_key, suggest_mapping as deepseek_suggest_mapping
+from .detail_filters import EntryCondition, FILTER_COLUMNS
+from .detail_filter_ui import DetailFilterDialog, filter_arrow, heading_filter_column
 from .grid_lines import DashedGrid
 from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_sheet, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
 from .jev_mapping import delete_api_key, get_api_key, key_memory_only, save_api_key
+from .navigation import NavigationTooltip, navigation_icon
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, PrecheckStats, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
 from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, build_party_index, indexed_party_match
@@ -92,6 +95,9 @@ DEFAULT_COLUMNS = {
     "detail": ["date", "voucher", "name", "summary", "counterparty", "debit", "credit", "marked"],
     "voucher": ["code", "name", "summary", "debit", "credit", "source"],
 }
+
+DETAIL_FILTER_LABELS = {key: title for key, title, _ in VIEW_COLUMNS["detail"] if key in FILTER_COLUMNS}
+DETAIL_FILTER_LABELS["period"] = "会计期间"
 
 MONEY_COLUMN_KEYS = {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc", "debit", "credit", "original", "left_a", "left_b", "left_c", "right_a", "right_b", "right_c", "a", "b"}
 
@@ -1720,6 +1726,8 @@ class App(tk.Toplevel):
         self.report_source = {kind: tk.StringVar(value="无报表") for kind in REPORT_KINDS}
         self.report_options: dict[str, dict[str, int]] = {kind: {} for kind in REPORT_KINDS}
         self.search = tk.StringVar()
+        self.detail_search = ""
+        self.detail_conditions: dict[str, EntryCondition] = {}
         self.summary_search = tk.StringVar()
         self.detail_sort = "date"
         self.detail_descending = False
@@ -1732,6 +1740,9 @@ class App(tk.Toplevel):
         self.column_views: dict[str, list[ttk.Treeview]] = {kind: [] for kind in VIEW_COLUMNS}
         self.voucher_windows: set[tk.Toplevel] = set()
         self.review_windows: set[tk.Toplevel] = set()
+        self._sidebar_expanded = False
+        self._sidebar_mode = None
+        self._show_sidebar_with_calculator = False
         self._layout()
         self._build_menu()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -1744,27 +1755,40 @@ class App(tk.Toplevel):
         self.sidebar = ttk.Frame(self.shell, style="Sidebar.TFrame", width=184)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.pack_propagate(False)
-        ttk.Label(self.sidebar, text="DudLedger", style="Brand.TLabel").pack(anchor="w", padx=18, pady=(24, 4))
-        ttk.Label(self.sidebar, text="法律尽调 · 账簿核查", style="SidebarHint.TLabel").pack(anchor="w", padx=18, pady=(0, 26))
+        self.navigation_tooltip = NavigationTooltip(self)
+        self.sidebar_icons = {}
+        self.sidebar_buttons = []
+        self.sidebar_groups = []
+        self.sidebar_brand = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
+        ttk.Label(self.sidebar_brand, text="DudLedger", style="Brand.TLabel").pack(anchor="w", padx=18, pady=(8, 1))
+        ttk.Label(self.sidebar_brand, text="法律尽调 · 账簿核查", style="SidebarHint.TLabel").pack(anchor="w", padx=18, pady=(0, 5))
+        self.sidebar_pages = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
+        self.sidebar_pages.pack(fill="x", pady=(5, 0))
         self.nav_buttons = []
         self.page_names = ("科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 尽调线索")
-        for index, title in enumerate(self.page_names):
+        nav_icons = ("accounts", "entries", "balance", "income", "marks", "review")
+        for index, (title, icon) in enumerate(zip(self.page_names, nav_icons)):
+            button = self._sidebar_button(self.sidebar_pages, title, icon, lambda page=index: self.tabs.select(page))
             if index in (0, 4):
-                ttk.Label(self.sidebar, text="账簿" if index == 0 else "复核", style="SidebarHint.TLabel").pack(anchor="w", padx=20, pady=(14, 8))
-            button = ttk.Button(self.sidebar, text=title, style="Nav.TButton", command=lambda page=index: self.tabs.select(page))
-            button.pack(fill="x", padx=9, pady=2)
+                heading = ttk.Label(self.sidebar_pages, text="账簿" if index == 0 else "复核",
+                                    style="SidebarHint.TLabel")
+                self.sidebar_groups.append((heading, button))
             self.nav_buttons.append(button)
         footer = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
-        footer.pack(side="bottom", fill="x", padx=9, pady=14)
-        ttk.Button(footer, text="尽调主体名单", style="Nav.TButton", command=self.open_related_parties).pack(fill="x", pady=2)
-        ttk.Button(footer, text="偏好设置", style="Nav.TButton", command=self.open_settings).pack(fill="x", pady=2)
-        ttk.Button(footer, text="打开账套…", style="Nav.TButton", command=self.open_book).pack(fill="x", pady=2)
-        ttk.Separator(footer).pack(fill="x", padx=10, pady=10)
-        ttk.Label(footer, text="本地工作区", style="SidebarHint.TLabel").pack(anchor="w", padx=11)
+        footer.pack(side="bottom", fill="x", padx=9, pady=(5, 8))
+        self._sidebar_button(footer, "尽调主体名单", "parties", self.open_related_parties, padx=0)
+        self._sidebar_button(footer, "偏好设置", "settings", self.open_settings, padx=0)
+        self._sidebar_button(footer, "打开账套…", "folder", self.open_book, padx=0)
+        self.sidebar_footer_label = ttk.Label(footer, text="本地工作区", style="SidebarHint.TLabel")
         self.workspace = ttk.Frame(self.shell)
         self.workspace.grid(row=0, column=1, sticky="nsew")
         toolbar = ttk.Frame(self.workspace, padding=(16, 15))
         toolbar.pack(fill="x")
+        for name in ("expand", "collapse"):
+            self.sidebar_icons[name] = navigation_icon(self, name)
+        self.sidebar_toggle = ttk.Button(toolbar, compound="image", width=0, command=self._toggle_sidebar)
+        self.sidebar_toggle.pack(side="left", padx=(0, 6))
+        self.navigation_tooltip.attach(self.sidebar_toggle, lambda: self.sidebar_toggle.cget("text"))
         self.page_title = tk.StringVar(value="开始核查")
         self.page_menu = ttk.Menubutton(toolbar, textvariable=self.page_title)
         self.page_menu.pack(side="left")
@@ -1841,62 +1865,62 @@ class App(tk.Toplevel):
         self.balance_tools = TableTools(self.summary_view, {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc"},
             source_for_row=lambda row: self.balance_calc_sources.get(row, row))
         ttk.Button(balance_actions, text="计算器", command=self.balance_tools.toggle).pack(side="right", padx=4)
-        detail_top = ttk.Frame(frames[1], padding=5)
-        detail_top.pack(fill="x")
-        detail_scope = ttk.Frame(detail_top)
-        detail_actions = ttk.Frame(detail_top)
-        detail_scope.grid(row=0, column=0, sticky="w")
-        detail_actions.grid(row=0, column=1, sticky="e")
-        detail_top.columnconfigure(0, weight=1)
-        detail_top.bind("<Configure>", lambda event: self._flow_bar(detail_top, detail_scope, detail_actions))
-        ttk.Label(detail_scope, textvariable=self.account_label, wraplength=330, justify="left").pack(side="left")
-        ttk.Button(detail_scope, text="显示全部科目", command=self.show_all_entries).pack(side="left", padx=10)
-        self.detail_more = ttk.Menubutton(detail_actions, text="更多 ▾")
+        self.detail_controls = ttk.Frame(frames[1], padding=5)
+        self.detail_controls.pack(fill="x")
+        self.detail_controls.columnconfigure(1, weight=1)
+        self.detail_scope = ttk.Label(self.detail_controls, textvariable=self.account_label, wraplength=300, justify="left")
+        self.detail_scope.grid(row=0, column=0, sticky="w")
+        self.detail_lookup = ttk.Frame(self.detail_controls)
+        self.detail_lookup.grid(row=0, column=1, sticky="ew", padx=10)
+        ttk.Label(self.detail_lookup, text="查找（回车）").pack(side="left", padx=(0, 6))
+        self.detail_entry = ttk.Entry(self.detail_lookup, textvariable=self.search, width=16)
+        self.detail_entry.pack(side="left", fill="x", expand=True)
+        self.detail_entry.bind("<Return>", lambda _event: self.submit_detail_search())
+        self.detail_actions = ttk.Frame(self.detail_controls)
+        self.detail_actions.grid(row=0, column=2, sticky="e")
+        self.detail_more = ttk.Menubutton(self.detail_actions, text="更多 ▾", width=0)
         self.detail_more.pack(side="right")
         detail_menu = tk.Menu(self.detail_more, tearoff=False)
+        detail_menu.add_command(label="显示全部科目", command=self.show_all_entries)
+        detail_menu.add_command(label="筛选条件…", command=self._open_detail_filter)
+        detail_menu.add_command(label="清除全部筛选", command=self.clear_filter)
+        detail_menu.add_separator()
         detail_menu.add_command(label="选择显示列…", command=lambda: self._open_columns(self, "detail"))
         detail_menu.add_command(label="导出当前明细 CSV…", command=self.export_csv)
         detail_menu.add_command(label="恢复日期顺序", command=self.reset_detail_sort)
         self.detail_more.configure(menu=detail_menu)
-        ttk.Button(detail_actions, text="关注凭证 / 写备注", command=self.mark_selected_entry).pack(side="right", padx=6)
-        self.detail_controls = ttk.Frame(frames[1], padding=(5, 0, 5, 5))
-        self.detail_controls.pack(fill="x")
-        self.keyword_controls = ttk.Frame(self.detail_controls)
-        self.period_controls = ttk.Frame(self.detail_controls)
-        self.keyword_controls.grid(row=0, column=0, sticky="ew")
-        self.period_controls.grid(row=0, column=1, sticky="e")
-        self.detail_controls.columnconfigure(0, weight=1)
-        ttk.Label(self.keyword_controls, text="关键词").pack(side="left")
-        detail_entry = ttk.Entry(self.keyword_controls, textvariable=self.search, width=12)
-        detail_entry.pack(side="left", fill="x", expand=True, padx=6)
-        detail_entry.bind("<Return>", lambda _e: self.refresh_details())
-        ttk.Button(self.keyword_controls, text="查找", command=self.refresh_details, style="Accent.TButton").pack(side="left")
-        ttk.Button(self.keyword_controls, text="重置筛选", command=self.clear_filter).pack(side="left", padx=(6, 0))
-        ttk.Label(self.period_controls, text="期间").pack(side="left", padx=(6, 0))
-        self.period_from_combo = ttk.Combobox(self.period_controls, textvariable=self.period_from, values=("不限",), state="readonly", width=11)
-        self.period_from_combo.pack(side="left", padx=(6, 2))
-        self.period_from_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
-        ttk.Label(self.period_controls, text="至").pack(side="left")
-        self.period_to_combo = ttk.Combobox(self.period_controls, textvariable=self.period_to, values=("不限",), state="readonly", width=11)
-        self.period_to_combo.pack(side="left", padx=(2, 0))
-        self.period_to_combo.bind("<<ComboboxSelected>>", lambda _e: self._period_changed())
+        self.detail_mark = ttk.Button(self.detail_actions, text="关注凭证 / 写备注", width=0,
+                                      command=self.mark_selected_entry, state="disabled")
         self.detail_controls.bind("<Configure>", self._resize_detail_controls)
+        self.detail_scope.bind("<Configure>", self._resize_detail_controls)
+        self.detail_actions.bind("<Configure>", self._resize_detail_controls)
         paging = ttk.Frame(frames[1], padding=(6, 2))
-        paging.pack(fill="x")
-        self.detail_prev = ttk.Button(paging, text="上一页", command=lambda: self.change_detail_page(-1), state="disabled")
-        self.detail_prev.pack(side="right")
-        self.detail_next = ttk.Button(paging, text="下一页", command=lambda: self.change_detail_page(1), state="disabled")
-        self.detail_next.pack(side="right", padx=5)
+        paging.pack(side="bottom", fill="x")
+        self.detail_paging = ttk.Frame(paging)
+        self.detail_prev = ttk.Button(self.detail_paging, text="上一页", width=0,
+                                      command=lambda: self.change_detail_page(-1), state="disabled")
+        self.detail_prev.pack(side="left")
         self.detail_page_label = tk.StringVar(value="第 1 / 1 页")
-        ttk.Label(paging, textvariable=self.detail_page_label).pack(side="right", padx=5)
-        ttk.Label(paging, textvariable=self.detail_info, style="Hint.TLabel", wraplength=380).pack(side="left", fill="x", expand=True)
+        ttk.Label(self.detail_paging, textvariable=self.detail_page_label).pack(side="left", padx=5)
+        self.detail_next = ttk.Button(self.detail_paging, text="下一页", width=0,
+                                      command=lambda: self.change_detail_page(1), state="disabled")
+        self.detail_next.pack(side="left")
+        self.detail_status = ttk.Label(paging, textvariable=self.detail_info, style="Hint.TLabel", wraplength=440)
+        self.detail_status.pack(side="left", fill="x", expand=True)
+        self.detail_status.bind("<Configure>", self._resize_detail_status)
         self.detail_view = tree(frames[1], VIEW_COLUMNS["detail"])
-        self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"})
-        ttk.Button(detail_actions, text="计算器", command=self.detail_tools.toggle).pack(side="right", padx=4)
+        self.detail_filter_images = (filter_arrow(self.detail_view), filter_arrow(self.detail_view, active=True))
+        self.detail_view.bind("<ButtonPress-1>", self._detail_filter_click)
+        self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"},
+                                       on_visibility_changed=self._detail_calculator_changed)
+        ttk.Button(self.detail_actions, text="计算器", width=0, command=self.detail_tools.toggle).pack(side="right", padx=6)
+        self.detail_mark.pack(side="right")
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
+        self.detail_view.bind("<<TreeviewSelect>>", self._update_detail_mark)
         for key in ("date", "voucher", "code", "name", "summary", "debit", "credit"):
             self.detail_view.heading(key, command=lambda column=key: self.sort_details(column))
+        self._update_detail_headings()
         self.report_views: dict[str, ttk.Treeview] = {}
         self.report_info: dict[str, tk.StringVar] = {}
         self.report_combos: dict[str, ttk.Combobox] = {}
@@ -1990,22 +2014,72 @@ class App(tk.Toplevel):
         self.page_title.set(self.page_names[index] if self.store else "开始核查")
         for page, button in enumerate(self.nav_buttons):
             button.state(["selected" if page == index else "!selected"])
+        self._resize_workspace()
         if index == 5:
             self.review_panel.refresh()
+
+    def _detail_calculator_active(self) -> bool:
+        return self.tabs.index("current") == 1 and bool(self.detail_tools.panel.winfo_manager())
+
+    def _detail_calculator_changed(self, visible: bool) -> None:
+        if not visible:
+            self._show_sidebar_with_calculator = False
+        self._resize_workspace()
+
+    def _toggle_sidebar(self) -> None:
+        if self._detail_calculator_active():
+            self._show_sidebar_with_calculator = not self._show_sidebar_with_calculator
+        else:
+            self._sidebar_expanded = not self._sidebar_expanded
+        self._resize_workspace()
+
+    def _sidebar_button(self, parent, title, icon, command, *, padx=9):
+        image = self.sidebar_icons[icon] = navigation_icon(self, icon)
+        button = ttk.Button(parent, text=title, image=image, width=0, command=command)
+        button.pack(fill="x", padx=padx, pady=1)
+        self.sidebar_buttons.append(button)
+        self.navigation_tooltip.attach(button, lambda: title if self._sidebar_mode == "icons" else "")
+        return button
+
+    def _render_sidebar(self, mode: str) -> None:
+        if mode == self._sidebar_mode:
+            return
+        self.navigation_tooltip.hide()
+        self._sidebar_mode = mode
+        if mode == "hidden":
+            self.sidebar.grid_remove()
+            return
+        expanded = mode == "text"
+        self.sidebar.grid()
+        if expanded:
+            self.sidebar_brand.pack(fill="x", before=self.sidebar_pages)
+            for heading, button in self.sidebar_groups:
+                heading.pack(anchor="w", padx=20, pady=(4, 2), before=button)
+            self.sidebar_footer_label.pack(anchor="w", padx=11, pady=(4, 0))
+        else:
+            self.sidebar_brand.pack_forget()
+            for heading, _button in self.sidebar_groups:
+                heading.pack_forget()
+            self.sidebar_footer_label.pack_forget()
+        for button in self.sidebar_buttons:
+            button.configure(style="Nav.TButton" if expanded else "Rail.Nav.TButton",
+                             compound="left" if expanded else "image")
 
     def _resize_workspace(self, event=None) -> None:
         if event is not None and event.widget is not self:
             return
-        width = self.winfo_width()
-        if width < 10:
-            return
-        # Preserve the ledger width when the desktop window is made compact.
+        calculator = self._detail_calculator_active()
+        hidden = calculator and not self._show_sidebar_with_calculator
+        mode = "hidden" if hidden else ("text" if self._sidebar_expanded else "icons")
         sidebar_width = max(184, self.controller.font_size * 13)
-        self.sidebar.configure(width=sidebar_width)
-        if width < 850 + sidebar_width:
-            self.sidebar.grid_remove()
-        else:
-            self.sidebar.grid()
+        self.sidebar.configure(width=sidebar_width if mode == "text" else 56)
+        self._render_sidebar(mode)
+        collapse = not hidden if calculator else self._sidebar_expanded
+        self.sidebar_toggle.configure(
+            text=("隐藏侧栏" if collapse else "显示侧栏") if calculator else ("折叠为图标" if collapse else "展开侧栏文字"),
+            image=self.sidebar_icons["collapse" if collapse else "expand"],
+        )
+        self.detail_tools.set_compact_width(None if mode == "text" else sidebar_width)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self)
@@ -2017,6 +2091,9 @@ class App(tk.Toplevel):
         files.add_command(label="退出当前账套", command=self.close_book)
         menu.add_cascade(label="文件", menu=files)
         review = tk.Menu(menu, tearoff=False)
+        macos = self.tk.call("tk", "windowingsystem") == "aqua"
+        review.add_command(label="切换侧栏", command=self._toggle_sidebar,
+                           accelerator="⌘⇧L" if macos else "Ctrl+Shift+L")
         review.add_command(label="科目总览", command=lambda: self.tabs.select(0))
         review.add_command(label="明细账", command=lambda: self.tabs.select(1))
         review.add_command(label="关注凭证", command=lambda: self.tabs.select(4))
@@ -2036,6 +2113,8 @@ class App(tk.Toplevel):
             dialog.configure(menu=menu)
         self.bind("<Command-i>", lambda _event: self.import_file())
         self.bind("<Command-o>", lambda _event: self.open_book())
+        modifier = "Command" if macos else "Control"
+        self.bind(f"<{modifier}-Shift-L>", lambda _event: self._toggle_sidebar())
 
     def open_utility(self, title: str) -> None:
         dialog = self.utility_windows[title]
@@ -2151,8 +2230,7 @@ class App(tk.Toplevel):
         self.account = None
         self.include_descendants = False
         self.account_label.set("全部科目")
-        self._set_all_periods()
-        self.search.set("")
+        self._reset_detail_filters()
         self.summary_search.set("")
         self.balance_source.set("无余额表")
         for choice in self.report_source.values():
@@ -2190,8 +2268,7 @@ class App(tk.Toplevel):
                 view.configure(displaycolumns=visible_columns(kind, self.store.display_columns(kind)))
         self.account = None
         self.account_label.set("全部科目")
-        self._set_all_periods()
-        self.search.set("")
+        self._reset_detail_filters()
         self.summary_search.set("")
         self.include_descendants = False
         self.balance_source.set("无余额表")
@@ -2326,10 +2403,7 @@ class App(tk.Toplevel):
         chosen = filedialog.asksaveasfilename(parent=self, title="导出当前科目明细", defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if not chosen:
             return
-        period_start, period_end = self._period_bounds()
-        filters = dict(account=self.account, search=self.search.get().strip(),
-            period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
-            sort_by=self.detail_sort, descending=self.detail_descending)
+        filters = self._detail_query_filters()
         output, path = Path(chosen), self.store.path
         def export(cancelled, report):
             store = LedgerStore.connect_existing(path, cancelled=cancelled)
@@ -2479,9 +2553,42 @@ class App(tk.Toplevel):
         self.refresh_summary()
 
     def clear_filter(self) -> None:
-        self.search.set("")
-        self._set_all_periods()
+        self._reset_detail_filters()
         self.refresh_details()
+
+    def submit_detail_search(self) -> None:
+        self.detail_search = self.search.get().strip()
+        self.refresh_details()
+
+    def _has_detail_filter(self, column: str) -> bool:
+        if column == "period":
+            return any(self._period_bounds())
+        return column in self.detail_conditions
+
+    def _open_detail_filter(self, column: str | None = None) -> None:
+        if self.store:
+            initial = column or next((key for key in DETAIL_FILTER_LABELS if self._has_detail_filter(key)), "date")
+            DetailFilterDialog(self, DETAIL_FILTER_LABELS, initial)
+
+    def _detail_filter_click(self, event):
+        column = heading_filter_column(self.detail_view, event.x, event.y)
+        if column is not None:
+            self._open_detail_filter(column)
+            return "break"
+
+    def _set_detail_filter(self, column: str, condition: EntryCondition | tuple[str, str] | None) -> None:
+        if column == "period":
+            start, end = condition or ("不限", "不限")
+            self.period_from.set(start)
+            self.period_to.set(end)
+        elif condition is None:
+            self.detail_conditions.pop(column, None)
+        else:
+            self.detail_conditions[column] = condition
+        self.refresh_details()
+
+    def _update_detail_mark(self, _event=None) -> None:
+        self.detail_mark.configure(state="normal" if self.detail_view.selection() else "disabled")
 
     def reset_detail_sort(self) -> None:
         self.detail_sort = "date"
@@ -2527,12 +2634,12 @@ class App(tk.Toplevel):
             return f"至 {reverse.get(end, self.period_to.get())}"
         return "全部期间"
 
-    def _set_all_periods(self) -> None:
+    def _reset_detail_filters(self) -> None:
+        self.search.set("")
+        self.detail_search = ""
+        self.detail_conditions.clear()
         self.period_from.set("不限")
         self.period_to.set("不限")
-
-    def _period_changed(self) -> None:
-        self.refresh_details()
 
     def refresh_all(self) -> None:
         for view in (self.source_view, self.mark_view):
@@ -2547,9 +2654,6 @@ class App(tk.Toplevel):
             self.balance_calc_sources.clear()
             return
         self.period_options = {f"{year}年{period}期": (year, period) for year, period in self.store.periods()}
-        period_values = ("不限", *self.period_options)
-        self.period_from_combo.configure(values=period_values)
-        self.period_to_combo.configure(values=period_values)
         for variable in (self.period_from, self.period_to):
             if variable.get() != "不限" and variable.get() not in self.period_options:
                 variable.set("不限")
@@ -2773,8 +2877,7 @@ class App(tk.Toplevel):
         if len(scope) > 30:
             scope = scope[:30] + f"…（{len(keys)} 个科目）"
         self.account_label.set(f"{label} → {scope}" + (" · 含子科目" if include_descendants else ""))
-        self.search.set("")
-        self._set_all_periods()
+        self._reset_detail_filters()
         self.refresh_details()
         self.tabs.select(1)
 
@@ -2787,11 +2890,29 @@ class App(tk.Toplevel):
 
     def _resize_detail_controls(self, event=None):
         width = self.detail_controls.winfo_width()
-        required = self.keyword_controls.winfo_reqwidth() + self.period_controls.winfo_reqwidth() + 12
+        if width <= 1:
+            return
+        wrap = max(100, min(300, width - self.detail_actions.winfo_reqwidth() - 12))
+        if int(self.detail_scope.cget("wraplength")) != wrap:
+            self.detail_scope.configure(wraplength=wrap)
+        widgets = (self.detail_scope, self.detail_lookup, self.detail_actions)
+        required = sum(widget.winfo_reqwidth() for widget in widgets) + 30
         if width < required:
-            self.period_controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
+            self.detail_lookup.grid(row=1, column=0, columnspan=3, sticky="ew", padx=0, pady=(5, 0))
         else:
-            self.period_controls.grid(row=0, column=1, columnspan=1, sticky="e", pady=0)
+            self.detail_lookup.grid(row=0, column=1, columnspan=1, sticky="ew", padx=10, pady=0)
+
+    def _detail_query_filters(self):
+        period_start, period_end = self._period_bounds()
+        conditions = tuple(self.detail_conditions[key] for key in sorted(self.detail_conditions))
+        return dict(account=self.account, search=self.detail_search, conditions=conditions,
+                    period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
+                    sort_by=self.detail_sort, descending=self.detail_descending)
+
+    def _resize_detail_status(self, event) -> None:
+        wrap = max(80, event.width - 4)
+        if int(self.detail_status.cget("wraplength")) != wrap:
+            self.detail_status.configure(wraplength=wrap)
 
     def change_detail_page(self, direction):
         self.detail_offset = max(0, self.detail_offset + direction * 500)
@@ -2801,12 +2922,11 @@ class App(tk.Toplevel):
         self.tasks.cancel("details")
         self.detail_tools.reset_selection()
         self.detail_view.delete(*self.detail_view.get_children())
+        self._update_detail_mark()
+        self._update_detail_headings()
         if not self.store:
             return
-        period_start, period_end = self._period_bounds()
-        filters = dict(account=self.account, search=self.search.get().strip(),
-            period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
-            sort_by=self.detail_sort, descending=self.detail_descending)
+        filters = self._detail_query_filters()
         scope = json.dumps(filters, sort_keys=True)
         if scope != getattr(self, "_detail_scope", None):
             self.detail_offset = 0
@@ -2833,16 +2953,25 @@ class App(tk.Toplevel):
             side_tag = "debit_row" if row["debit_cents"] and not row["credit_cents"] else "credit_row" if row["credit_cents"] and not row["debit_cents"] else ""
             marked = voucher_key(row) in marked_keys
             self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
-        for key, title, _ in VIEW_COLUMNS["detail"]:
-            arrow = (" ↓" if self.detail_descending else " ↑") if key == self.detail_sort else ""
-            self.detail_view.heading(key, text=title + arrow)
         pages = max(1, (total + 499) // 500)
         self.detail_page_label.set(f"第 {offset // 500 + 1} / {pages} 页")
+        if pages > 1:
+            self.detail_paging.pack(side="right", before=self.detail_status)
+        else:
+            self.detail_paging.pack_forget()
         self.detail_prev.configure(state="normal" if offset else "disabled")
         self.detail_next.configure(state="normal" if offset + 500 < total else "disabled")
         end = offset + len(rows_found)
         shown = f"显示 {offset + 1}—{end} 条" if rows_found else "暂无匹配明细"
-        self.detail_info.set(f"共 {total:,} 条 · {shown} · {self._period_label()} · 选区统计仅含当前页，导出含全部匹配项")
+        filter_count = len(self.detail_conditions) + bool(self.detail_search) + self._has_detail_filter("period")
+        filter_info = f" · 已筛选 {filter_count} 项" if filter_count else ""
+        self.detail_info.set(f"共 {total:,} 条 · {shown}{filter_info} · {self._period_label()}")
+
+    def _update_detail_headings(self) -> None:
+        for key, title, _ in VIEW_COLUMNS["detail"]:
+            arrow = (" ↓" if self.detail_descending else " ↑") if key == self.detail_sort else ""
+            image = self.detail_filter_images[self._has_detail_filter(key)] if key in DETAIL_FILTER_LABELS else ""
+            self.detail_view.heading(key, text=title + arrow, image=image)
 
     def open_account(self, _event: object) -> None:
         if _event is not None and self.summary_view.identify_column(_event.x) == '#0':
@@ -2852,8 +2981,7 @@ class App(tk.Toplevel):
             return
         self.account = selection[0]
         self.include_descendants = self.account.startswith("C:")
-        self.search.set("")
-        self._set_all_periods()
+        self._reset_detail_filters()
         values = self.summary_view.item(selection[0], "values")
         self.account_label.set(f"{values[0]} {values[1]}".strip() + (" · 含子科目" if self.include_descendants else ""))
         self.refresh_details()

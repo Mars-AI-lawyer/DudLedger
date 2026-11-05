@@ -113,7 +113,7 @@ class SimplifiedUITest(unittest.TestCase):
             exported = list(csv.DictReader(handle))
         self.assertEqual([row['科目编码'] for row in exported], ['100201', '1002'])
         self.app.search.set('采购')
-        self.app.refresh_details()
+        self.app.submit_detail_search()
         self.assertEqual(self.shown_codes(), [])
         self.app.clear_filter()
         self.assertEqual(self.shown_codes(), ['100201', '1002'])

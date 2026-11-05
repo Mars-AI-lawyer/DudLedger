@@ -275,7 +275,7 @@ class TableToolsUiTest(unittest.TestCase):
         self.view.set(first, "source", "新的来源")
         self.window.sort_details("credit")
         self.window.search.set("不存在的查询")
-        self.window.refresh_details()
+        self.window.submit_detail_search()
         self.root.update()
         self.assertEqual(self.tools.selection_total.get(), "—")
         self.assertEqual(self.tools.result.get(), "0.30")

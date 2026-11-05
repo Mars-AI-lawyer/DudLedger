@@ -119,9 +119,7 @@ def _norm(value: object) -> str:
     return re.sub(r"[\s_（）()\-:：]+", "", str(value or "")).lower()
 
 
-def money(value: object) -> int:
-    if value is None or str(value).strip() in ("", "—", "-", "–"):
-        return 0
+def decimal_amount(value: object) -> Decimal:
     if isinstance(value, bool):
         raise ValueError("金额不能为布尔值")
     raw = str(value).strip().replace(",", "").replace("￥", "").replace("¥", "")
@@ -133,6 +131,13 @@ def money(value: object) -> int:
         raise ValueError(f"无法识别金额：{value}") from exc
     if not amount.is_finite():
         raise ValueError(f"金额不是有限数：{value}")
+    return amount
+
+
+def money(value: object) -> int:
+    if value is None or str(value).strip() in ("", "—", "-", "–"):
+        return 0
+    amount = decimal_amount(value)
     return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 

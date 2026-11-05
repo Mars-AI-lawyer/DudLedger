@@ -6,6 +6,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from .detail_filters import EntryCondition, VALID_DATE_SQL, compare_original_amount, condition_clause
 from .importer import (
     DISPOSITION_IMPORT,
     DISPOSITION_PENDING,
@@ -419,6 +420,10 @@ class LedgerStore:
     def periods(self) -> list[tuple[str, str]]:
         return [(row[0], row[1]) for row in self.db.execute("SELECT DISTINCT fiscal_year,period FROM entries WHERE fiscal_year<>'' AND period<>'' ORDER BY CAST(fiscal_year AS INTEGER),CAST(period AS INTEGER)")]
 
+    def entry_months(self) -> tuple[str, ...]:
+        query = f"SELECT DISTINCT substr(e.entry_date, 1, 7) AS month FROM entries e WHERE {VALID_DATE_SQL} ORDER BY month"
+        return tuple(row[0] for row in self.db.execute(query))
+
     def summary(self, search: str = "", balance_source_id: int | None = None) -> list[sqlite3.Row]:
         if balance_source_id is None:
             balance_source_id = self.db.execute("SELECT COALESCE(MAX(id),-1) FROM sources WHERE kind='balance'").fetchone()[0]
@@ -443,7 +448,8 @@ class LedgerStore:
         """, (balance_source_id, pattern, pattern)).fetchall()
 
     def _entry_filter(self, account=None, search="", fiscal_year=None, period=None,
-                      period_from=None, period_to=None, include_descendants=False):
+                      period_from=None, period_to=None, include_descendants=False,
+                      conditions: tuple[EntryCondition, ...] = ()):
         where = []
         args: list[object] = []
         account_sql, account_args = self._account_clause(account, include_descendants)
@@ -460,11 +466,20 @@ class LedgerStore:
         if search:
             where.append("(a.code LIKE ? OR a.name LIKE ? OR e.summary LIKE ? OR e.voucher_no LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
             args.extend([f"%{search}%"] * 6)
+        if not getattr(self, "_has_original_comparison", False) and any(
+            condition.column == "original" for condition in conditions
+        ):
+            self.db.create_function("compare_original_amount", 2, compare_original_amount, deterministic=True)
+            self._has_original_comparison = True
+        for condition in conditions:
+            predicate, parameters = condition_clause(condition)
+            where.append(predicate)
+            args.extend(parameters)
         clause = " WHERE " + " AND ".join(where) if where else ""
         return clause, args
 
-    def entries(self, account: str | list[str] | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False, offset: int = 0) -> list[sqlite3.Row]:
-        clause, args = self._entry_filter(account, search, fiscal_year, period, period_from, period_to, include_descendants)
+    def entries(self, account: str | list[str] | None = None, search: str = "", limit: int = 3000, fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False, offset: int = 0, *, conditions: tuple[EntryCondition, ...] = ()) -> list[sqlite3.Row]:
+        clause, args = self._entry_filter(account, search, fiscal_year, period, period_from, period_to, include_descendants, conditions)
         return self.db.execute("""
           SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path FROM entries e
           JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
@@ -546,32 +561,15 @@ class LedgerStore:
           FROM entries e WHERE """ + (account_sql if account_sql else "1=1") + """ AND (? IS NULL OR e.fiscal_year=?) AND (? IS NULL OR e.period=?)
           GROUP BY label ORDER BY n DESC,label LIMIT 1000""", (*account_args, fiscal_year, fiscal_year, period, period)).fetchall()
 
-    def export_entries(self, path: Path, account: str | list[str] | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False) -> int:
+    def export_entries(self, path: Path, account: str | list[str] | None = None, search: str = "", fiscal_year: str | None = None, period: str | None = None, period_from: tuple[str, str] | None = None, period_to: tuple[str, str] | None = None, include_descendants: bool = False, sort_by: str = "date", descending: bool = False, *, conditions: tuple[EntryCondition, ...] = ()) -> int:
         import csv
         from .related_parties import build_party_index, indexed_party_match
 
         party_index = build_party_index(self.related_parties())
         query = """SELECT e.*,a.code,a.name,s.filename,s.sheet FROM entries e
             JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id"""
-        where = []
-        args: list[object] = []
-        account_sql, account_args = self._account_clause(account, include_descendants)
-        if account_sql:
-            where.append(account_sql)
-            args.extend(account_args)
-        if fiscal_year and period:
-            where.append("e.fiscal_year=? AND e.period=?")
-            args.extend((fiscal_year, period))
-        range_sql, range_args = self._period_range_clause(period_from, period_to)
-        if range_sql:
-            where.append(range_sql)
-            args.extend(range_args)
-        if search:
-            where.append("(a.code LIKE ? OR a.name LIKE ? OR e.summary LIKE ? OR e.voucher_no LIKE ? OR e.counterparty LIKE ? OR e.auxiliary LIKE ?)")
-            args.extend([f"%{search}%"] * 6)
-        if where:
-            query += " WHERE " + " AND ".join(where)
-        query += " ORDER BY " + self._entry_order(sort_by, descending)
+        clause, args = self._entry_filter(account, search, fiscal_year, period, period_from, period_to, include_descendants, conditions)
+        query += clause + " ORDER BY " + self._entry_order(sort_by, descending)
         cursor = self.db.execute(query, args)
         count = 0
         with path.open("w", encoding="utf-8-sig", newline="") as handle:

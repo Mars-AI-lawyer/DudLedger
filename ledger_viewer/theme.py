@@ -61,9 +61,10 @@ def configure_theme(root):
     style.configure("Sidebar.TFrame", background=SIDEBAR)
     style.configure("Sidebar.TLabel", background=SIDEBAR)
     style.configure("SidebarHint.TLabel", background=SIDEBAR, foreground=MUTED)
-    style.configure("Nav.TButton", background=SIDEBAR, anchor="w", padding=(12, 9), focuscolor="#B5AEA0")
+    style.configure("Nav.TButton", background=SIDEBAR, anchor="w", padding=(10, 4), focuscolor="#B5AEA0")
     style.map("Nav.TButton", background=[("selected", "#E2DED3"), ("active", "#E8E4DB")],
               foreground=[("selected", "#873F2C"), ("!selected", "#53524C")])
+    style.configure("Rail.Nav.TButton", anchor="center", padding=(0, 7))
     style.configure("Status.TLabel", foreground=MUTED, padding=(18, 7))
     base = tkfont.nametofont("TkDefaultFont")
     size = abs(base.cget("size"))
