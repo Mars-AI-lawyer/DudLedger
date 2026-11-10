@@ -108,29 +108,24 @@ class ResponsivenessTest(unittest.TestCase):
         dialog.note_editor.insert('end', '待核对原始合同')
         return dialog
 
-    def test_unsaved_note_cancel_blocks_next_voucher_and_book_exit(self):
+    def test_pending_note_is_saved_before_replacing_voucher_and_book_exit(self):
         dialog = self.open_editor()
-        with patch('ledger_viewer.ui.messagebox.askyesnocancel', return_value=None):
-            self.app.open_voucher(None, entry_id=self.app.store.entries()[0]['id'])
-            self.assertEqual(self.app.voucher_windows, {dialog})
-            self.app.close_book()
-            self.assertIsNotNone(self.app.store)
-            self.assertTrue(dialog.winfo_exists())
-        with patch('ledger_viewer.ui.messagebox.askyesnocancel', return_value=True):
-            self.assertTrue(dialog.request_close())
+        self.app.open_voucher(None, entry_id=self.app.store.entries()[0]['id'])
+        self.assertFalse(dialog.winfo_exists())
         self.assertEqual(list_marks(self.app.store)[0]['note'], '待核对原始合同')
+        self.app.close_book()
+        self.assertIsNone(self.app.store)
 
     def test_failed_save_keeps_note_and_dialog(self):
         dialog = self.open_editor()
-        with patch('ledger_viewer.ui.messagebox.askyesnocancel', return_value=True), \
-             patch('ledger_viewer.ui.save_mark', side_effect=OSError('write failed')), \
-             patch('ledger_viewer.ui.messagebox.showerror'):
+        with patch('ledger_viewer.issue_store.write_note', side_effect=OSError('write failed')):
             self.assertFalse(dialog.request_close())
+            self.app.close_book()
+            self.assertIsNotNone(self.app.store)
         self.assertTrue(dialog.winfo_exists())
         self.assertIn('待核对', dialog.note_editor.get('1.0', 'end'))
-        with patch('ledger_viewer.ui.messagebox.askyesnocancel', return_value=False):
-            self.assertTrue(dialog.request_close())
-        self.assertEqual(list_marks(self.app.store), [])
+        self.assertTrue(dialog.request_close())
+        self.assertEqual(list_marks(self.app.store)[0]['note'], '待核对原始合同')
 
     def test_paging_covers_all_matches_and_retains_committed_calculation(self):
         self.add_entries(1103)
@@ -438,12 +433,11 @@ class ResponsivenessTest(unittest.TestCase):
         dialog = ReviewDetail(self.app.review_panel, group)
         dialog._toggle_notes()
         dialog.note.insert('end', '补充凭证备注')
-        with patch('ledger_viewer.jev_ui.messagebox.askyesnocancel', return_value=None):
+        with patch('ledger_viewer.issue_store.write_note', side_effect=OSError('write failed')):
             self.app.close_book()
         self.assertIsNotNone(self.app.store)
         self.assertTrue(dialog.winfo_exists())
-        with patch('ledger_viewer.jev_ui.messagebox.askyesnocancel', return_value=True):
-            self.assertTrue(dialog.request_close())
+        self.assertTrue(dialog.request_close())
         self.assertEqual(list_marks(self.app.store)[0]['note'], '补充凭证备注')
 
     def test_large_source_removal_is_background_and_disables_conflicting_import(self):

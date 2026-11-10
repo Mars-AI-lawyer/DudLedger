@@ -111,7 +111,8 @@ class LedgerStore:
                 raise ValueError("这不是本软件创建的账套文件")
             self.db.execute("PRAGMA journal_mode=WAL")
             from .jev_review import SCHEMA as REVIEW_SCHEMA
-            self.db.executescript(SCHEMA + REVIEW_SCHEMA)
+            from .issue_store import SCHEMA as ISSUE_SCHEMA
+            self.db.executescript(SCHEMA + REVIEW_SCHEMA + ISSUE_SCHEMA)
             self.db.execute("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('format','legal-ledger-viewer-v6')")
             version = self.db.execute("SELECT value FROM ledger_meta WHERE key='format'").fetchone()[0]
             if version not in ("legal-ledger-viewer-v1", "legal-ledger-viewer-v2", "legal-ledger-viewer-v3", "legal-ledger-viewer-v4", "legal-ledger-viewer-v5", "legal-ledger-viewer-v6", "legal-ledger-viewer-v7"):

@@ -36,8 +36,9 @@ def heading_filter_column(view, x: int, y: int) -> str | None:
     if columns == ("#all",):
         columns = tuple(view.cget("columns"))
     widths = [view.column(key, "width") for key in columns]
-    scroll = round(view.xview()[0] * sum(widths))
-    edge = sum(widths[:int(display[1:])]) - scroll
+    tree_width = view.column("#0", "width") if "tree" in tuple(map(str, view.cget("show"))) else 0
+    scroll = round(view.xview()[0] * (sum(widths) + tree_width))
+    edge = tree_width + sum(widths[:int(display[1:])]) - scroll
     # The heading image sits inside the theme's 8 px right padding.
     # Native heading identification above keeps separator dragging out of this hit area.
     return column if edge - 26 <= x <= edge - 4 else None

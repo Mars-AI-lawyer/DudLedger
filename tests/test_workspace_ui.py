@@ -74,7 +74,7 @@ class WorkspaceUITest(unittest.TestCase):
         self.assertFalse(self.app.sidebar_brand.winfo_ismapped())
         self.assertEqual(str(button.cget("compound")), "image")
 
-    def test_detail_calculator_reuses_sidebar_width_and_restores_navigation(self):
+    def test_shared_calculator_preserves_scroll_and_restores_navigation(self):
         self.app._use_book(Path(self.temp.name) / "演示账套.sqlite")
         self.app.tabs.select(1)
         self.app.geometry("1160x690")
@@ -92,9 +92,9 @@ class WorkspaceUITest(unittest.TestCase):
         self.root.update()
         self.assertTrue(tools.panel.winfo_ismapped())
         self.assertFalse(self.app.sidebar.winfo_ismapped())
-        self.assertGreaterEqual(view.winfo_width(), ledger_width)
+        self.assertGreaterEqual(view.winfo_width(), 500)
         self.assertAlmostEqual(view.xview()[0], first)
-        self.assertGreaterEqual(view.xview()[1], last)
+        self.assertGreater(view.xview()[1], first)
 
         menu = self.app.nametowidget(self.app.cget("menu"))
         review = self.app.nametowidget(menu.entrycget(1, "menu"))
@@ -110,7 +110,7 @@ class WorkspaceUITest(unittest.TestCase):
         view.event_generate(f"<{modifier}-Shift-L>")
         self.root.update()
         self.assertFalse(self.app.sidebar.winfo_ismapped())
-        self.assertGreaterEqual(view.winfo_width(), ledger_width)
+        self.assertGreaterEqual(view.winfo_width(), 500)
 
         self.app.tabs.select(0)
         self.root.update()

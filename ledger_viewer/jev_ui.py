@@ -707,7 +707,7 @@ class ReviewDetail(tk.Toplevel):
     def __init__(self, panel, group):
         super().__init__(panel)
         from .ui import VIEW_COLUMNS, amount, tree
-        from .voucher_notes import list_marks, mark_for_entry, remove_mark, save_mark
+        from .voucher_notes import list_marks, mark_for_entry, remove_mark, save_mark, voucher_key
         self._mark_tools = (mark_for_entry, remove_mark, save_mark, list_marks)
         self.panel, self.app, self.group = panel, panel.app, group
         self.app.review_windows.add(self)
@@ -759,21 +759,35 @@ class ReviewDetail(tk.Toplevel):
             self.note.insert('1.0', existing_mark['note'])
         self._saved_note = (self.attention.get(), self.note.get('1.0', 'end-1c'))
         self.feedback = tk.StringVar()
+        self.note_key = voucher_key(lines[0]) if lines else group['key']
+        self.note_draft = self.app.note_hub.bind(self, self.note, self.note_key, self.feedback, on_saved=self._note_saved)
         ttk.Label(self.note_area, textvariable=self.feedback, foreground='#555').pack(anchor='w')
         ttk.Button(self.note_area, text='保存关注与注释', command=self._save_attention, style='Accent.TButton').pack(anchor='e', pady=(6, 0))
+        ttk.Button(self.note_area, text='重读已保存备注…', command=lambda: self.app.note_hub.reload(self.note)).pack(anchor='e')
         self.json_area = ttk.Frame(self)
         self.json_text = None
         self.bind('<Escape>', lambda _event: self.request_close())
         self.protocol('WM_DELETE_WINDOW', self.request_close)
 
     def request_close(self):
-        if (self.attention.get(), self.note.get('1.0', 'end-1c')) != self._saved_note:
-            decision = messagebox.askyesnocancel('注释尚未保存',
-                '这张凭证的关注或注释尚未保存。\n选择“是”保存，“否”放弃，“取消”继续编辑。', parent=self)
-            if decision is None or (decision and not self._save_attention()):
-                return False
+        if not self.note_draft.flush():
+            self.note.focus_set()
+            return False
+        if self.attention.get() != self._saved_note[0] and not self._save_attention():
+            return False
         self.destroy()
         return True
+
+    def _note_saved(self):
+        from .issue_store import note_record
+        current = note_record(self.store, self.note_key)
+        pending_attention = self.attention.get() != self._saved_note[0]
+        if not pending_attention:
+            self.attention.set(bool(current))
+        self._saved_note = (bool(current), self.note.get('1.0', 'end-1c'))
+        for item in self.voucher_view.get_children():
+            self.voucher_view.item(item, tags=('marked',) if current else ())
+        self.app.update_mark_indicators(self.note_key)
 
     def _toggle_json(self):
         if self.json_text is not None and self.json_text.winfo_manager():
@@ -820,29 +834,24 @@ class ReviewDetail(tk.Toplevel):
             self.note.focus_set()
 
     def _save_attention(self):
-        mark_for_entry, remove_mark, save_mark, _list_marks = self._mark_tools
+        from .issue_store import write_note
+        mark_for_entry, remove_mark, _save_mark, _list_marks = self._mark_tools
+        requested = self.attention.get()
+        if not self.note_draft.flush() or not self.app.note_hub.flush():
+            return False
         try:
             current = mark_for_entry(self.store, self.entry_id)
-            if self.attention.get():
-                if current:
-                    status = next((item['status'] for item in _list_marks(self.store) if item['key'] == current['voucher_key']), '正常')
-                    if status == '内容变化' and not messagebox.askyesno('确认凭证内容', '凭证内容与原标注时不同。确认已核对当前分录并继续关注吗？', parent=self):
-                        return False
-                save_mark(self.store, self.entry_id, self.note.get('1.0', 'end-1c'))
-                self.feedback.set('已保存至关注凭证')
-            elif current:
-                remove_mark(self.store, current['voucher_key'])
-                self.feedback.set('已取消关注')
-            else:
-                self.feedback.set('未关注此凭证')
+            if requested and current is None:
+                write_note(self.store, self.note_key, None, self.note.get('1.0', 'end-1c'))
+            elif not requested and current:
+                remove_mark(self.store, self.note_key)
+            self.app.note_hub.broadcast(self.note_key)
+            self._note_saved()
+            self.feedback.set('已保存至关注凭证' if requested else '已取消关注；问题关联保留')
         except Exception as exc:
-            messagebox.showerror('保存失败', str(exc), parent=self)
+            self.feedback.set(f'保存失败：{exc}')
             return False
-        self.app.refresh_details()
         self.app.refresh_marks()
-        for item in self.voucher_view.get_children():
-            self.voucher_view.item(item, tags=('marked',) if self.attention.get() else ())
-        self._saved_note = (self.attention.get(), self.note.get('1.0', 'end-1c'))
         return True
 
     def _save_ignore(self):

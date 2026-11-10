@@ -34,7 +34,9 @@ from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_
 from .store import LedgerStore
 from .theme import configure_theme
 from .table_tools import TableTools
-from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_mark, save_mark, save_mark_by_key, source_account, update_mark_note, voucher_key
+from .workbench import NoteHub, RightWorkbench, VoucherDrag
+from . import issue_store
+from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_mark, save_mark_by_key, source_account, voucher_key
 
 
 FIELD_LABELS = {
@@ -1743,6 +1745,7 @@ class App(tk.Toplevel):
         self._sidebar_expanded = False
         self._sidebar_mode = None
         self._show_sidebar_with_calculator = False
+        self.note_hub = NoteHub(self)
         self._layout()
         self._build_menu()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -1806,7 +1809,14 @@ class App(tk.Toplevel):
         self.content = ttk.Frame(self.workspace)
         self.content.pack(fill="both", expand=True, padx=18, pady=(12, 0))
         self.tabs = ttk.Notebook(self.content, style="Workspace.TNotebook")
-        self.tabs.pack(fill="both", expand=True)
+        self.content.columnconfigure(0, weight=1)
+        self.content.rowconfigure(0, weight=1)
+        self.tabs.grid(row=0, column=0, sticky="nsew")
+        self.workbench = RightWorkbench(self)
+        self.drag = VoucherDrag(self)
+        self.drag.attach(self.workbench.tree, lambda row: self.workbench.rows[row][1], tree_handle=False)
+        self.content.bind("<Configure>", lambda _e: self.workbench.layout())
+        ttk.Button(toolbar, text="问题工作台", command=self.workbench.show).pack(side="right", padx=4)
         self.utility_windows = {}
         frames = []
         for title in ("科目总览", "明细账", "资产负债表", "利润表", "核对提醒", "导入记录", "关注凭证", "AI 尽调线索"):
@@ -1863,7 +1873,9 @@ class App(tk.Toplevel):
         self.summary_view.bind("<<TreeviewClose>>", self._after_expansion_change)
         self.summary_view.bind("<Double-1>", self.open_account)
         self.balance_tools = TableTools(self.summary_view, {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc"},
-            source_for_row=lambda row: self.balance_calc_sources.get(row, row))
+            source_for_row=lambda row: self.balance_calc_sources.get(row, row),
+            panel_parent=self.workbench.calculator_host("科目总览"),
+            on_toggle=lambda reveal: self.workbench.set_calculator(self.balance_tools, "科目总览", reveal))
         ttk.Button(balance_actions, text="计算器", command=self.balance_tools.toggle).pack(side="right", padx=4)
         self.detail_controls = ttk.Frame(frames[1], padding=5)
         self.detail_controls.pack(fill="x")
@@ -1912,7 +1924,9 @@ class App(tk.Toplevel):
         self.detail_filter_images = (filter_arrow(self.detail_view), filter_arrow(self.detail_view, active=True))
         self.detail_view.bind("<ButtonPress-1>", self._detail_filter_click)
         self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"},
-                                       on_visibility_changed=self._detail_calculator_changed)
+                                       panel_parent=self.workbench.calculator_host("明细账"),
+                                       on_toggle=lambda reveal: self.workbench.set_calculator(self.detail_tools, "明细账", reveal))
+        self.drag.attach(self.detail_view, lambda row: voucher_key(self.store.entry(int(row))))
         ttk.Button(self.detail_actions, text="计算器", width=0, command=self.detail_tools.toggle).pack(side="right", padx=6)
         self.detail_mark.pack(side="right")
         self._register_column_view("detail", self.detail_view)
@@ -1979,6 +1993,7 @@ class App(tk.Toplevel):
         ttk.Button(mark_actions, text="另存为 MD", command=lambda: self.export_marks(as_new=True)).pack(side="right")
         ttk.Button(mark_actions, text="更新关注凭证 MD", command=self.export_marks, style="Accent.TButton").pack(side="right", padx=5)
         self.mark_view = tree(frames[6], [("status", "状态", 85), ("voucher", "凭证", 175), ("accounts", "涉及科目", 275), ("note", "注释摘要", 360)])
+        self.drag.attach(self.mark_view, lambda row: self.mark_keys[row])
         self.mark_view.bind("<<TreeviewSelect>>", self._load_selected_mark)
         self.mark_view.bind("<Double-1>", self.open_selected_mark_voucher)
         note_frame = ttk.Frame(frames[6], padding=(6, 6))
@@ -1986,7 +2001,10 @@ class App(tk.Toplevel):
         ttk.Label(note_frame, text="注释").pack(anchor="w")
         self.mark_note = tk.Text(note_frame, height=4, wrap="word", undo=True, background="#FFFDFB", relief="solid", borderwidth=1)
         self.mark_note.pack(fill="x", pady=(4, 5))
+        self.mark_note_status = tk.StringVar()
+        ttk.Label(note_frame, textvariable=self.mark_note_status, style="Hint.TLabel").pack(anchor="w")
         ttk.Button(note_frame, text="保存注释", command=self.edit_selected_mark).pack(anchor="e")
+        ttk.Button(note_frame, text="重读已保存备注…", command=lambda: self.note_hub.reload(self.mark_note)).pack(anchor="e")
         from .jev_ui import ReviewPanel
         self.review_panel = ReviewPanel(frames[7], self)
         self.tabs.bind("<<NotebookTabChanged>>", self._page_changed)
@@ -2015,11 +2033,13 @@ class App(tk.Toplevel):
         for page, button in enumerate(self.nav_buttons):
             button.state(["selected" if page == index else "!selected"])
         self._resize_workspace()
+        self.workbench.page_changed()
         if index == 5:
             self.review_panel.refresh()
 
     def _detail_calculator_active(self) -> bool:
-        return self.tabs.index("current") == 1 and bool(self.detail_tools.panel.winfo_manager())
+        return (self.workbench.visible and self.workbench.mode == "calculator"
+                and self.workbench.active_tools is self.detail_tools and self.tabs.index("current") == 1)
 
     def _detail_calculator_changed(self, visible: bool) -> None:
         if not visible:
@@ -2079,7 +2099,7 @@ class App(tk.Toplevel):
             text=("隐藏侧栏" if collapse else "显示侧栏") if calculator else ("折叠为图标" if collapse else "展开侧栏文字"),
             image=self.sidebar_icons["collapse" if collapse else "expand"],
         )
-        self.detail_tools.set_compact_width(None if mode == "text" else sidebar_width)
+        self.workbench.layout()
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self)
@@ -2097,6 +2117,7 @@ class App(tk.Toplevel):
         review.add_command(label="科目总览", command=lambda: self.tabs.select(0))
         review.add_command(label="明细账", command=lambda: self.tabs.select(1))
         review.add_command(label="关注凭证", command=lambda: self.tabs.select(4))
+        review.add_command(label="问题工作台", command=self.workbench.show)
         review.add_command(label="AI 尽调线索", command=lambda: (self.review_panel.refresh(), self.tabs.select(5)))
         review.add_command(label="筛选全部凭证…", command=lambda: (self.tabs.select(5), self.review_panel.new_batch()))
         review.add_command(label="尽调主体名单…", command=self.open_related_parties)
@@ -2177,6 +2198,9 @@ class App(tk.Toplevel):
         RelatedPartiesDialog(self)
 
     def _close(self) -> None:
+        self.drag.cancel()
+        if not self.workbench.flush():
+            return
         for dialog in list(self.voucher_windows | self.review_windows):
             if dialog.winfo_exists() and not dialog.request_close():
                 return
@@ -2208,6 +2232,9 @@ class App(tk.Toplevel):
         if not self.store:
             self.status.set("当前没有打开的账套。")
             return
+        self.drag.cancel()
+        if not self.workbench.flush():
+            return
         for dialog in list(self.voucher_windows | self.review_windows):
             if dialog.winfo_exists() and not dialog.request_close():
                 return
@@ -2225,6 +2252,9 @@ class App(tk.Toplevel):
         self.controller.book_windows.pop(self.store.path.resolve(), None)
         self.store.close()
         self.store = None
+        self.note_hub.unbind(self.mark_note)
+        self.workbench.reset()
+        self.workbench.hide()
         self.detail_tools.clear()
         self.balance_tools.clear()
         self.account = None
@@ -2247,12 +2277,15 @@ class App(tk.Toplevel):
         self.status.set("已退出当前账套；可导入 Excel 或打开已有账套。")
 
     def _use_book(self, path: Path) -> None:
+        if self.store and not self.workbench.flush():
+            return
         try:
             new_store = LedgerStore(path)
         except Exception as exc:
             messagebox.showerror("打开失败", str(exc), parent=self)
             return
         self.store = new_store
+        self.workbench.reset()
         self.detail_offset = self.detail_total = 0
         self._checks_cache = None
         self._check_render_token = None
@@ -2443,6 +2476,8 @@ class App(tk.Toplevel):
         self.open_voucher(None, edit_attention=True)
 
     def refresh_marks(self, select_key: str | None = None) -> None:
+        if not self.note_hub.flush():
+            return
         self.tasks.cancel("marks")
         if self.store and self.store.large_book():
             self._read_task("marks", list_marks, lambda marks: self._render_marks(marks, select_key))
@@ -2450,9 +2485,12 @@ class App(tk.Toplevel):
             self._render_marks(list_marks(self.store) if self.store else [], select_key)
 
     def _render_marks(self, marks, select_key):
+        if not self.note_hub.flush():
+            return
         self.mark_view.delete(*self.mark_view.get_children())
         self.mark_keys = {}
         self.mark_entry_ids = {}
+        self.note_hub.unbind(self.mark_note)
         self.selected_mark_key = None
         self.mark_note.delete("1.0", "end")
         if not self.store:
@@ -2471,13 +2509,15 @@ class App(tk.Toplevel):
             iid = str(index)
             self.mark_keys[iid] = mark["key"]
             self.mark_entry_ids[iid] = lines[0]["id"] if lines else None
-            self.mark_view.insert("", "end", iid=iid, values=(mark["status"], label, accounts, mark["note"].replace("\n", " ")[:160]))
+            self.mark_view.insert("", "end", iid=iid, text="⋮⋮", values=(mark["status"], label, accounts, mark["note"].replace("\n", " ")[:160]))
             if mark["key"] == select_key:
                 self.mark_view.selection_set(iid)
                 self.mark_view.see(iid)
                 self._load_selected_mark()
 
     def open_selected_mark_voucher(self, _event: object = None) -> None:
+        if _event is not None and self.mark_view.identify_column(_event.x) == "#0":
+            return "break"
         selection = self.mark_view.selection()
         if not selection:
             messagebox.showinfo("请选择凭证", "请先在关注凭证列表中选中一张凭证。", parent=self)
@@ -2496,22 +2536,69 @@ class App(tk.Toplevel):
         key = self._selected_mark_key()
         if key == self.selected_mark_key:
             return
+        if not self.note_hub.flush():
+            previous = next((row for row, value in self.mark_keys.items() if value == self.selected_mark_key), None)
+            if previous:
+                self.mark_view.selection_set(previous)
+            return
+        self.note_hub.unbind(self.mark_note)
         self.selected_mark_key = key
         self.mark_note.delete("1.0", "end")
         if key and self.store:
-            row = self.store.db.execute("SELECT note FROM voucher_marks WHERE voucher_key=?", (key,)).fetchone()
-            if row:
-                self.mark_note.insert("1.0", row["note"])
+            self.note_hub.bind(self.mark_note, self.mark_note, key, self.mark_note_status,
+                               on_saved=lambda: self.update_mark_indicators(key))
 
     def edit_selected_mark(self) -> None:
-        key = self._selected_mark_key()
-        if not key or not self.store:
+        self.note_hub.flush()
+
+    def update_mark_indicators(self, key):
+        if not self.store:
             return
-        update_mark_note(self.store, key, self.mark_note.get("1.0", "end-1c"))
-        self.refresh_marks(select_key=key)
-        self.status.set("注释已保存在当前账套；更新 MD 时会使用最新内容。")
+        mark = issue_store.note_record(self.store, key)
+        for row in self.detail_view.get_children():
+            # Update existing rows in place: do not reset cell selection or scroll.
+            if getattr(self, "detail_voucher_keys", {}).get(row) == key:
+                self.detail_view.set(row, "marked", "●" if mark else "")
+                self.detail_view.item(row, tags=("marked",) if mark else ())
+        if mark is not None and key not in self.mark_keys.values() and not getattr(self, "_marks_refresh_scheduled", False):
+            self._marks_refresh_scheduled = True
+            def refresh_later():
+                self._marks_refresh_scheduled = False
+                if self.store:
+                    self.refresh_marks(select_key=self.selected_mark_key)
+            self.after_idle(refresh_later)
+        for row, row_key in self.mark_keys.items():
+            if row_key == key and self.mark_view.exists(row) and mark:
+                self.mark_view.set(row, "note", mark["note"].replace("\n", " ")[:160])
+
+    def locate_issue_voucher(self, key):
+        if not self.store or not self.workbench.flush():
+            return
+        item = issue_store.voucher_preview(self.store, key)
+        entry_id = item["entry_id"]
+        if entry_id is None:
+            self.status.set("原凭证未匹配，可在工作台查看归集时快照。")
+            return
+        if self.detail_view.exists(str(entry_id)):
+            self.tabs.select(1)
+            self.detail_view.selection_set(str(entry_id))
+            self.detail_view.see(str(entry_id))
+            return
+        if (self.account or self.detail_search or self.detail_conditions or any(self._period_bounds())):
+            if not messagebox.askyesno("定位凭证", "目标分录不在当前显示范围内。清除科目和筛选，并按日期定位该分录？", parent=self):
+                return
+        self.account = None
+        self.include_descendants = False
+        self.account_label.set("全部科目")
+        self._reset_detail_filters()
+        self.detail_sort, self.detail_descending = "date", False
+        self.detail_locate_target = entry_id
+        self.tabs.select(1)
+        self.refresh_details()
 
     def confirm_selected_mark(self) -> None:
+        if not self.workbench.flush():
+            return
         key = self._selected_mark_key()
         if not key or not self.store:
             return
@@ -2527,12 +2614,17 @@ class App(tk.Toplevel):
 
     def remove_selected_mark(self) -> None:
         key = self._selected_mark_key()
+        if not self.workbench.flush():
+            return
         if key and self.store and messagebox.askyesno("取消关注", "确定取消关注并删除这条注释吗？", parent=self):
             remove_mark(self.store, key)
+            self.note_hub.broadcast(key)
             self.refresh_details()
             self.refresh_marks()
 
     def export_marks(self, as_new: bool = False) -> None:
+        if not self.workbench.flush():
+            return
         if not self.store:
             return
         path_text = "" if as_new else self.store.setting("marked_export_path")
@@ -2642,6 +2734,9 @@ class App(tk.Toplevel):
         self.period_to.set("不限")
 
     def refresh_all(self) -> None:
+        if not self.workbench.flush():
+            return
+        self.workbench.refresh_directory()
         for view in (self.source_view, self.mark_view):
             view.delete(*view.get_children())
         for view in self.report_views.values():
@@ -2932,11 +3027,16 @@ class App(tk.Toplevel):
             self.detail_offset = 0
         self._detail_scope = scope
         offset = self.detail_offset
+        locate_id = getattr(self, "detail_locate_target", None)
+        self.detail_locate_target = None
         def query(store):
-            page = store.entries_page(**filters, offset=offset)
+            current_offset = offset
+            if locate_id is not None:
+                current_offset = issue_store.entry_page_offset(store, locate_id)
+            page = store.entries_page(**filters, offset=current_offset)
             marked = {row["voucher_key"] for row in store.db.execute("SELECT voucher_key FROM voucher_marks")}
             parties = build_party_index(store.related_parties())
-            return page, marked, parties
+            return page, marked, parties, locate_id
         self.detail_prev.configure(state="disabled")
         self.detail_next.configure(state="disabled")
         if self.store.large_book():
@@ -2946,13 +3046,20 @@ class App(tk.Toplevel):
             self._render_details(query(self.store))
 
     def _render_details(self, result):
-        (rows_found, total, offset), marked_keys, party_index = result
+        (rows_found, total, offset), marked_keys, party_index, *locate = result
+        locate_id = locate[0] if locate else None
+        self.detail_voucher_keys = {}
         self.detail_total, self.detail_offset = total, offset
         self.detail_view.delete(*self.detail_view.get_children())
         for row in rows_found:
             side_tag = "debit_row" if row["debit_cents"] and not row["credit_cents"] else "credit_row" if row["credit_cents"] and not row["debit_cents"] else ""
+            self.detail_voucher_keys[str(row["id"])] = voucher_key(row)
             marked = voucher_key(row) in marked_keys
-            self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
+            self.detail_view.insert("", "end", iid=str(row["id"]), text="⋮⋮", values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
+        if locate_id is not None and self.detail_view.exists(str(locate_id)):
+            self.detail_view.selection_set(str(locate_id))
+            self.detail_view.see(str(locate_id))
+            self._update_detail_mark()
         pages = max(1, (total + 499) // 500)
         self.detail_page_label.set(f"第 {offset // 500 + 1} / {pages} 页")
         if pages > 1:
@@ -3044,6 +3151,8 @@ class App(tk.Toplevel):
         self.status.set("已记住当前展开的科目；刷新或重启后仍保持。")
 
     def open_voucher(self, _event: object, entry_id: int | None = None, *, edit_attention: bool = False) -> None:
+        if _event is not None and self.detail_view.identify_column(_event.x) == "#0":
+            return "break"
         if not self.store:
             return
         selection = self.detail_view.selection()
@@ -3078,6 +3187,8 @@ class App(tk.Toplevel):
         more.configure(menu=display_menu)
         view = tree(dialog, VIEW_COLUMNS["voucher"])
         dialog.cell_tools = TableTools(view, {"debit", "credit", "original"})
+        self.drag.attach(view, lambda _row: voucher_key(target))
+        ttk.Button(voucher_top, text="加入问题…", command=lambda: self.workbench.choose_issue(voucher_key(target))).pack(side="right", padx=4)
         ttk.Button(voucher_top, text="计算器", command=dialog.cell_tools.toggle).pack(side="right", padx=4)
         view.configure(height=min(8, max(2, len(lines))))
         self._register_column_view("voucher", view)
@@ -3087,7 +3198,7 @@ class App(tk.Toplevel):
         view.bind("<ButtonRelease-1>", lambda _e, widget=view: self._save_voucher_widths(widget), add="+")
         for line in lines:
             side_tag = "debit_row" if line["debit_cents"] and not line["credit_cents"] else "credit_row" if line["credit_cents"] and not line["debit_cents"] else ""
-            view.insert("", "end", values=(line["code"], line["name"], line["summary"], line["auxiliary"], line["currency"], line["original_amount"], amount(line["debit_cents"]), amount(line["credit_cents"]), f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'), tags=("marked",) if existing_mark else ((side_tag,) if side_tag else ()))
+            view.insert("", "end", text="⋮⋮", values=(line["code"], line["name"], line["summary"], line["auxiliary"], line["currency"], line["original_amount"], amount(line["debit_cents"]), amount(line["credit_cents"]), f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'), tags=("marked",) if existing_mark else ((side_tag,) if side_tag else ()))
         debit = sum(line["debit_cents"] for line in lines)
         credit = sum(line["credit_cents"] for line in lines)
         ttk.Label(dialog, text=f"{len(lines)} 行分录   借方 {amount(debit) or '0.00'}   贷方 {amount(credit) or '0.00'}   差额 {amount(debit-credit) or '0.00'}", padding=(12, 7)).pack(anchor="w")
@@ -3106,39 +3217,48 @@ class App(tk.Toplevel):
         actions.pack(fill="x", pady=(7, 0))
         feedback = tk.StringVar()
         ttk.Label(actions, textvariable=feedback, style="Hint.TLabel").pack(side="left")
+        def note_saved():
+            nonlocal saved_state
+            current = issue_store.note_record(self.store, voucher_key(target))
+            pending_attention = attention.get() != saved_state[0]
+            if not pending_attention:
+                attention.set(bool(current))
+            for item in view.get_children():
+                view.item(item, tags=("marked",) if current else ())
+            self.update_mark_indicators(voucher_key(target))
+            saved_state = (bool(current), editor.get("1.0", "end-1c"))
+
+        note_draft = self.note_hub.bind(dialog, editor, voucher_key(target), feedback, on_saved=note_saved)
+        dialog.note_draft = note_draft
+
         def save_attention() -> bool:
             nonlocal saved_state
+            requested_attention = attention.get()
+            if not note_draft.flush() or not self.note_hub.flush():
+                return False
             try:
                 current = mark_for_entry(self.store, entry_id)
-                if attention.get():
-                    if current:
-                        current_status = next((item["status"] for item in list_marks(self.store) if item["key"] == current["voucher_key"]), "正常")
-                        if current_status == "内容变化" and not messagebox.askyesno("确认凭证内容", "凭证内容与原标注时不同。确认已核对当前分录并继续关注吗？", parent=dialog):
-                            return False
-                    save_mark(self.store, entry_id, editor.get("1.0", "end-1c"))
+                if requested_attention:
+                    if current is None:
+                        issue_store.write_note(self.store, voucher_key(target), None, editor.get("1.0", "end-1c"))
                     feedback.set("已保存至关注凭证")
                 elif current:
-                    remove_mark(self.store, current["voucher_key"])
-                    feedback.set("已取消关注")
-                else:
-                    feedback.set("未关注此凭证")
+                    remove_mark(self.store, voucher_key(target))
+                    feedback.set("已取消关注；问题关联保留")
+                self.note_hub.broadcast(voucher_key(target))
+                note_saved()
             except Exception as exc:
-                messagebox.showerror("保存失败", str(exc), parent=dialog)
+                feedback.set(f"保存失败：{exc}")
                 return False
-            for item in view.get_children():
-                view.item(item, tags=("marked",) if attention.get() else ())
-            self.refresh_details()
             self.refresh_marks(select_key=voucher_key(target) if attention.get() else None)
-            saved_state = (attention.get(), editor.get("1.0", "end-1c"))
             return True
 
         def request_close() -> bool:
-            current_state = (attention.get(), editor.get("1.0", "end-1c"))
-            if current_state != saved_state:
-                decision = messagebox.askyesnocancel("注释尚未保存",
-                    "这张凭证的关注或注释尚未保存。\n选择“是”保存，“否”放弃，“取消”继续编辑。", parent=dialog)
-                if decision is None or (decision and not save_attention()):
-                    return False
+            if not note_draft.flush():
+                editor.focus_set()
+                return False
+            if attention.get() != saved_state[0] and not save_attention():
+                return False
             dialog.destroy()
             return True
 
@@ -3146,6 +3266,7 @@ class App(tk.Toplevel):
         dialog.note_editor = editor
         dialog.protocol("WM_DELETE_WINDOW", request_close)
         ttk.Button(actions, text="保存关注与注释", command=save_attention, style="Accent.TButton").pack(side="right")
+        ttk.Button(actions, text="重读已保存备注…", command=lambda: self.note_hub.reload(editor)).pack(side="right", padx=4)
         collapsed_label = "查看 / 编辑关注备注" if existing_mark else "关注这张凭证"
         note_height = 0
         def toggle_notes() -> None:

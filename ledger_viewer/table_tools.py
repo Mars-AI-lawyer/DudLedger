@@ -101,12 +101,13 @@ class TableTools:
     """Track a rectangular range in displayed order, independently of row focus."""
 
     def __init__(self, view: ttk.Treeview, money_columns: set[str], *, source_for_row=None,
-                 on_visibility_changed=None):
+                 on_visibility_changed=None, panel_parent=None, on_toggle=None):
         self.view = view
         view.cell_tools = self
         self.money_columns = money_columns
         self.source_for_row = source_for_row
         self.on_visibility_changed = on_visibility_changed
+        self.on_toggle = on_toggle
         self.active: tuple[str, str] | None = None
         self.anchor: tuple[str, str] | None = None
         self.column_order = ()
@@ -124,7 +125,7 @@ class TableTools:
         self.stats = tk.StringVar(value="拖动框选，自动合计与计数；Ctrl+C / ⌘C 复制选区")
         ttk.Label(view.master, textvariable=self.stats, padding=(5, 4), anchor="w").grid(
             row=2, column=0, columnspan=2, sticky="ew")
-        self.panel = ttk.Frame(view.master, padding=(12, 8), width=270)
+        self.panel = ttk.Frame(panel_parent if panel_parent is not None else view.master, padding=(12, 8), width=270)
         self.panel.grid(row=0, column=2, rowspan=2, sticky="nsew")
         self.panel.grid_remove()
         self.panel.columnconfigure(0, weight=1)
@@ -151,7 +152,8 @@ class TableTools:
         self.plus.pack(side="left", fill="x", expand=True)
         self.minus = ttk.Button(operations, text="－ 减去", width=8, command=lambda: self.calculate(-1), state="disabled")
         self.minus.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        ttk.Label(self.panel, text="计算过程", font=("", 11, "bold")).grid(row=3, column=0, sticky="w", pady=(12, 5))
+        history_title = ttk.Label(self.panel, text="计算过程", font=("", 11, "bold"))
+        history_title.grid(row=3, column=0, sticky="w", pady=(12, 5))
         history_holder = ttk.Frame(self.panel)
         history_holder.grid(row=4, column=0, sticky="nsew")
         history_holder.rowconfigure(0, weight=1)
@@ -170,7 +172,8 @@ class TableTools:
                                       relief="flat", borderwidth=0, font="TkTextFont", background="#FAF9F5")
         self.history_detail.grid(row=5, column=0, sticky="ew", pady=(5, 8))
         self._set_history_detail("点击加或减，将当前选区记入计算。")
-        ttk.Label(self.panel, text="累计结果", font=("", 11, "bold")).grid(row=6, column=0, sticky="w")
+        result_title = ttk.Label(self.panel, text="累计结果", font=("", 11, "bold"))
+        result_title.grid(row=6, column=0, sticky="w")
         self.result = tk.StringVar(value="0.00")
         self.result_entry = ttk.Entry(self.panel, textvariable=self.result, state="readonly", justify="right", width=24)
         self.result_entry.grid(row=7, column=0, sticky="ew", pady=(3, 8))
@@ -184,6 +187,13 @@ class TableTools:
         self.clear_button.pack(side="right")
         self.hint = ttk.Label(self.panel, text="换选区只更新预览，点击加减后累计。", foreground="#666", wraplength=245)
         self.hint.grid(row=9, column=0, sticky="w", pady=(8, 0))
+        if panel_parent is not None:
+            # Keep the result and every calculation action above the scrollable history.
+            self.panel.rowconfigure(4, weight=0)
+            self.panel.rowconfigure(7, weight=1)
+            for widget, row in ((result_title, 3), (self.result_entry, 4), (actions, 5),
+                                (history_title, 6), (history_holder, 7), (self.history_detail, 8)):
+                widget.grid_configure(row=row)
         self.borders = [tk.Frame(view, background="#587A67", borderwidth=0) for _ in range(4)]
         for border in self.borders:
             border.bind("<Button-1>", self._click)
@@ -448,7 +458,9 @@ class TableTools:
                 cells.append(AmountSnapshot(row, column, self.view.heading(column, "text"), value, number, source))
         snapshot = SelectionSnapshot(tuple(rows), tuple(columns), tuple(cells))
         self.calculation.add(sign, str(self.summary.total), selection_name(len(self.calculation.items) + 1), snapshot)
-        if reveal and not self.panel.winfo_manager():
+        if reveal and self.on_toggle is not None:
+            self.on_toggle(True)
+        elif reveal and not self.panel.winfo_manager():
             self.toggle()
         self._render()
 
@@ -520,6 +532,8 @@ class TableTools:
             self.history.column("amount", width=115, minwidth=95, stretch=True)
 
     def toggle(self):
+        if self.on_toggle is not None:
+            return self.on_toggle(False)
         visible = not bool(self.panel.winfo_manager())
         if visible:
             self.panel.grid()
