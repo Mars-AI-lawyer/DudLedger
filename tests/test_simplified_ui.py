@@ -52,53 +52,65 @@ class SimplifiedUITest(unittest.TestCase):
         self.temp.cleanup()
 
     def click_report(self, kind, row, field):
-        self.app.tabs.select(2 if kind == 'balance_sheet' else 3)
+        self.app.select_page('reports')
+        self.app.report_kind.set(kind)
+        self.app.switch_report()
         self.root.update()
         view = self.app.report_views[kind]
-        # Scroll the right side into view to exercise the actual display-column mapping.
         if field == 'right_item':
-            view.xview_moveto(1)
+            view.xview_moveto(.5)
             self.root.update()
         x, y, width, height = view.bbox(str(row), field)
-        event = SimpleNamespace(x=max(x + 5, 5), y=y + height // 2)
-        self.app.open_report_account(kind, event)
+        view.event_generate('<ButtonPress-1>', x=max(x + 5, 5), y=y + height // 2)
+        view.event_generate('<ButtonRelease-1>', x=max(x + 5, 5), y=y + height // 2)
+        self.root.update()
 
     def shown_codes(self):
         return [self.app.detail_view.set(item, 'code') for item in self.app.detail_view.get_children()]
 
-    def test_left_right_and_income_click_clear_old_filters(self):
+    def test_report_clicks_preserve_detail_filters_and_never_navigate(self):
         self.app.search.set('不存在')
         self.app.period_from.set('2026年7期')
         self.app.period_to.set('2026年8期')
-        self.click_report('balance_sheet', 2, 'left_item')
-        self.assertEqual(self.shown_codes(), ['1002', '100201'])
-        self.assertEqual(self.app.search.get(), '')
-        self.assertEqual(self.app.period_from.get(), '不限')
-        self.assertEqual(self.app.period_to.get(), '不限')
-        self.click_report('balance_sheet', 2, 'right_item')
-        self.assertEqual(self.shown_codes(), ['2202'])
-        self.click_report('income_statement', 2, 'left_item')
-        self.assertEqual(self.shown_codes(), ['6001'])
-        self.assertEqual(self.app.tabs.tab(self.app.tabs.select(), 'text'), '明细账')
+        for kind, field in (('balance_sheet', 'left_item'), ('balance_sheet', 'right_item'), ('income_statement', 'left_item')):
+            self.click_report(kind, 2, field)
+            self.assertEqual(self.app.current_page(), 'reports')
+            self.assertEqual(self.app.search.get(), '不存在')
+            self.assertEqual(self.app.period_from.get(), '2026年7期')
+        self.assertFalse(any(isinstance(w, ReportAccountsDialog) for w in self.app.winfo_children()))
 
-    def test_suggested_and_explicit_mappings_jump_directly_and_unknown_opens_picker(self):
-        self.click_report('balance_sheet', 3, 'left_item')
-        self.assertEqual(self.shown_codes(), ['1002', '100201'])
-        self.assertTrue(self.app.include_descendants)
-        source_id = self.app.report_options['balance_sheet'][self.app.report_source['balance_sheet'].get()]
-        self.store.save_setting('reconciliation_plan', json.dumps({'mappings': [
-            {'kind': 'balance_sheet', 'source_id': source_id, 'row_no': 3, 'side': 'left', 'accounts': ['C:1002', 'C:100201']}
-        ]}))
-        self.click_report('balance_sheet', 3, 'left_item')
-        self.assertEqual(self.shown_codes(), ['1002', '100201'])
-        self.assertFalse(self.app.include_descendants)
-        self.click_report('balance_sheet', 4, 'left_item')
-        picker = next(w for w in self.app.winfo_children() if isinstance(w, ReportAccountsDialog))
-        self.assertEqual(picker.chosen, set())
-        picker.destroy()
+    def test_report_ranges_copy_sum_and_calculators_remain_independent(self):
+        self.app.select_page('reports')
+        self.root.update()
+        tools = self.app.report_tools['balance_sheet']
+        view = tools.view
+        rows = view.get_children()
+        tools.select(rows[0], 'left_a')
+        tools.select(rows[1], 'left_a', extend=True)
+        self.assertEqual(str(tools.summary.total), '204.00')
+        with patch.object(view, 'clipboard_clear'), patch.object(view, 'clipboard_append') as copied:
+            tools.copy_cell()
+            self.assertEqual(copied.call_args.args[0], '102.00\n102.00')
+        tools.calculate(1)
+        self.app.report_kind.set('income_statement')
+        self.app.switch_report()
+        other = self.app.report_tools['income_statement']
+        other.select(other.view.get_children()[1], 'left_a')
+        other.calculate(-1)
+        self.assertEqual(other.result.get(), '-72.00')
+        self.assertEqual(tools.result.get(), '204.00')
+        self.app.calculator_button.invoke()
+        self.root.update()
+        self.assertIn('利润表', self.app.workbench.calc_source.get())
+        self.app.report_kind.set('balance_sheet')
+        self.app.switch_report()
+        self.assertIn('资产负债表', self.app.workbench.calc_source.get())
 
     def test_numeric_sort_filters_and_export_match(self):
-        self.app.show_report_accounts(['C:1002', 'C:100201'], '选中科目')
+        self.app.account = ['C:1002', 'C:100201']
+        self.app.include_descendants = False
+        self.app.refresh_details()
+        self.app.select_page('entries')
         self.app.sort_details('debit')
         self.assertEqual(self.shown_codes(), ['1002', '100201'])
         self.app.sort_details('debit')

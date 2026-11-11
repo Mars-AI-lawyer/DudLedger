@@ -40,7 +40,7 @@ class WorkflowUITest(unittest.TestCase):
                 window.refresh_all()
                 menu = window.nametowidget(window.cget("menu"))
                 self.assertEqual([menu.entrycget(index, "label") for index in range(menu.index("end") + 1)], ["文件", "查看", "设置"])
-                self.assertEqual([window.tabs.tab(tab, "text") for tab in window.tabs.tabs()], ["科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 尽调线索"])
+                self.assertEqual([window.tabs.tab(tab, "text") for tab in window.tabs.tabs()], ["科目总览", "明细账", "财务报表", "关注凭证", "AI 尽调线索"])
                 # 文件菜单精简为三项：导入 Excel、打开账套、退出当前账套。
                 imports = window.nametowidget(menu.entrycget(0, "menu"))
                 self.assertEqual([imports.entrycget(index, "label") for index in range(imports.index("end") + 1) if imports.type(index) == "command"],
@@ -67,6 +67,8 @@ class WorkflowUITest(unittest.TestCase):
                 self.assertEqual(len(window.detail_view.get_children()), 2)
                 window.detail_view.selection_set(next(iter(window.detail_view.get_children())))
                 window.mark_selected_entry()
+                self.assertFalse(window.voucher_windows)
+                window.open_voucher(None, edit_attention=True)
                 dialog = next(iter(window.voucher_windows))
                 self.assertFalse(any(type(child).__name__ == "NoteDialog" for child in descendants(dialog)))
                 checkbox = next(child for child in descendants(dialog) if isinstance(child, ttk.Checkbutton) and child.cget("text") == "关注这张凭证")
@@ -85,7 +87,7 @@ class WorkflowUITest(unittest.TestCase):
                 editor.insert("end", "，补充流水")
                 save.invoke()
                 self.assertIn("补充流水", list_marks(window.store)[0]["note"])
-                window.tabs.select(4)
+                window.select_page("marks")
                 window.refresh_marks()
                 self.assertEqual(len(window.mark_view.get_children()), 1)
                 window.mark_view.selection_set(next(iter(window.mark_view.get_children())))

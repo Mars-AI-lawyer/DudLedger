@@ -133,7 +133,8 @@ class DetailFilterUITest(unittest.TestCase):
         self.assertTrue(self.app.detail_mark.instate(("!disabled",)))
         with patch.object(self.app, "open_voucher") as open_voucher:
             self.app.detail_mark.invoke()
-            open_voucher.assert_called_once_with(None, edit_attention=True)
+            open_voucher.assert_not_called()
+            self.assertTrue(self.app.store.db.execute("SELECT 1 FROM voucher_marks").fetchone())
 
     def test_more_edits_hidden_conditions_and_search_applies_on_return(self):
         self.view.configure(displaycolumns=("debit", "credit"))

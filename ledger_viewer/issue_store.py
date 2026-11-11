@@ -86,23 +86,71 @@ def issue_vouchers(store, issue_id, offset=0, limit=100):
         WHERE v.issue_id=? ORDER BY v.created_at,v.rowid LIMIT ? OFFSET ?""", (issue_id, limit, offset))]
 
 
-def link_voucher(store, issue_id, key):
-    get_issue(store, issue_id)
-    lines = voucher_lines_for_key(store, key)
+def _link_voucher(store, issue_id, key, lines=None):
+    lines = voucher_lines_for_key(store, key) if lines is None else lines
     existing = store.db.execute("SELECT 1 FROM dd_voucher_refs WHERE voucher_key=?", (key,)).fetchone()
     if not lines and not existing:
         raise ValueError("凭证已不存在，无法加入问题")
+    if lines:
+        signature = voucher_signature(lines)
+        store.db.execute("""INSERT OR IGNORE INTO dd_voucher_refs
+            (voucher_key,label,summary,signature,snapshot_json) VALUES(?,?,?,?,?)""",
+            (key, voucher_label(lines), lines[0]["summary"], signature,
+             json.dumps([dict(row) for row in lines], ensure_ascii=False)))
+        # Never reset an existing mark's note or silently accept changed content.
+        store.db.execute("INSERT OR IGNORE INTO voucher_marks(voucher_key,note,signature) VALUES(?,'',?)", (key, signature))
+    cursor = store.db.execute("INSERT OR IGNORE INTO dd_issue_vouchers(issue_id,voucher_key) VALUES(?,?)", (issue_id, key))
+    return bool(cursor.rowcount)
+
+def link_vouchers(store, issue_id, keys):
+    from .voucher_summary import voucher_lines_many
+    keys = tuple(dict.fromkeys(keys))
+    get_issue(store, issue_id)
+    lines = voucher_lines_many(store, keys)
     with store.db:
-        if lines:
-            signature = voucher_signature(lines)
-            store.db.execute("""INSERT OR IGNORE INTO dd_voucher_refs
-                (voucher_key,label,summary,signature,snapshot_json) VALUES(?,?,?,?,?)""",
-                (key, voucher_label(lines), lines[0]["summary"], signature,
-                 json.dumps([dict(row) for row in lines], ensure_ascii=False)))
-            # Never reset an existing mark's note or silently accept changed content.
-            store.db.execute("INSERT OR IGNORE INTO voucher_marks(voucher_key,note,signature) VALUES(?,'',?)", (key, signature))
-        cursor = store.db.execute("INSERT OR IGNORE INTO dd_issue_vouchers(issue_id,voucher_key) VALUES(?,?)", (issue_id, key))
-        return bool(cursor.rowcount)
+        added = sum(_link_voucher(store, issue_id, key, lines.get(key, [])) for key in keys)
+    return {'added': added, 'duplicates': len(keys) - added}
+
+
+def create_issue_with_vouchers(store, title, keys):
+    from .voucher_summary import voucher_lines_many
+    title = title.strip()
+    if not title:
+        raise ValueError('请输入问题名称')
+    if store.db.execute('SELECT 1 FROM dd_issues WHERE title=?', (title,)).fetchone():
+        raise ValueError('已有同名问题，请使用其他名称')
+    keys = tuple(dict.fromkeys(keys))
+    lines = voucher_lines_many(store, keys)
+    with store.db:
+        issue_id = store.db.execute('INSERT INTO dd_issues(title) VALUES(?)', (title,)).lastrowid
+        for key in keys:
+            _link_voucher(store, issue_id, key, lines.get(key, []))
+    return issue_id
+
+
+def link_voucher(store, issue_id, key):
+    return bool(link_vouchers(store, issue_id, [key])['added'])
+
+
+def mark_vouchers(store, keys):
+    from .voucher_summary import voucher_lines_many
+    keys = tuple(dict.fromkeys(keys))
+    lines = voucher_lines_many(store, keys)
+    added = 0
+    with store.db:
+        for key in keys:
+            if not lines.get(key):
+                raise ValueError('原凭证未匹配，无法新增关注')
+            cursor = store.db.execute("INSERT OR IGNORE INTO voucher_marks(voucher_key,note,signature) VALUES(?,'',?)",
+                                      (key, voucher_signature(lines[key])))
+            added += bool(cursor.rowcount)
+    return {'added': added, 'duplicates': len(keys) - added}
+
+
+def unlink_vouchers(store, issue_id, keys):
+    with store.db:
+        store.db.executemany('DELETE FROM dd_issue_vouchers WHERE issue_id=? AND voucher_key=?',
+                             [(issue_id, key) for key in dict.fromkeys(keys)])
 
 
 def unlink_voucher(store, issue_id, key):
@@ -126,14 +174,23 @@ def voucher_preview(store, key):
             "snapshot": json.loads(reference["snapshot_json"]) if reference else None}
 
 
-def confirm_reference(store, key):
-    lines = voucher_lines_for_key(store, key)
-    if not lines:
-        raise ValueError("原凭证未匹配，不能确认")
+def confirm_references(store, keys):
+    from .voucher_summary import voucher_lines_many
+    keys = tuple(dict.fromkeys(keys))
+    live = voucher_lines_many(store, keys)
+    updates = []
+    for key in keys:
+        lines = live.get(key, [])
+        if not lines:
+            raise ValueError('原凭证未匹配，不能确认')
+        updates.append((voucher_label(lines), lines[0]['summary'], voucher_signature(lines),
+                        json.dumps([dict(row) for row in lines], ensure_ascii=False), key))
     with store.db:
-        store.db.execute("""UPDATE dd_voucher_refs SET label=?,summary=?,signature=?,snapshot_json=?
-            WHERE voucher_key=?""", (voucher_label(lines), lines[0]["summary"], voucher_signature(lines),
-                                      json.dumps([dict(row) for row in lines], ensure_ascii=False), key))
+        store.db.executemany('UPDATE dd_voucher_refs SET label=?,summary=?,signature=?,snapshot_json=? WHERE voucher_key=?', updates)
+
+
+def confirm_reference(store, key):
+    confirm_references(store, [key])
 
 
 def write_note(store, key, baseline, text):

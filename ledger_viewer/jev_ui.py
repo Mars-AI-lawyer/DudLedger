@@ -668,7 +668,7 @@ class ReviewPanel(ttk.Frame):
             ReviewDetail(self, self.rows[selected[0]])
 
     def _visible(self):
-        return self.app.tabs.index('current') == 5
+        return self.app.current_page() == 'review'
 
     def _poll(self):
         if self.app.store:

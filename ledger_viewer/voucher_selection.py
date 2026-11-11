@@ -1,0 +1,151 @@
+"""Voucher-level checks coexist with rectangular cell selection and drag handles."""
+
+import tkinter as tk
+from tkinter import ttk
+
+
+class VoucherSelection:
+    def __init__(self, view, key_for_row, on_change=None):
+        self.view, self.key_for_row, self.on_change = view, key_for_row, on_change
+        self.checked = set()
+        self.anchor = None
+        self.scope = None
+        view.voucher_selection = self
+        self.tag = f'VoucherSelection:{id(self)}'
+        view.bindtags((self.tag, *view.bindtags()))
+        view.bind_class(self.tag, '<ButtonPress-1>', self.press)
+        view.configure(show='tree headings')
+        view.column('#0', width=58, minwidth=58, stretch=False)
+        view.heading('#0', text='☐  ⋮⋮', command=self.toggle_all)
+        view.bind('<<TreeviewSelect>>', lambda _e: self.changed(), add='+')
+        self.info = tk.StringVar(value='')
+
+    def row_keys(self, rows):
+        keys = []
+        for row in rows:
+            try:
+                key = self.key_for_row(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key and key not in keys:
+                keys.append(key)
+        return tuple(keys)
+
+    def action_keys(self):
+        if self.checked:
+            return tuple(sorted(self.checked))
+        tools = getattr(self.view, 'cell_tools', None)
+        rows = tools.selection_range()[0] if tools else ()
+        return self.row_keys(rows or self.view.selection())
+
+    def drag_keys(self, row):
+        key = self.key_for_row(row)
+        selected = self.action_keys()
+        return selected if key in selected else (key,)
+
+    def set_scope(self, scope):
+        if scope != self.scope:
+            self.scope = scope
+            self.checked.clear()
+            self.anchor = None
+        self.refresh()
+
+    def clear(self):
+        self.checked.clear()
+        self.refresh()
+
+    def refresh(self):
+        visible = set(self.row_keys(self.view.get_children()))
+        for row in self.view.get_children():
+            self.view.item(row, text=('☑' if self.key_for_row(row) in self.checked else '☐') + '  ⋮⋮')
+        self.view.heading('#0', text=('☑' if visible and visible <= self.checked else '☐') + '  ⋮⋮')
+        self.changed()
+
+    def changed(self):
+        visible = set(self.row_keys(self.view.get_children()))
+        if self.checked:
+            self.info.set(f'已勾选 {len(self.checked)} 张，其中跨页 {len(self.checked - visible)} 张')
+        else:
+            keys = self.action_keys()
+            self.info.set(f'选区涉及 {len(keys)} 张凭证' if keys else '勾选凭证或框选单元格')
+        if self.on_change:
+            self.on_change()
+
+    def toggle_all(self):
+        visible = set(self.row_keys(self.view.get_children()))
+        if visible and visible <= self.checked:
+            self.checked.difference_update(visible)
+        else:
+            self.checked.update(visible)
+        self.refresh()
+
+    def press(self, event):
+        view = self.view
+        if view.identify_column(event.x) != '#0' or event.x > 28:
+            return
+        row = view.identify_row(event.y)
+        if not row:
+            return
+        rows = view.get_children()
+        key = self.key_for_row(row)
+        select = key not in self.checked
+        affected = (row,)
+        if event.state & 1 and self.anchor in rows:
+            lo, hi = sorted((rows.index(self.anchor), rows.index(row)))
+            affected = rows[lo:hi + 1]
+        keys = self.row_keys(affected)
+        self.checked.update(keys) if select else self.checked.difference_update(keys)
+        self.anchor = row
+        view.selection_set(row)
+        view.focus(row)
+        view.focus_set()
+        self.refresh()
+        return 'break'
+
+
+def selection_bar(parent, selection):
+    frame = ttk.Frame(parent, padding=(6, 2))
+    frame.pack(side='bottom', fill='x', before=selection.view.master)
+    ttk.Label(frame, textvariable=selection.info, style='Hint.TLabel').pack(side='left')
+    ttk.Button(frame, text='清空勾选', command=selection.clear).pack(side='right')
+    ttk.Button(frame, text='本页全选', command=selection.toggle_all).pack(side='right', padx=4)
+    return frame
+
+
+class CellTooltip:
+    """Show full cell text, including content clipped by a narrow column."""
+    def __init__(self, view):
+        self.view, self.job, self.tip, self.cell = view, None, None, None
+        view.bind('<Motion>', self.motion, add='+')
+        for event in ('<Leave>', '<ButtonPress-1>', '<Destroy>', '<MouseWheel>'):
+            view.bind(event, self.hide, add='+')
+
+    def motion(self, event):
+        cell = (self.view.identify_row(event.y), self.view.identify_column(event.x))
+        if cell == self.cell:
+            return
+        self.hide()
+        self.cell = cell
+        if cell[0] and cell[1] not in ('', '#0'):
+            self.job = self.view.after(650, lambda: self.show(cell, event.x_root, event.y_root))
+
+    def show(self, cell, x, y):
+        self.job = None
+        if not self.view.exists(cell[0]):
+            return
+        text = self.view.set(*cell)
+        if not text:
+            return
+        self.tip = tk.Toplevel(self.view)
+        self.tip.overrideredirect(True)
+        ttk.Label(self.tip, text=text, padding=8, wraplength=560, relief='solid').pack()
+        self.tip.geometry(f'{x + 12:+d}{y + 18:+d}')
+
+    def hide(self, _event=None):
+        if self.job:
+            self.view.after_cancel(self.job)
+            self.job = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+        self.cell = None

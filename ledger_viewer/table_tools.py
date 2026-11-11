@@ -101,10 +101,11 @@ class TableTools:
     """Track a rectangular range in displayed order, independently of row focus."""
 
     def __init__(self, view: ttk.Treeview, money_columns: set[str], *, source_for_row=None,
-                 on_visibility_changed=None, panel_parent=None, on_toggle=None):
+                 on_visibility_changed=None, panel_parent=None, on_toggle=None, show_stats=True):
         self.view = view
         view.cell_tools = self
         self.money_columns = money_columns
+        self.selection_hint = "拖动框选，自动合计与计数；Ctrl+C / ⌘C 复制选区" if money_columns else "拖动框选；Ctrl+C / ⌘C 复制选区"
         self.source_for_row = source_for_row
         self.on_visibility_changed = on_visibility_changed
         self.on_toggle = on_toggle
@@ -122,9 +123,10 @@ class TableTools:
         self._height_before_open = None
         self._grown_height = None
         self.job = None
-        self.stats = tk.StringVar(value="拖动框选，自动合计与计数；Ctrl+C / ⌘C 复制选区")
-        ttk.Label(view.master, textvariable=self.stats, padding=(5, 4), anchor="w").grid(
-            row=2, column=0, columnspan=2, sticky="ew")
+        self.stats = tk.StringVar(value=self.selection_hint)
+        if show_stats:
+            ttk.Label(view.master, textvariable=self.stats, padding=(5, 4), anchor="w").grid(
+                row=2, column=0, columnspan=2, sticky="ew")
         self.panel = ttk.Frame(panel_parent if panel_parent is not None else view.master, padding=(12, 8), width=270)
         self.panel.grid(row=0, column=2, rowspan=2, sticky="nsew")
         self.panel.grid_remove()
@@ -201,9 +203,10 @@ class TableTools:
             border.bind("<ButtonRelease-1>", self._release)
         self.menu = tk.Menu(view, tearoff=False)
         self.menu.add_command(label="复制选区", command=self.copy_cell)
-        self.menu.add_separator()
-        self.menu.add_command(label="加入计算", command=lambda: self.calculate(1, reveal=True))
-        self.menu.add_command(label="从结果减去", command=lambda: self.calculate(-1, reveal=True))
+        if money_columns:
+            self.menu.add_separator()
+            self.menu.add_command(label="加入计算", command=lambda: self.calculate(1, reveal=True))
+            self.menu.add_command(label="从结果减去", command=lambda: self.calculate(-1, reveal=True))
         view.bind("<Button-1>", self._click, add="+")
         view.bind("<B1-Motion>", self._drag)
         view.bind("<ButtonRelease-1>", self._release, add="+")
@@ -396,13 +399,15 @@ class TableTools:
         self.summary = summary
         self.summary_dirty = False
         stats = f"合计 {display_number(summary.total)}   计数 {summary.count}   金额 {summary.numbers} 项"
-        self.stats.set(stats)
+        self.stats.set(stats if self.money_columns else f"已选 {summary.cells} 格 · 可复制")
         self.selected.set(f"已选 {summary.numbers} 项金额 · 计数 {summary.count}")
         self.selection_total.set(display_number(summary.total) if summary.numbers else "—")
+        if hasattr(self.view, "voucher_selection"):
+            self.view.voucher_selection.changed()
         usable = summary.numbers > 0
         for button in (self.plus, self.minus):
             button.configure(state="normal" if usable else "disabled")
-        for label in ("加入计算", "从结果减去"):
+        for label in (("加入计算", "从结果减去") if self.money_columns else ()):
             self.menu.entryconfigure(label, state="normal" if usable else "disabled")
 
     def value(self):
@@ -583,14 +588,16 @@ class TableTools:
         self.row_cache.clear()
         self.summary = SelectionSummary()
         self.summary_dirty = False
-        self.stats.set("拖动框选，自动合计与计数；Ctrl+C / ⌘C 复制选区")
+        self.stats.set(self.selection_hint)
         self.selected.set("拖动框选一段金额")
         self.selection_total.set("—")
+        if hasattr(self.view, "voucher_selection"):
+            self.view.voucher_selection.changed()
         for button in (self.plus, self.minus):
             button.configure(state="disabled")
         for border in self.borders:
             border.place_forget()
-        for label in ("加入计算", "从结果减去"):
+        for label in (("加入计算", "从结果减去") if self.money_columns else ()):
             self.menu.entryconfigure(label, state="disabled")
 
     def schedule(self, event=None):

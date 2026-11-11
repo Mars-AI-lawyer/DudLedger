@@ -97,9 +97,12 @@ def mark_for_entry(store: LedgerStore, entry_id: int):
 
 
 def list_marks(store: LedgerStore) -> list[dict]:
+    from .voucher_summary import voucher_lines_many
     result = []
-    for mark in store.db.execute("SELECT * FROM voucher_marks ORDER BY created_at,voucher_key"):
-        lines = voucher_lines_for_key(store, mark["voucher_key"])
+    marks = store.db.execute("SELECT * FROM voucher_marks ORDER BY created_at,voucher_key").fetchall()
+    all_lines = voucher_lines_many(store, [mark["voucher_key"] for mark in marks])
+    for mark in marks:
+        lines = all_lines.get(mark["voucher_key"], [])
         status = "未匹配" if not lines else ("内容变化" if voucher_signature(lines) != mark["signature"] else "正常")
         result.append({"key": mark["voucher_key"], "note": mark["note"], "status": status, "lines": lines})
     return result

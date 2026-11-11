@@ -42,6 +42,8 @@ def configure_theme(root):
     for name in ("TCheckbutton", "TRadiobutton"):
         style.configure(name, background=CANVAS, padding=3)
         style.map(name, background=[("active", CANVAS)])
+    style.configure('Segment.TRadiobutton', padding=(12, 7), background=SIDEBAR)
+    style.map('Segment.TRadiobutton', background=[('selected', '#E2DED3'), ('active', '#E8E4DB')], foreground=[('selected', '#873F2C')])
     style.configure("TSeparator", background=BORDER, lightcolor=BORDER, darkcolor=BORDER)
     style.configure("TNotebook", background=CANVAS, borderwidth=0)
     style.configure("TNotebook.Tab", background=SIDEBAR, padding=(12, 7))

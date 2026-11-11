@@ -42,9 +42,9 @@ class WorkspaceUITest(unittest.TestCase):
         self.assertTrue(self.app.sidebar.winfo_ismapped())
         self.assertFalse(self.app.sidebar_brand.winfo_ismapped())
         self.assertTrue(all(str(button.cget("compound")) == "image" for button in self.app.sidebar_buttons))
-        menu = self.app.nametowidget(self.app.page_menu.cget("menu"))
+        self.assertEqual(self.app.page_menu.winfo_class(), "TLabel")
         for index, title in enumerate(self.app.page_names):
-            menu.invoke(index)
+            self.app.select_page(self.app.page_ids[index])
             self.root.update()
             self.assertEqual(self.app.page_title.get(), title)
             self.assertTrue(self.app.nametowidget(self.app.tabs.select()).winfo_ismapped())
@@ -74,55 +74,32 @@ class WorkspaceUITest(unittest.TestCase):
         self.assertFalse(self.app.sidebar_brand.winfo_ismapped())
         self.assertEqual(str(button.cget("compound")), "image")
 
-    def test_shared_calculator_preserves_scroll_and_restores_navigation(self):
-        self.app._use_book(Path(self.temp.name) / "演示账套.sqlite")
-        self.app.tabs.select(1)
-        self.app.geometry("1160x690")
-        self.app.sidebar_toggle.invoke()
+    def test_calculator_keeps_navigation_and_tool_buttons_available(self):
+        self.app._use_book(Path(self.temp.name) / '演示账套.sqlite')
+        self.app.select_page('entries')
+        self.app.geometry('1160x690')
         self.root.update()
         view = self.app.detail_view
-        tools = self.app.detail_tools
+        view.xview_moveto(.05)
+        self.root.update()
+        first = view.xview()[0]
+        self.app.calculator_button.invoke()
+        self.root.update()
+        self.assertTrue(self.app.detail_tools.panel.winfo_ismapped())
         self.assertTrue(self.app.sidebar.winfo_ismapped())
-        ledger_width = view.winfo_width()
-        view.xview_moveto(0.05)
-        self.root.update()
-        first, last = view.xview()
-
-        tools.toggle()
-        self.root.update()
-        self.assertTrue(tools.panel.winfo_ismapped())
-        self.assertFalse(self.app.sidebar.winfo_ismapped())
-        self.assertGreaterEqual(view.winfo_width(), 500)
+        self.assertTrue(self.app.workbench_button.winfo_ismapped())
+        self.assertGreaterEqual(view.winfo_width(), 520)
         self.assertAlmostEqual(view.xview()[0], first)
-        self.assertGreater(view.xview()[1], first)
-
-        menu = self.app.nametowidget(self.app.cget("menu"))
-        review = self.app.nametowidget(menu.entrycget(1, "menu"))
-        sidebar_action = next(index for index in range(review.index("end") + 1)
-                              if review.entrycget(index, "label") == "切换侧栏")
-        review.invoke(sidebar_action)
+        self.app.select_page('accounts')
         self.root.update()
+        self.assertIs(self.app.workbench.active_tools, self.app.balance_tools)
+        self.app.select_page('entries')
+        self.root.update()
+        self.assertIs(self.app.workbench.active_tools, self.app.detail_tools)
+        self.app.calculator_button.invoke()
+        self.root.update()
+        self.assertFalse(self.app.workbench.visible)
         self.assertTrue(self.app.sidebar.winfo_ismapped())
-
-        modifier = "Command" if self.root.tk.call("tk", "windowingsystem") == "aqua" else "Control"
-        view.focus_force()
-        self.root.update()
-        view.event_generate(f"<{modifier}-Shift-L>")
-        self.root.update()
-        self.assertFalse(self.app.sidebar.winfo_ismapped())
-        self.assertGreaterEqual(view.winfo_width(), 500)
-
-        self.app.tabs.select(0)
-        self.root.update()
-        self.assertTrue(self.app.sidebar.winfo_ismapped())
-        self.app.tabs.select(1)
-        self.root.update()
-        self.assertFalse(self.app.sidebar.winfo_ismapped())
-        tools.toggle()
-        self.root.update()
-        self.assertTrue(self.app.sidebar.winfo_ismapped())
-        self.assertTrue(self.app.sidebar_brand.winfo_ismapped())
-        self.assertEqual(view.winfo_width(), ledger_width)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,8 @@ from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_
 from .store import LedgerStore
 from .theme import configure_theme
 from .table_tools import TableTools
+from .voucher_selection import VoucherSelection, CellTooltip, selection_bar
+from .voucher_summary import read_marks, summaries_for_keys
 from .workbench import NoteHub, RightWorkbench, VoucherDrag
 from . import issue_store
 from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_mark, save_mark_by_key, source_account, voucher_key
@@ -1768,20 +1770,24 @@ class App(tk.Toplevel):
         self.sidebar_pages = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
         self.sidebar_pages.pack(fill="x", pady=(5, 0))
         self.nav_buttons = []
-        self.page_names = ("科目总览", "明细账", "资产负债表", "利润表", "关注凭证", "AI 尽调线索")
-        nav_icons = ("accounts", "entries", "balance", "income", "marks", "review")
+        self.page_names = ("科目总览", "明细账", "财务报表", "关注凭证", "AI 尽调线索")
+        self.page_ids = ("accounts", "entries", "reports", "marks", "review")
+        nav_icons = ("accounts", "entries", "balance", "marks", "review")
         for index, (title, icon) in enumerate(zip(self.page_names, nav_icons)):
-            button = self._sidebar_button(self.sidebar_pages, title, icon, lambda page=index: self.tabs.select(page))
-            if index in (0, 4):
-                heading = ttk.Label(self.sidebar_pages, text="账簿" if index == 0 else "复核",
+            button = self._sidebar_button(self.sidebar_pages, title, icon, lambda page=self.page_ids[index]: self.select_page(page))
+            if index in (0, 3):
+                heading = ttk.Label(self.sidebar_pages, text="账簿" if index == 0 else "尽调",
                                     style="SidebarHint.TLabel")
                 self.sidebar_groups.append((heading, button))
             self.nav_buttons.append(button)
+            if index == 3:
+                self.workbench_button = self._sidebar_button(self.sidebar_pages, "问题工作台", "workbench", lambda: self.workbench.toggle())
+        self.calculator_button = self._sidebar_button(self.sidebar_pages, "计算器", "calculator", lambda: self.workbench.show_calculator(toggle=True))
         footer = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
         footer.pack(side="bottom", fill="x", padx=9, pady=(5, 8))
         self._sidebar_button(footer, "尽调主体名单", "parties", self.open_related_parties, padx=0)
         self._sidebar_button(footer, "偏好设置", "settings", self.open_settings, padx=0)
-        self._sidebar_button(footer, "打开账套…", "folder", self.open_book, padx=0)
+        self._sidebar_button(footer, "账套", "folder", self.open_book_menu, padx=0)
         self.sidebar_footer_label = ttk.Label(footer, text="本地工作区", style="SidebarHint.TLabel")
         self.workspace = ttk.Frame(self.shell)
         self.workspace.grid(row=0, column=1, sticky="nsew")
@@ -1793,15 +1799,8 @@ class App(tk.Toplevel):
         self.sidebar_toggle.pack(side="left", padx=(0, 6))
         self.navigation_tooltip.attach(self.sidebar_toggle, lambda: self.sidebar_toggle.cget("text"))
         self.page_title = tk.StringVar(value="开始核查")
-        self.page_menu = ttk.Menubutton(toolbar, textvariable=self.page_title)
+        self.page_menu = ttk.Label(toolbar, textvariable=self.page_title, style="Intro.TLabel")
         self.page_menu.pack(side="left")
-        navigation = tk.Menu(self.page_menu, tearoff=False)
-        for index, title in enumerate(self.page_names):
-            navigation.add_command(label=title, command=lambda page=index: self.tabs.select(page))
-        navigation.add_separator()
-        navigation.add_command(label="导入记录…", command=lambda: self.open_utility("导入记录"))
-        navigation.add_command(label="核对提醒…", command=lambda: self.open_utility("核对提醒"))
-        self.page_menu.configure(menu=navigation)
         ttk.Button(toolbar, text="导入表格", command=self.import_file, style="Accent.TButton").pack(side="right")
         self.book_name = tk.StringVar(value="未打开账套")
         ttk.Label(toolbar, textvariable=self.book_name, style="Hint.TLabel").pack(side="right", padx=16)
@@ -1814,11 +1813,14 @@ class App(tk.Toplevel):
         self.tabs.grid(row=0, column=0, sticky="nsew")
         self.workbench = RightWorkbench(self)
         self.drag = VoucherDrag(self)
-        self.drag.attach(self.workbench.tree, lambda row: self.workbench.rows[row][1], tree_handle=False)
+        self.drag.attach(self.workbench.voucher_view, lambda row: self.workbench.rows[row][1])
         self.content.bind("<Configure>", lambda _e: self.workbench.layout())
-        ttk.Button(toolbar, text="问题工作台", command=self.workbench.show).pack(side="right", padx=4)
         self.utility_windows = {}
         frames = []
+        self.page_frames = {}
+        self.report_kind = tk.StringVar(value="balance_sheet")
+        self.report_labels = REPORT_LABELS
+        self.report_frames = {}
         for title in ("科目总览", "明细账", "资产负债表", "利润表", "核对提醒", "导入记录", "关注凭证", "AI 尽调线索"):
             if title in ("核对提醒", "导入记录"):
                 dialog = tk.Toplevel(self)
@@ -1831,9 +1833,25 @@ class App(tk.Toplevel):
                 self.utility_windows[title] = dialog
                 frame = ttk.Frame(dialog)
                 frame.pack(fill="both", expand=True)
+            elif title in REPORT_LABELS.values():
+                if not self.report_frames:
+                    self.report_page = ttk.Frame(self.tabs)
+                    self.tabs.add(self.report_page, text="财务报表")
+                    self.page_frames['reports'] = self.report_page
+                    switch = ttk.Frame(self.report_page, padding=5)
+                    switch.pack(fill='x')
+                    for kind, label in REPORT_LABELS.items():
+                        ttk.Radiobutton(switch, text=label, variable=self.report_kind, value=kind,
+                                        command=self.switch_report, style='Segment.TRadiobutton').pack(side='left', padx=(0, 4))
+                frame = ttk.Frame(self.report_page)
+                kind = next(key for key, label in REPORT_LABELS.items() if label == title)
+                self.report_frames[kind] = frame
+                if kind == 'balance_sheet':
+                    frame.pack(fill='both', expand=True)
             else:
                 frame = ttk.Frame(self.tabs)
                 self.tabs.add(frame, text=title)
+                self.page_frames[self.page_ids[self.page_names.index(title)]] = frame
             frames.append(frame)
         summary_search_row = ttk.Frame(frames[0], padding=5)
         summary_search_row.pack(fill="x")
@@ -1876,7 +1894,6 @@ class App(tk.Toplevel):
             source_for_row=lambda row: self.balance_calc_sources.get(row, row),
             panel_parent=self.workbench.calculator_host("科目总览"),
             on_toggle=lambda reveal: self.workbench.set_calculator(self.balance_tools, "科目总览", reveal))
-        ttk.Button(balance_actions, text="计算器", command=self.balance_tools.toggle).pack(side="right", padx=4)
         self.detail_controls = ttk.Frame(frames[1], padding=5)
         self.detail_controls.pack(fill="x")
         self.detail_controls.columnconfigure(1, weight=1)
@@ -1901,7 +1918,7 @@ class App(tk.Toplevel):
         detail_menu.add_command(label="导出当前明细 CSV…", command=self.export_csv)
         detail_menu.add_command(label="恢复日期顺序", command=self.reset_detail_sort)
         self.detail_more.configure(menu=detail_menu)
-        self.detail_mark = ttk.Button(self.detail_actions, text="关注凭证 / 写备注", width=0,
+        self.detail_mark = ttk.Button(self.detail_actions, text="关注所选（0）", width=0,
                                       command=self.mark_selected_entry, state="disabled")
         self.detail_controls.bind("<Configure>", self._resize_detail_controls)
         self.detail_scope.bind("<Configure>", self._resize_detail_controls)
@@ -1926,18 +1943,22 @@ class App(tk.Toplevel):
         self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"},
                                        panel_parent=self.workbench.calculator_host("明细账"),
                                        on_toggle=lambda reveal: self.workbench.set_calculator(self.detail_tools, "明细账", reveal))
-        self.drag.attach(self.detail_view, lambda row: voucher_key(self.store.entry(int(row))))
-        ttk.Button(self.detail_actions, text="计算器", width=0, command=self.detail_tools.toggle).pack(side="right", padx=6)
+        self.detail_selection = VoucherSelection(self.detail_view, lambda row: self.detail_voucher_keys.get(row), self._update_detail_mark)
+        self.drag.attach(self.detail_view, lambda row: self.detail_voucher_keys.get(row))
+        selection_bar(frames[1], self.detail_selection)
+        self.detail_join = ttk.Button(self.detail_actions, text="加入问题…（0）", command=lambda: self.drag.choose_from_view(self.detail_view), state='disabled')
+        self.detail_join.pack(side="right", padx=4)
         self.detail_mark.pack(side="right")
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
-        self.detail_view.bind("<<TreeviewSelect>>", self._update_detail_mark)
+        self.detail_view.bind("<<TreeviewSelect>>", self._update_detail_mark, add="+")
         for key in ("date", "voucher", "code", "name", "summary", "debit", "credit"):
             self.detail_view.heading(key, command=lambda column=key: self.sort_details(column))
         self._update_detail_headings()
         self.report_views: dict[str, ttk.Treeview] = {}
         self.report_info: dict[str, tk.StringVar] = {}
         self.report_combos: dict[str, ttk.Combobox] = {}
+        self.report_tools = {}
         for kind, frame in (("balance_sheet", frames[2]), ("income_statement", frames[3])):
             top = ttk.Frame(frame, padding=5)
             top.pack(fill="x")
@@ -1954,7 +1975,9 @@ class App(tk.Toplevel):
                 columns += [("right_item", "右侧项目", 230), ("right_a", "右侧金额 1", 125), ("right_b", "右侧金额 2", 125), ("right_c", "右侧金额 3", 125)]
             columns += [("source", "来源行", 260)]
             self.report_views[kind] = tree(frame, columns)
-            self.report_views[kind].bind("<ButtonRelease-1>", lambda event, report_kind=kind: self.open_report_account(report_kind, event))
+            self.report_tools[kind] = TableTools(self.report_views[kind], {"left_a", "left_b", "left_c", "right_a", "right_b", "right_c"},
+                panel_parent=self.workbench.calculator_host(REPORT_LABELS[kind]),
+                on_toggle=lambda reveal, report_kind=kind: self.workbench.set_calculator(self.report_tools[report_kind], REPORT_LABELS[report_kind], reveal))
         check_top = ttk.Frame(frames[4], padding=5)
         check_top.pack(fill="x")
         ttk.Label(check_top, text="这里只列需要核对的线索；金额差异不影响查看原始分录。", style="Hint.TLabel").pack(side="left")
@@ -1986,25 +2009,34 @@ class App(tk.Toplevel):
         ttk.Button(mark_search_row, text="筛选", command=self.refresh_marks).pack(side="left")
         mark_actions = ttk.Frame(mark_top)
         mark_actions.pack(fill="x", pady=(5, 0))
-        ttk.Label(mark_actions, text="双击或点“打开凭证”查看原凭证；选中后可在下方修改注释。", style="Hint.TLabel").pack(side="left")
-        ttk.Button(mark_actions, text="打开凭证", command=self.open_selected_mark_voucher).pack(side="left", padx=5)
-        ttk.Button(mark_actions, text="取消关注", command=self.remove_selected_mark).pack(side="left", padx=5)
-        ttk.Button(mark_actions, text="确认变更凭证", command=self.confirm_selected_mark).pack(side="left", padx=5)
-        ttk.Button(mark_actions, text="另存为 MD", command=lambda: self.export_marks(as_new=True)).pack(side="right")
-        ttk.Button(mark_actions, text="更新关注凭证 MD", command=self.export_marks, style="Accent.TButton").pack(side="right", padx=5)
-        self.mark_view = tree(frames[6], [("status", "状态", 85), ("voucher", "凭证", 175), ("accounts", "涉及科目", 275), ("note", "注释摘要", 360)])
-        self.drag.attach(self.mark_view, lambda row: self.mark_keys[row])
-        self.mark_view.bind("<<TreeviewSelect>>", self._load_selected_mark)
+        self.mark_join = ttk.Button(mark_actions, text="加入问题…（0）", command=lambda: self.drag.choose_from_view(self.mark_view), state='disabled')
+        self.mark_join.pack(side='right', padx=4)
+        mark_more = ttk.Menubutton(mark_actions, text='更多')
+        mark_more.pack(side='right')
+        mark_menu = tk.Menu(mark_more, tearoff=False)
+        mark_menu.add_command(label='取消所选关注…', command=self.remove_selected_mark)
+        mark_menu.add_command(label='确认所选变更凭证…', command=self.confirm_selected_mark)
+        mark_menu.add_separator()
+        mark_menu.add_command(label='更新关注凭证 MD', command=self.export_marks)
+        mark_menu.add_command(label='另存为 MD…', command=lambda: self.export_marks(as_new=True))
+        mark_more.configure(menu=mark_menu)
+        self.mark_note_toggle = ttk.Button(mark_actions, text='编辑备注 ▸', command=self.toggle_mark_note)
+        self.mark_note_toggle.pack(side='left')
+        self.mark_view = tree(frames[6], [("date", "日期", 100), ("voucher", "凭证号", 105), ("summary", "摘要", 250), ("amount", "金额", 150), ("accounts", "涉及科目", 210), ("note", "备注摘要", 220), ("status", "复核状态", 150)])
+        self.mark_tools = TableTools(self.mark_view, set(), show_stats=False)
+        self.mark_selection = VoucherSelection(self.mark_view, lambda row: self.mark_keys.get(row), self._update_mark_actions)
+        self.drag.attach(self.mark_view, lambda row: self.mark_keys.get(row))
+        self.mark_tools.menu.add_command(label='取消所选关注…', command=self.remove_selected_mark)
+        CellTooltip(self.mark_view)
+        selection_bar(frames[6], self.mark_selection)
+        self.mark_view.bind("<<TreeviewSelect>>", self._load_selected_mark, add='+')
         self.mark_view.bind("<Double-1>", self.open_selected_mark_voucher)
-        note_frame = ttk.Frame(frames[6], padding=(6, 6))
-        note_frame.pack(fill="x")
-        ttk.Label(note_frame, text="注释").pack(anchor="w")
-        self.mark_note = tk.Text(note_frame, height=4, wrap="word", undo=True, background="#FFFDFB", relief="solid", borderwidth=1)
+        self.mark_note_frame = ttk.Frame(frames[6], padding=(6, 6))
+        self.mark_note = tk.Text(self.mark_note_frame, height=4, wrap="word", undo=True, background="#FFFDFB", relief="solid", borderwidth=1)
         self.mark_note.pack(fill="x", pady=(4, 5))
         self.mark_note_status = tk.StringVar()
-        ttk.Label(note_frame, textvariable=self.mark_note_status, style="Hint.TLabel").pack(anchor="w")
-        ttk.Button(note_frame, text="保存注释", command=self.edit_selected_mark).pack(anchor="e")
-        ttk.Button(note_frame, text="重读已保存备注…", command=lambda: self.note_hub.reload(self.mark_note)).pack(anchor="e")
+        ttk.Label(self.mark_note_frame, textvariable=self.mark_note_status, style="Hint.TLabel").pack(anchor="w")
+        ttk.Button(self.mark_note_frame, text="重读已保存备注…", command=lambda: self.note_hub.reload(self.mark_note)).pack(anchor="e")
         from .jev_ui import ReviewPanel
         self.review_panel = ReviewPanel(frames[7], self)
         self.tabs.bind("<<NotebookTabChanged>>", self._page_changed)
@@ -2024,6 +2056,36 @@ class App(tk.Toplevel):
         self.after_idle(self._resize_workspace)
         self._page_changed()
 
+    def current_page(self):
+        selected = self.tabs.select()
+        return next((key for key, frame in self.page_frames.items() if str(frame) == selected), None)
+
+    def select_page(self, page):
+        self.tabs.select(self.page_frames[page])
+
+    def switch_report(self):
+        for kind, frame in self.report_frames.items():
+            if kind == self.report_kind.get():
+                frame.pack(fill='both', expand=True)
+            else:
+                frame.pack_forget()
+        if hasattr(self, 'report_tools'):
+            self.workbench.page_changed()
+
+    def open_book_menu(self):
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label='打开账套…', command=self.open_book)
+        menu.add_command(label='新建账套…', command=self.new_book)
+        menu.add_separator()
+        menu.add_command(label='导入记录…', command=lambda: self.open_utility('导入记录'))
+        menu.add_command(label='核对提醒…', command=lambda: self.open_utility('核对提醒'))
+        menu.add_separator()
+        menu.add_command(label='退出当前账套', command=self.close_book)
+        try:
+            menu.tk_popup(self.sidebar.winfo_rootx() + self.sidebar.winfo_width(), self.sidebar.winfo_rooty() + self.sidebar.winfo_height() - 150)
+        finally:
+            menu.grab_release()
+
     def _page_changed(self, _event=None) -> None:
         selected = self.tabs.select()
         if not selected:
@@ -2034,12 +2096,12 @@ class App(tk.Toplevel):
             button.state(["selected" if page == index else "!selected"])
         self._resize_workspace()
         self.workbench.page_changed()
-        if index == 5:
+        if self.current_page() == "review":
             self.review_panel.refresh()
 
     def _detail_calculator_active(self) -> bool:
         return (self.workbench.visible and self.workbench.mode == "calculator"
-                and self.workbench.active_tools is self.detail_tools and self.tabs.index("current") == 1)
+                and self.workbench.active_tools is self.detail_tools and self.current_page() == "entries")
 
     def _detail_calculator_changed(self, visible: bool) -> None:
         if not visible:
@@ -2047,10 +2109,7 @@ class App(tk.Toplevel):
         self._resize_workspace()
 
     def _toggle_sidebar(self) -> None:
-        if self._detail_calculator_active():
-            self._show_sidebar_with_calculator = not self._show_sidebar_with_calculator
-        else:
-            self._sidebar_expanded = not self._sidebar_expanded
+        self._sidebar_expanded = not self._sidebar_expanded
         self._resize_workspace()
 
     def _sidebar_button(self, parent, title, icon, command, *, padx=9):
@@ -2058,7 +2117,7 @@ class App(tk.Toplevel):
         button = ttk.Button(parent, text=title, image=image, width=0, command=command)
         button.pack(fill="x", padx=padx, pady=1)
         self.sidebar_buttons.append(button)
-        self.navigation_tooltip.attach(button, lambda: title if self._sidebar_mode == "icons" else "")
+        self.navigation_tooltip.attach(button, lambda: str(button.cget("text")) if self._sidebar_mode == "icons" else "")
         return button
 
     def _render_sidebar(self, mode: str) -> None:
@@ -2089,14 +2148,21 @@ class App(tk.Toplevel):
         if event is not None and event.widget is not self:
             return
         calculator = self._detail_calculator_active()
-        hidden = calculator and not self._show_sidebar_with_calculator
+        hidden = False
         mode = "hidden" if hidden else ("text" if self._sidebar_expanded else "icons")
         sidebar_width = max(184, self.controller.font_size * 13)
         self.sidebar.configure(width=sidebar_width if mode == "text" else 56)
         self._render_sidebar(mode)
-        collapse = not hidden if calculator else self._sidebar_expanded
+        if mode == 'text':
+            if self.winfo_height() < 650:
+                self.sidebar_brand.pack_forget()
+                self.sidebar_footer_label.pack_forget()
+            elif not self.sidebar_brand.winfo_manager():
+                self.sidebar_brand.pack(fill='x', before=self.sidebar_pages)
+                self.sidebar_footer_label.pack(anchor='w', padx=11, pady=(4, 0))
+        collapse = self._sidebar_expanded
         self.sidebar_toggle.configure(
-            text=("隐藏侧栏" if collapse else "显示侧栏") if calculator else ("折叠为图标" if collapse else "展开侧栏文字"),
+            text="折叠为图标" if collapse else "展开侧栏文字",
             image=self.sidebar_icons["collapse" if collapse else "expand"],
         )
         self.workbench.layout()
@@ -2114,12 +2180,13 @@ class App(tk.Toplevel):
         macos = self.tk.call("tk", "windowingsystem") == "aqua"
         review.add_command(label="切换侧栏", command=self._toggle_sidebar,
                            accelerator="⌘⇧L" if macos else "Ctrl+Shift+L")
-        review.add_command(label="科目总览", command=lambda: self.tabs.select(0))
-        review.add_command(label="明细账", command=lambda: self.tabs.select(1))
-        review.add_command(label="关注凭证", command=lambda: self.tabs.select(4))
+        review.add_command(label="科目总览", command=lambda: self.select_page("accounts"))
+        review.add_command(label="明细账", command=lambda: self.select_page("entries"))
+        review.add_command(label="财务报表", command=lambda: self.select_page("reports"))
+        review.add_command(label="关注凭证", command=lambda: self.select_page("marks"))
         review.add_command(label="问题工作台", command=self.workbench.show)
-        review.add_command(label="AI 尽调线索", command=lambda: (self.review_panel.refresh(), self.tabs.select(5)))
-        review.add_command(label="筛选全部凭证…", command=lambda: (self.tabs.select(5), self.review_panel.new_batch()))
+        review.add_command(label="AI 尽调线索", command=lambda: (self.review_panel.refresh(), self.select_page("review")))
+        review.add_command(label="筛选全部凭证…", command=lambda: (self.select_page("review"), self.review_panel.new_batch()))
         review.add_command(label="尽调主体名单…", command=self.open_related_parties)
         review.add_command(label="核对提醒…", command=lambda: self.open_utility("核对提醒"))
         review.add_command(label="核对范围…", command=self.open_reconciliation)
@@ -2257,6 +2324,10 @@ class App(tk.Toplevel):
         self.workbench.hide()
         self.detail_tools.clear()
         self.balance_tools.clear()
+        for tools in self.report_tools.values():
+            tools.clear()
+        self.detail_selection.set_scope(None)
+        self.mark_selection.set_scope(None)
         self.account = None
         self.include_descendants = False
         self.account_label.set("全部科目")
@@ -2272,7 +2343,7 @@ class App(tk.Toplevel):
         self.review_panel.job = None
         self.review_panel.refresh_rows()
         self.welcome.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self.tabs.select(0)
+        self.select_page("accounts")
         self._page_changed()
         self.status.set("已退出当前账套；可导入 Excel 或打开已有账套。")
 
@@ -2285,6 +2356,8 @@ class App(tk.Toplevel):
             messagebox.showerror("打开失败", str(exc), parent=self)
             return
         self.store = new_store
+        self.detail_selection.set_scope(None)
+        self.mark_selection.set_scope(None)
         self.workbench.reset()
         self.detail_offset = self.detail_total = 0
         self._checks_cache = None
@@ -2310,7 +2383,7 @@ class App(tk.Toplevel):
         self.title(f"账簿核查 · {path.name}")
         self.refresh_all()
         self.review_panel.refresh()
-        self.tabs.select(1 if self.store.setting("home_view", "summary") == "detail" else 0)
+        self.select_page("entries" if self.store.setting("home_view", "summary") == "detail" else "accounts")
         self._page_changed()
 
     def import_file(self) -> None:
@@ -2467,70 +2540,71 @@ class App(tk.Toplevel):
                 messagebox.showerror("导出失败", f"原文件已保留。\n{exc}", parent=self)
 
     def mark_selected_entry(self) -> None:
-        if not self.store:
+        keys = self.detail_selection.action_keys()
+        if not self.store or not keys or not self.note_hub.flush():
             return
-        selection = self.detail_view.selection()
-        if not selection:
-            messagebox.showinfo("请选择分录", "请先在“明细记录”中选中一行。", parent=self)
-            return
-        self.open_voucher(None, edit_attention=True)
+        try:
+            result = issue_store.mark_vouchers(self.store, keys)
+            for key in keys:
+                self.update_mark_indicators(key)
+                self.note_hub.broadcast(key)
+            self.status.set(f'新增关注 {result["added"]} 张，已关注 {result["duplicates"]} 张')
+        except Exception as exc:
+            messagebox.showerror('关注失败', str(exc), parent=self)
 
     def refresh_marks(self, select_key: str | None = None) -> None:
         if not self.note_hub.flush():
             return
         self.tasks.cancel("marks")
         if self.store and self.store.large_book():
-            self._read_task("marks", list_marks, lambda marks: self._render_marks(marks, select_key))
+            self._read_task("marks", read_marks, lambda result: self._render_marks(result[0], select_key, result[1]))
         else:
-            self._render_marks(list_marks(self.store) if self.store else [], select_key)
+            marks, summaries = read_marks(self.store) if self.store else ([], {})
+            self._render_marks(marks, select_key, summaries)
 
-    def _render_marks(self, marks, select_key):
+    def _render_marks(self, marks, select_key, summaries=None):
         if not self.note_hub.flush():
             return
+        self.mark_tools.reset_selection()
         self.mark_view.delete(*self.mark_view.get_children())
         self.mark_keys = {}
         self.mark_entry_ids = {}
         self.note_hub.unbind(self.mark_note)
         self.selected_mark_key = None
-        self.mark_note.delete("1.0", "end")
+        self.mark_note.delete('1.0', 'end')
         if not self.store:
             return
         needle = self.mark_search.get().strip().lower()
+        self.mark_selection.set_scope((str(self.store.path), needle))
+        self.mark_selection.checked.intersection_update(mark['key'] for mark in marks)
+        if summaries is None:
+            summaries = summaries_for_keys(self.store, [mark['key'] for mark in marks])
         for index, mark in enumerate(marks):
-            lines = mark["lines"]
-            if lines:
-                first = lines[0]
-                label = f'{first["fiscal_year"]}年{first["period"]}期 {first["voucher_type"]}{first["voucher_no"]}' if first["voucher_no"] else f'{first["entry_date"]} 无凭证号'
-                accounts = ", ".join(dict.fromkeys((source_account(line)[0] or source_account(line)[1]) for line in lines))
-            else:
-                label, accounts = "原凭证未匹配", ""
-            if needle and needle not in f'{label} {accounts} {mark["note"]} {mark["status"]}'.lower():
+            row = summaries[mark['key']]
+            status = '；'.join(part for part in (mark['status'] if mark['status'] != '正常' else '', row['status'] if not row['entry_id'] else '', row['amount_status']) if part)
+            searchable = ' '.join(str(value) for value in row.values()) + ' ' + mark['note'] + ' ' + status
+            if needle and needle not in searchable.lower():
                 continue
             iid = str(index)
-            self.mark_keys[iid] = mark["key"]
-            self.mark_entry_ids[iid] = lines[0]["id"] if lines else None
-            self.mark_view.insert("", "end", iid=iid, text="⋮⋮", values=(mark["status"], label, accounts, mark["note"].replace("\n", " ")[:160]))
-            if mark["key"] == select_key:
+            self.mark_keys[iid] = mark['key']
+            self.mark_entry_ids[iid] = row['entry_id']
+            self.mark_view.insert('', 'end', iid=iid, values=(row['date'], row['voucher'], row['summary'], row['amount'], row['accounts'], mark['note'].replace('\n', ' '), status or '正常'))
+            if mark['key'] == select_key:
                 self.mark_view.selection_set(iid)
                 self.mark_view.see(iid)
-                self._load_selected_mark()
+        self.mark_selection.refresh()
+        self._load_selected_mark()
 
     def open_selected_mark_voucher(self, _event: object = None) -> None:
         if _event is not None and self.mark_view.identify_column(_event.x) == "#0":
             return "break"
-        selection = self.mark_view.selection()
-        if not selection:
-            messagebox.showinfo("请选择凭证", "请先在关注凭证列表中选中一张凭证。", parent=self)
-            return
-        entry_id = self.mark_entry_ids.get(selection[0])
-        if entry_id is None:
-            messagebox.showinfo("无法打开", "原凭证已无法匹配（明细可能被重新导入），请在明细账中重新关注。", parent=self)
-            return
-        self.open_voucher(None, entry_id=entry_id)
+        row = self.mark_view.identify_row(_event.y) if _event is not None else next(iter(self.mark_view.selection()), None)
+        if row and row in self.mark_keys:
+            self.workbench.open_key(self.mark_keys[row])
 
     def _selected_mark_key(self) -> str | None:
-        selection = self.mark_view.selection()
-        return self.mark_keys.get(selection[0]) if selection else None
+        keys = self.mark_selection.action_keys()
+        return keys[0] if len(keys) == 1 else None
 
     def _load_selected_mark(self, _event: object = None) -> None:
         key = self._selected_mark_key()
@@ -2569,7 +2643,7 @@ class App(tk.Toplevel):
             self.after_idle(refresh_later)
         for row, row_key in self.mark_keys.items():
             if row_key == key and self.mark_view.exists(row) and mark:
-                self.mark_view.set(row, "note", mark["note"].replace("\n", " ")[:160])
+                self.mark_view.set(row, "note", mark["note"].replace("\n", " "))
 
     def locate_issue_voucher(self, key):
         if not self.store or not self.workbench.flush():
@@ -2577,10 +2651,10 @@ class App(tk.Toplevel):
         item = issue_store.voucher_preview(self.store, key)
         entry_id = item["entry_id"]
         if entry_id is None:
-            self.status.set("原凭证未匹配，可在工作台查看归集时快照。")
+            self.status.set("原凭证未匹配，可在工作台双击打开归集时快照。")
             return
         if self.detail_view.exists(str(entry_id)):
-            self.tabs.select(1)
+            self.select_page("entries")
             self.detail_view.selection_set(str(entry_id))
             self.detail_view.see(str(entry_id))
             return
@@ -2593,34 +2667,69 @@ class App(tk.Toplevel):
         self._reset_detail_filters()
         self.detail_sort, self.detail_descending = "date", False
         self.detail_locate_target = entry_id
-        self.tabs.select(1)
+        self.select_page("entries")
         self.refresh_details()
 
     def confirm_selected_mark(self) -> None:
-        if not self.workbench.flush():
+        if not self.store or not self.workbench.flush():
             return
-        key = self._selected_mark_key()
-        if not key or not self.store:
+        keys = self.mark_selection.action_keys()
+        marks = {item['key']: item for item in list_marks(self.store)}
+        valid = [key for key in keys if key in marks and marks[key]['status'] != '未匹配']
+        changed = [key for key in valid if marks[key]['status'] == '内容变化']
+        if changed and not messagebox.askyesno('确认凭证内容', f'已核对 {len(changed)} 张内容变化的凭证，并确认继续关注？', parent=self):
             return
-        mark = next((item for item in list_marks(self.store) if item["key"] == key), None)
-        if mark is None or mark["status"] == "未匹配":
-            messagebox.showinfo("无法确认", "原凭证已无法匹配，请从当前明细重新关注。", parent=self)
-            return
-        if mark["status"] == "内容变化" and not messagebox.askyesno("确认凭证内容", "当前凭证与标注时的内容不同。已核对现有分录并确认继续关注吗？", parent=self):
-            return
-        save_mark_by_key(self.store, key, self.mark_note.get("1.0", "end-1c"))
-        self.refresh_details()
-        self.refresh_marks(select_key=key)
+        from .voucher_notes import voucher_signature
+        try:
+            with self.store.db:
+                for key in valid:
+                    self.store.db.execute('UPDATE voucher_marks SET signature=? WHERE voucher_key=?', (voucher_signature(marks[key]['lines']), key))
+            self.refresh_marks(select_key=self.selected_mark_key)
+            self.status.set(f'已确认 {len(valid)} 张，未匹配跳过 {len(keys) - len(valid)} 张')
+        except Exception as exc:
+            messagebox.showerror('确认失败', str(exc), parent=self)
 
     def remove_selected_mark(self) -> None:
-        key = self._selected_mark_key()
-        if not self.workbench.flush():
+        if not self.store or not self.workbench.flush():
             return
-        if key and self.store and messagebox.askyesno("取消关注", "确定取消关注并删除这条注释吗？", parent=self):
-            remove_mark(self.store, key)
-            self.note_hub.broadcast(key)
-            self.refresh_details()
+        keys = self.mark_selection.action_keys()
+        if not keys:
+            return
+        if not messagebox.askyesno('取消关注', f'取消 {len(keys)} 张凭证的关注并删除其备注？问题关联及归集快照保留。', parent=self):
+            return
+        try:
+            with self.store.db:
+                self.store.db.executemany('DELETE FROM voucher_marks WHERE voucher_key=?', [(key,) for key in keys])
+            self.note_hub.unbind(self.mark_note)
+            for key in keys:
+                self.note_hub.broadcast(key)
+                self.update_mark_indicators(key)
+            self.mark_selection.clear()
             self.refresh_marks()
+            self.status.set(f'已取消 {len(keys)} 张凭证的关注，问题关联保留')
+        except Exception as exc:
+            messagebox.showerror('取消关注失败', str(exc), parent=self)
+
+    def toggle_mark_note(self):
+        if self.mark_note_frame.winfo_manager():
+            if self.note_hub.flush():
+                self.mark_note_frame.pack_forget()
+                self.mark_note_toggle.configure(text='编辑备注 ▸')
+        elif len(self.mark_selection.action_keys()) == 1:
+            self.mark_note_frame.pack(side='bottom', fill='x', before=self.mark_view.master)
+            self.mark_note_toggle.configure(text='编辑备注 ▾')
+            self._load_selected_mark()
+
+    def _update_mark_actions(self):
+        count = len(self.mark_selection.action_keys())
+        self.mark_join.configure(text=f'加入问题…（{count}）', state='normal' if count else 'disabled')
+        self.mark_note_toggle.configure(state='normal' if count == 1 else 'disabled')
+        if hasattr(self, 'mark_note'):
+            if count != 1 and self.mark_note_frame.winfo_manager():
+                if self.note_hub.flush():
+                    self.mark_note_frame.pack_forget()
+                    self.mark_note_toggle.configure(text='编辑备注 ▸')
+            self._load_selected_mark()
 
     def export_marks(self, as_new: bool = False) -> None:
         if not self.workbench.flush():
@@ -2680,7 +2789,11 @@ class App(tk.Toplevel):
         self.refresh_details()
 
     def _update_detail_mark(self, _event=None) -> None:
-        self.detail_mark.configure(state="normal" if self.detail_view.selection() else "disabled")
+        selection = getattr(self, 'detail_selection', None)
+        count = len(selection.action_keys()) if selection else 0
+        self.detail_mark.configure(text=f'关注所选（{count}）', state='normal' if count else 'disabled')
+        if hasattr(self, 'detail_join'):
+            self.detail_join.configure(text=f'加入问题…（{count}）', state='normal' if count else 'disabled')
 
     def reset_detail_sort(self) -> None:
         self.detail_sort = "date"
@@ -2875,6 +2988,7 @@ class App(tk.Toplevel):
 
     def refresh_report(self, kind: str) -> None:
         view = self.report_views[kind]
+        self.report_tools[kind].reset_selection()
         view.delete(*view.get_children())
         if not self.store:
             return
@@ -2907,7 +3021,7 @@ class App(tk.Toplevel):
                 display.append("right_c")
         display.append("source")
         view.configure(displaycolumns=display)
-        self.report_info[kind].set(f'{source["filename"]} · {source["sheet"]} · {source["row_count"]} 行 · 点击项目名称查看明细（全部期间）')
+        self.report_info[kind].set(f'{source["filename"]} · {source["sheet"]} · {source["row_count"]} 行 · 框选金额可合计及复制')
         for row in self.store.report_rows(source_id):
             values = [row["left_item"], report_amount(row["left_amount_1_cents"]), report_amount(row["left_amount_2_cents"]), report_amount(row["left_amount_3_cents"])]
             if kind == "balance_sheet":
@@ -2922,60 +3036,6 @@ class App(tk.Toplevel):
         name = re.sub(r"^(?:其中|加|减)[：:]", "", name)
         return name
 
-    def open_report_account(self, kind: str, event) -> None:
-        if not self.store:
-            return
-        view = self.report_views[kind]
-        item = view.identify_row(event.y)
-        column = view.identify_column(event.x)
-        if not item or not column or column == "#0":
-            return
-        # identify_column uses the displayed order, including hidden amount columns.
-        displayed = view.cget("displaycolumns")
-        index = int(column[1:]) - 1
-        if index >= len(displayed) or displayed[index] not in ("left_item", "right_item"):
-            return
-        side = "left" if displayed[index] == "left_item" else "right"
-        source_id = self.report_options[kind].get(self.report_source[kind].get())
-        row = next((row for row in self.store.report_rows(source_id) if str(row["row_no"]) == item), None)
-        if row is None or not row[f"{side}_item"].strip():
-            return
-        label = row[f"{side}_item"]
-        accounts = self.store.db.execute("SELECT key,code,name FROM accounts ORDER BY code,name").fetchall()
-        existing = {account["key"] for account in accounts}
-        mappings = [mapping for mapping in load_plan(self.store)["mappings"]
-                    if mapping.get("kind") == kind and mapping.get("source_id") == source_id
-                    and mapping.get("row_no") == row["row_no"] and mapping.get("side") == side]
-        keys = sorted({key for mapping in mappings for key in mapping.get("accounts", [])})
-        if keys and set(keys) <= existing:
-            self.show_report_accounts(keys, label, include_descendants=False)
-            return
-        name = self._report_item_name(label)
-        exact = [account["key"] for account in accounts if self._report_item_name(account["name"]) == name]
-        if len(exact) == 1:
-            self.show_report_accounts(exact, label)
-            return
-        suggestions = {"货币资金": {"库存现金", "现金", "银行存款", "其他货币资金"},
-                       "营业收入": {"主营业务收入", "其他业务收入"},
-                       "营业成本": {"主营业务成本", "其他业务成本"}}
-        suggested = sorted(set(exact) | {account["key"] for account in accounts if account["name"] in suggestions.get(name, set())})
-        if suggested:
-            self.show_report_accounts(suggested, label)
-            return
-        ReportAccountsDialog(self, label, accounts, [])
-
-    def show_report_accounts(self, keys: list[str], label: str, include_descendants: bool = True) -> None:
-        self.account = keys
-        self.include_descendants = include_descendants
-        names = [row["name"] for row in self.store.db.execute("SELECT key,name FROM accounts") if row["key"] in keys]
-        scope = "、".join(names)
-        if len(scope) > 30:
-            scope = scope[:30] + f"…（{len(keys)} 个科目）"
-        self.account_label.set(f"{label} → {scope}" + (" · 含子科目" if include_descendants else ""))
-        self._reset_detail_filters()
-        self.refresh_details()
-        self.tabs.select(1)
-
     @staticmethod
     def _flow_bar(container, first, second):
         if container.winfo_width() < first.winfo_reqwidth() + second.winfo_reqwidth() + 12:
@@ -2987,15 +3047,13 @@ class App(tk.Toplevel):
         width = self.detail_controls.winfo_width()
         if width <= 1:
             return
-        wrap = max(100, min(300, width - self.detail_actions.winfo_reqwidth() - 12))
-        if int(self.detail_scope.cget("wraplength")) != wrap:
+        wrap = max(90, min(180, width // 4))
+        if int(self.detail_scope.cget('wraplength')) != wrap:
             self.detail_scope.configure(wraplength=wrap)
-        widgets = (self.detail_scope, self.detail_lookup, self.detail_actions)
-        required = sum(widget.winfo_reqwidth() for widget in widgets) + 30
-        if width < required:
-            self.detail_lookup.grid(row=1, column=0, columnspan=3, sticky="ew", padx=0, pady=(5, 0))
-        else:
-            self.detail_lookup.grid(row=0, column=1, columnspan=1, sticky="ew", padx=10, pady=0)
+        # Fixed row order avoids controls disappearing during live sidebar resizing.
+        self.detail_scope.grid(row=0, column=0, sticky='w')
+        self.detail_lookup.grid(row=0, column=1, columnspan=2, sticky='ew', padx=(10, 0))
+        self.detail_actions.grid(row=1, column=0, columnspan=3, sticky='e', pady=(4, 0))
 
     def _detail_query_filters(self):
         period_start, period_end = self._period_bounds()
@@ -3026,6 +3084,7 @@ class App(tk.Toplevel):
         if scope != getattr(self, "_detail_scope", None):
             self.detail_offset = 0
         self._detail_scope = scope
+        self.detail_selection.set_scope(scope)
         offset = self.detail_offset
         locate_id = getattr(self, "detail_locate_target", None)
         self.detail_locate_target = None
@@ -3056,6 +3115,7 @@ class App(tk.Toplevel):
             self.detail_voucher_keys[str(row["id"])] = voucher_key(row)
             marked = voucher_key(row) in marked_keys
             self.detail_view.insert("", "end", iid=str(row["id"]), text="⋮⋮", values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
+        self.detail_selection.refresh()
         if locate_id is not None and self.detail_view.exists(str(locate_id)):
             self.detail_view.selection_set(str(locate_id))
             self.detail_view.see(str(locate_id))
@@ -3092,7 +3152,7 @@ class App(tk.Toplevel):
         values = self.summary_view.item(selection[0], "values")
         self.account_label.set(f"{values[0]} {values[1]}".strip() + (" · 含子科目" if self.include_descendants else ""))
         self.refresh_details()
-        self.tabs.select(1)
+        self.select_page("entries")
 
     def toggle_account(self, event):
         view = self.summary_view
