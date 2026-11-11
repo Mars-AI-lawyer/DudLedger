@@ -368,7 +368,7 @@ def merged_ranges(path: Path, sheet: str) -> list[tuple[int, int, int, int]]:
     if path.suffix.lower() == ".csv":
         pass
     elif path.suffix.lower() == ".xls":
-        book = xlrd.open_workbook(str(path), on_demand=True)
+        book = xlrd.open_workbook(str(path), on_demand=True, formatting_info=True)
         try:
             if sheet in book.sheet_names():
                 ranges = [(rlo + 1, rhi, clo + 1, chi) for rlo, rhi, clo, chi in book.sheet_by_name(sheet).merged_cells]
@@ -442,10 +442,15 @@ def combine_header(upper: list[object], lower: list[object]) -> list[str]:
         bottom = text_value(lower[index]) if index < len(lower) else ""
         if top:
             group = top
-        if bottom and _norm(bottom) in ("借方", "贷方") and group and _norm(group) != _norm(bottom):
-            combined.append(group + bottom)
-        elif top and bottom:
-            combined.append(bottom if _norm(top) == _norm(bottom) else top + bottom)
+        if bottom and _norm(bottom).endswith(("借方", "贷方")) and group and _norm(group) != _norm(bottom):
+            top = group
+        if top and bottom:
+            if _norm(top) == _norm(bottom) or _norm(bottom).startswith(_norm(top)):
+                combined.append(bottom)
+                continue
+            overlap = next((size for size in range(min(len(top), len(bottom)), 0, -1)
+                            if top[-size:] == bottom[:size]), 0)
+            combined.append(top + bottom[overlap:])
         else:
             combined.append(top or bottom)
     return combined
@@ -461,15 +466,22 @@ def _window_maps(path: Path, sheet: str) -> tuple[dict[int, list[object]], list[
 
 
 def header_candidates(path: Path, sheet: str, row_no: int, kind: str) -> list[list[str]]:
-    """给定行的表头候选：平面行；账簿类再叠加“上一行组名 + 本行子标题”的组合候选。"""
+    """Expand real merges and build multi-level ledger headers up to 20 rows deep."""
     window_rows, ranges = _window_maps(path, sheet)
     flat = [text_value(value) for value in _expanded_row(window_rows, ranges, row_no)]
-    if kind not in REPORT_KINDS and row_no > 1:
-        upper = _expanded_row(window_rows, ranges, row_no - 1)
-        combined = combine_header(upper, flat)
-        if combined != flat:
-            return [flat, combined]
-    return [flat]
+    candidates = [flat]
+    combined = flat
+    if kind not in REPORT_KINDS:
+        for previous in range(row_no - 1, max(0, row_no - 20), -1):
+            upper = _expanded_row(window_rows, ranges, previous)
+            populated = [value for value in upper if text_value(value)]
+            if any(not isinstance(value, str) or len(value) > 60 or
+                   re.search(r"\d", value) for value in populated):
+                break
+            combined = combine_header(upper, combined)
+            if combined not in candidates:
+                candidates.append(combined)
+    return candidates
 
 
 def _balance_header_pair(top: list[object], bottom: list[object]) -> list[str] | None:

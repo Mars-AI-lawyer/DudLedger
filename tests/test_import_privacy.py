@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from ledger_viewer.import_preview import preview_headers
+from ledger_viewer.import_preview import preview_for_ai, preview_headers
 from ledger_viewer.ui import Application, BatchImportDialog, ImportDialog, ai_tools, suggest_for_import
 
 
@@ -19,17 +19,19 @@ class ImportPrivacyTest(unittest.TestCase):
         self.path.write_text("秘密公司\n日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n"
                              "2026-01-01,秘密凭证,1002,银行存款,秘密交易摘要,1234567.89,0\n", encoding="utf-8")
 
-    def test_actual_request_only_contains_one_header_row_and_no_identifiers(self):
+    def test_authorized_first_rows_request_does_not_add_file_metadata(self):
         def fake_chat(key, payload):
             encoded = json.dumps(payload, ensure_ascii=False)
-            for secret in ("秘密", "1234567.89", "2026-01-01", self.path.name, str(self.path.parent)):
-                self.assertNotIn(secret, encoded)
+            for metadata in (self.path.name, str(self.path.parent)):
+                self.assertNotIn(metadata, encoded)
+            for sample in ("秘密交易摘要", "1234567.89", "2026-01-01"):
+                self.assertIn(sample, encoded)
             return json.dumps({"kind": "entry", "header_row": 2,
                                "mapping": {"account_code": 3, "account_name": 4, "debit": 6, "credit": 7}})
 
         from ledger_viewer.deepseek_mapping import suggest_mapping
         def suggest(preview, key):
-            self.assertEqual(len(preview["rows"]), 1)
+            self.assertEqual(len(preview["rows"]), 3)
             self.assertEqual(preview["sheet"], "工作表")
             return suggest_mapping(preview, key, chat=fake_chat)
 

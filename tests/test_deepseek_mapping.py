@@ -86,13 +86,16 @@ class DeepSeekMappingTest(unittest.TestCase):
         self.assertEqual(result.mapping, {"summary": 4})
         self.assertTrue(any("尚不满足导入条件" in warning for warning in result.warnings))
 
-    def test_legacy_multirow_preview_is_rejected_before_sending(self):
-        chat = canned({})
-        preview = {"sheet": "秘密公司", "rows": [*PREVIEW["rows"],
-            {"row": 2, "cells": ["秘密业务数据"]}]}
-        with self.assertRaisesRegex(ValueError, "1 行逻辑表头"):
-            suggest_mapping(preview, "sk-test", chat=chat)
-        self.assertEqual(chat.calls, [])
+    def test_multirow_preview_is_accepted_and_capped_at_twenty_rows(self):
+        chat = canned({"kind": "entry", "header_row": 1,
+                       "mapping": {"account_name": 4, "debit": 6, "credit": 7}})
+        preview = {"sheet": "不另发工作表名", "rows": [*PREVIEW["rows"],
+            *({"row": n, "cells": ["业务样本" if n <= 20 else "第二十一行不能发送"]} for n in range(2, 22))]}
+        suggest_mapping(preview, "sk-test", chat=chat)
+        encoded = json.dumps(chat.calls, ensure_ascii=False)
+        self.assertIn('业务样本', encoded)
+        self.assertNotIn('第二十一行不能发送', encoded)
+        self.assertNotIn('不另发工作表名', encoded)
 
     def test_payload_strips_extra_metadata_and_enforces_header_limits(self):
         chat = canned({"kind": "entry", "header_row": 1,
@@ -103,6 +106,27 @@ class DeepSeekMappingTest(unittest.TestCase):
         payload = json.dumps(chat.calls, ensure_ascii=False)
         for secret in ("秘密公司", "/private/secret", "秘密明细", "名" * 61):
             self.assertNotIn(secret, payload)
+
+    def test_concrete_model_ambiguity_blocks_import_but_notices_are_visible(self):
+        result = suggest_mapping(PREVIEW, 'sk-test', chat=canned({'kind': 'entry', 'header_row': 1,
+            'mapping': {'account_name': 4, 'debit': 6, 'credit': 7},
+            'warnings': ['无法区分本期与本年累计金额'], 'notices': ['已使用本币列']}))
+        self.assertEqual(result.warnings, ('无法区分本期与本年累计金额',))
+        self.assertEqual(result.notices, ('已使用本币列',))
+
+    def test_multirow_request_preserves_only_numeric_merge_metadata(self):
+        preview = {**PREVIEW, 'merged_ranges': [
+            {'start_row': 1, 'end_row': 3, 'start_col': 1, 'end_col': 2, 'path': '不要发送'},
+            {'start_row': 30, 'end_row': 40, 'start_col': 1, 'end_col': 2},
+            {'start_row': '私密文字', 'end_row': 4, 'start_col': 1, 'end_col': 2}]}
+        chat = canned({'kind': 'entry', 'header_row': 1,
+                       'mapping': {'account_name': 4, 'debit': 6, 'credit': 7}})
+        suggest_mapping(preview, 'sk-test', chat=chat)
+        encoded = chat.calls[0]['messages'][1]['content']
+        self.assertIn('"end_row": 3', encoded)
+        self.assertNotIn('不要发送', encoded)
+        self.assertNotIn('私密文字', encoded)
+        self.assertNotIn('"start_row": 30', encoded)
 
     def test_non_json_answer_is_rejected(self):
         with self.assertRaises(ValueError):

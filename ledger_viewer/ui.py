@@ -9,16 +9,16 @@ import sqlite3
 import tempfile
 import tkinter as tk
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Event, Thread
+from threading import Event
 from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from .agent_import import handoff_text
 from .import_cascade import redact_error
-from .import_preview import preview_headers, PRIVACY_NOTICE
+from .import_preview import PRIVACY_NOTICE
 from .import_work import inventory, prepare_sheets, preview_data, requires_background
+from .import_review import review_sheet, suggest_columns
 from .background import BackgroundTasks, Cancelled, check_cancelled
 from .checks import run_checks
 from .deepseek_mapping import delete_api_key as deepseek_delete_api_key, get_api_key as deepseek_get_api_key, key_memory_only as deepseek_memory_only, save_api_key as deepseek_save_api_key, suggest_mapping as deepseek_suggest_mapping
@@ -69,18 +69,8 @@ def ai_tools(controller) -> tuple[str, object, object]:
 
 
 def suggest_for_import(path, sheet, suggest, api_key, cancelled=lambda: False, *, header_row=None, kind=None):
-    fingerprint = file_hash(path)
-    preview = preview_headers(path, sheet, header_row, kind)
-    if file_hash(path) != fingerprint:
-        raise ValueError("读取预览期间原文件发生变化，请重试")
-    if cancelled():
-        raise ValueError("已取消分析")
-    result = deepseek_suggest_mapping(preview, api_key)
-    if cancelled():
-        raise ValueError("已取消分析")
-    if file_hash(path) != fingerprint:
-        raise ValueError("分析期间原文件发生变化，请重试")
-    return result
+    return suggest_columns(path, sheet, suggest or deepseek_suggest_mapping, api_key, cancelled,
+                           header_row=header_row, kind=kind)
 
 
 def copy_agent_task(dialog, items):
@@ -909,8 +899,8 @@ class ImportDialog(tk.Toplevel):
         self.header = tk.StringVar(value="1")
         self.columns: list[str] = []
         self.vars: dict[str, tk.StringVar] = {}
-        self._ai_queue: Queue = Queue()
-        self._ai_sheet = ""
+        self._ai_review = None
+        self._explicit_header = False
         self._layout()
         if spec is not None:
             self.kind.set(BatchImportDialog.LABELS[spec.kind])
@@ -975,7 +965,7 @@ class ImportDialog(tk.Toplevel):
         header_actions.pack(fill="x", pady=(8, 0))
         ttk.Label(header_actions, text="表头行号").pack(side="left")
         ttk.Entry(header_actions, textvariable=self.header, width=5).pack(side="left", padx=6)
-        ttk.Button(header_actions, text="按行号读取表头", command=lambda: self.refresh_preview(manual=True)).pack(side="left", padx=5)
+        ttk.Button(header_actions, text="按行号读取表头", command=self._read_header).pack(side="left", padx=5)
         self.ai_button = ttk.Button(header_actions, text="AI 建议列（可选）", command=self._offer_ai)
         self.ai_button.pack(side="right")
         ttk.Button(header_actions, text="复制给我的 Agent", command=lambda: copy_agent_task(self, [(self.path, self.sheet.get())])).pack(side="right", padx=5)
@@ -1001,66 +991,62 @@ class ImportDialog(tk.Toplevel):
         self.map_frame.bind("<Configure>", lambda _event: self.map_canvas.configure(scrollregion=self.map_canvas.bbox("all")))
         self.map_canvas.bind("<Configure>", lambda event: self.map_canvas.itemconfigure(self.map_window, width=event.width))
 
+    def _read_header(self):
+        self._explicit_header = True
+        self.refresh_preview(manual=True)
+
+    def _editor_signature(self):
+        return (self.sheet.get(), self.kind.get(), self.header.get(),
+                tuple((field, var.get()) for field, var in self.vars.items()))
+
     def _offer_ai(self) -> None:
+        if self.tasks.busy('review_ai') or self.working:
+            return
         label, suggest, get_key = ai_tools(self.parent.controller)
-        try:
+        api_key = get_key()
+        if not api_key:
+            self.grab_release()
+            settings = SettingsDialog(self.parent)
+            self.wait_window(settings)
+            if not self.winfo_exists():
+                return
+            self.grab_set()
             api_key = get_key()
             if not api_key:
-                self.grab_release()
-                settings = SettingsDialog(self.parent)
-                settings.lift()
-                settings.grab_set()
-                self.wait_window(settings)
-                if not self.winfo_exists():
-                    return
-                self.grab_set()
-                label, suggest, get_key = ai_tools(self.parent.controller)
-                api_key = get_key()
-                if not api_key:
-                    return
-            sheet = self.sheet.get()
-            header_row = int(self.header.get())
-            kind = next(code for code, name in BatchImportDialog.LABELS.items() if name == self.kind.get())
-        except Exception as exc:
-            messagebox.showerror("无法取得建议", str(exc), parent=self)
-            return
-        # 密钥已在偏好设置中保存即视为已确认发送范围，不再逐次弹窗；发送范围说明见偏好设置。
-        self.import_note.configure(text=f"{label} 正在分析 1 行表头；业务数据和疑点行保留在本机。")
-        self._ai_sheet = sheet
-        self.ai_button.configure(state="disabled", text=f"{label} 正在分析…")
-
-        path, queue, stop = self.path, self._ai_queue, self.stop_requested
-        def worker() -> None:
-            try:
-                queue.put((True, suggest_for_import(path, sheet, suggest, api_key, stop.is_set,
-                                                     header_row=header_row, kind=kind)))
-            except Exception as exc:
-                queue.put((False, redact_error(exc, api_key)))
-
-        Thread(target=worker, daemon=True).start()
-        self.after(120, self._poll_ai)
-
-    def _poll_ai(self) -> None:
-        if not self.winfo_exists():
-            return
+                self.import_note.configure(text="尚未设置 AI；可手动设置，或复制提示词给 Agent。")
+                return
         try:
-            success, result = self._ai_queue.get_nowait()
-        except Empty:
-            self.after(120, self._poll_ai)
+            header_row = int(self.header.get()) if self._explicit_header else None
+        except ValueError:
+            self.import_note.configure(text="表头行号必须为正整数")
             return
-        self.ai_button.configure(state="normal", text="AI 建议列（可选）")
-        if not success:
-            messagebox.showerror("AI 建议未完成", result, parent=self)
-            return
-        if self.sheet.get() != self._ai_sheet:
-            messagebox.showinfo("工作表已切换", "刚才的建议属于原工作表，未应用到当前表。", parent=self)
-            return
-        self.kind.set({"entry": "明细账／序时账", "balance": "科目余额表", "balance_sheet": "资产负债表", "income_statement": "利润表"}[result.kind])
-        self.header.set(str(result.header_row))
-        self.refresh_preview(manual=True, mapping=result.mapping)
-        if result.warnings:
-            caution = "\n".join(result.warnings[:8])
-            messagebox.showinfo("AI 建议需要核对", f"表类型、表头行和列映射已填入下方，但有以下需要注意之处：\n{caution}", parent=self)
+        signature = self._editor_signature()
+        path, sheet, kind = self.path, self.sheet.get(), self.kind_code()
+        self.ai_button.configure(state="disabled", text="正在审查…")
+        self.import_button.configure(state="disabled")
+        self.import_note.configure(text=f"{label} 正在分析前 20 行与合并单元格，并在本机整表预检…")
+
+        def restore():
+            self.ai_button.configure(state="normal", text="AI 建议列（可选）")
+            self.import_button.configure(state="normal")
+
+        def done(review):
+            restore()
+            if signature != self._editor_signature():
+                self.import_note.configure(text="列设置已改变，未应用刚才的 AI 建议；可重新审查。")
+                return
+            self._ai_review = review
+            self.kind.set(BatchImportDialog.LABELS[review.spec.kind])
+            self.header.set(str(review.spec.header_row))
+            self.refresh_preview(manual=True, mapping=review.spec.mapping)
+
+        def failed(exc):
+            restore()
+            self.import_note.configure(text="审查未完成：" + redact_error(exc, api_key) + "；可复制提示词给 Agent。")
+
+        self.tasks.submit('review_ai', lambda stop, report: review_sheet(path, sheet, stop, report,
+            suggest=suggest, api_key=api_key, header_row=header_row,
+            kind=kind if header_row is not None else None), done, failed)
 
     def refresh_preview(self, manual: bool = False, *, auto_kind=False, mapping=None) -> None:
         if self.working:
@@ -1119,6 +1105,12 @@ class ImportDialog(tk.Toplevel):
             ttk.Combobox(cell, textvariable=variable, values=["不导入", *self.columns], state="readonly", width=28).pack(side="left", fill="x", expand=True)
         self.map_frame.columnconfigure(0, weight=1)
         self.map_frame.columnconfigure(1, weight=1)
+        review = self._ai_review
+        if review and review.spec.header_row == row_no and review.spec.mapping == guess:
+            note = review.problem or review.report.summary_line()
+            if review.notices:
+                note += "；" + "；".join(review.notices)
+            self.import_note.configure(text=note)
 
     def kind_code(self) -> str:
         if self.kind.get() == "明细账／序时账":
@@ -1154,7 +1146,7 @@ class ImportDialog(tk.Toplevel):
         self._import_prechecked([(spec, result)], auto_excluded=reasons)
 
     def import_now(self) -> None:
-        if self.working or self.tasks.busy('preview'):
+        if self.working or self.tasks.busy('preview') or self.tasks.busy('review_ai'):
             return
         try:
             mapping = {field: self.columns.index(var.get()) for field, var in self.vars.items() if var.get() != "不导入"}
@@ -1281,18 +1273,15 @@ class BatchImportDialog(tk.Toplevel):
     def __init__(self, parent: "App", paths: list[Path]):
         super().__init__(parent)
         self.parent = parent
-        self.items = []
-        self.skipped = []
-        self.manual = set()
-        self.ai_ready = set()
-        self.ai_queue = Queue()
-        self.ai_cancel = Event()
-        self.ai_running = False
+        self.items, self.skipped, self.item_status = [], [], {}
+        self.selected, self.manual, self.completed = set(), set(), set()
+        self.reviews, self.review_errors = {}, {}
+        self.local_mode = False
+        self.ai_running = self.working = False
+        self.ai_cancel, self.stop_requested = Event(), Event()
         self.tasks = BackgroundTasks(self)
-        self.working = False
-        self.stop_requested = Event()
-        self.item_status = {}
-        self.completed = set()
+        self._editor = None
+        self._needs_key = False
         templates = parent.store.template_candidates() if parent.store else None
         background = requires_background(paths)
         if not background:
@@ -1300,126 +1289,281 @@ class BatchImportDialog(tk.Toplevel):
             if not self.items and not self.skipped:
                 self.destroy()
                 return
-        self.title("导入表格 · 可选择一个或多个文件")
-        self.geometry("820x520")
-        self.minsize(650, 420)
+        self.title("导入表格 · 自动审查")
+        width = min(1020, self.winfo_screenwidth() - 80)
+        height = min(760, self.winfo_screenheight() - 120)
+        self.geometry(f"{width}x{height}")
+        self.minsize(min(700, width), min(560, height))
         self.transient(parent)
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="勾选要导入的工作表；需要时双击修改列设置。", foreground="#555").pack(anchor="w")
-        self.use_ai = tk.BooleanVar(value=True)
-        self.ai_toggle = ttk.Checkbutton(body, text="使用 AI 为所有勾选的工作表建议列（默认）", variable=self.use_ai,
-                                          command=self._toggle_ai)
-        self.ai_toggle.pack(anchor="w", pady=(9, 0))
-        self.ai_hint = ttk.Label(body, text="DeepSeek Flash 仅分析 1 行表头；业务数据和疑点行保留在本机。", foreground="#555")
-        self.ai_hint.pack(anchor="w", pady=(2, 5))
+        ttk.Label(body, text="自动审查表头并在本机预检；查看建议后，点击一次“确认导入”。", wraplength=600).pack(anchor="w")
+        self.ai_hint = ttk.Label(body, text="DeepSeek Flash 默认分析前 20 行及合并单元格，可能包含真实账目；整表预检留在本机。", foreground="#777", wraplength=600)
+        self.ai_hint.pack(fill="x", pady=(4, 8))
         self.ai_progress = ttk.Progressbar(body, mode="determinate")
-        self.ai_status = tk.StringVar(value="")
-        status_label = ttk.Label(body, textvariable=self.ai_status, foreground="#555", wraplength=740)
-        status_label.pack(fill="x")
+        self.ai_status = tk.StringVar(value="正在准备自动审查…")
+        status_label = ttk.Label(body, textvariable=self.ai_status, foreground="#555", wraplength=650)
+        status_label.pack(fill="x", pady=(0, 6))
         status_label.bind("<Configure>", lambda event: status_label.configure(wraplength=max(200, event.width - 8)))
         footer = ttk.Frame(body)
-        footer.pack(side="bottom", fill="x", pady=(12, 0))
-        self.cancel_button = ttk.Button(footer, text="取消", command=self._close)
+        footer.pack(side="bottom", fill="x", pady=(10, 0))
+        primary = ttk.Frame(footer)
+        primary.pack(fill="x")
+        self.cancel_button = ttk.Button(primary, text="关闭", command=self._close)
         self.cancel_button.pack(side="right", padx=(6, 0))
-        self.import_button = ttk.Button(footer, text="导入选中的工作表", command=self._import_selected)
+        self.import_button = ttk.Button(primary, text="确认导入", style="Accent.TButton", command=self._import_selected, state="disabled")
         self.import_button.pack(side="right")
-        self.edit_button = ttk.Button(footer, text="检查／调整列…", command=self._edit_current)
+        self.agent_button = ttk.Button(primary, text="复制提示词给我的 Agent", command=self._copy_agent)
+        self.agent_button.pack(side="left")
+        secondary = ttk.Frame(footer)
+        secondary.pack(fill="x", pady=(6, 0))
+        self.edit_button = ttk.Menubutton(secondary, text="手动设置…")
+        menu = tk.Menu(self.edit_button, tearoff=False)
+        menu.add_command(label="调整当前工作表的列…", command=self._edit_current)
+        menu.add_command(label="仅用本地规则和手动设置", command=self._use_local_mode)
+        menu.add_command(label="恢复 AI 自动审查", command=self._use_ai_mode)
+        self.edit_button.configure(menu=menu)
         self.edit_button.pack(side="left")
-        self.agent_button = ttk.Button(footer, text="复制给我的 Agent", command=lambda: copy_agent_task(
-            self, [(self.items[index][0], self.items[index][1]) for index in sorted(self.selected)]))
-        self.agent_button.pack(side="left", padx=6)
-        self.view = tree(body, [("selected", "导入", 55), ("file", "文件", 180),
-            ("sheet", "工作表", 130), ("kind", "类型", 140), ("state", "列设置", 170)])
-        self.selected = set()
-        for index, _ in enumerate(self.items):
-            self.selected.add(index)
+        self.retry_button = ttk.Button(secondary, text="重新审查", style="Quiet.TButton", command=self._retry_review)
+        self.retry_button.pack(side="left", padx=12)
+        self.settings_button = ttk.Button(secondary, text="设置 AI", style="Quiet.TButton", command=self._configure_ai)
+        self.settings_button.pack(side="left")
+        detail_holder = ttk.LabelFrame(body, text="当前工作表的建议与预检", padding=6)
+        detail_holder.pack(side="bottom", fill="both", pady=(8, 0))
+        self.detail = tk.Text(detail_holder, height=7, width=1, wrap="word", state="disabled", relief="flat")
+        detail_scroll = ttk.Scrollbar(detail_holder, orient="vertical", command=self.detail.yview)
+        self.detail.configure(yscrollcommand=detail_scroll.set)
+        detail_scroll.pack(side="right", fill="y")
+        self.detail.pack(fill="both", expand=True)
+        self.view = tree(body, [("selected", "导入", 50), ("file", "文件", 170),
+            ("sheet", "工作表", 130), ("kind", "类型", 140), ("state", "审查结果", 260)])
+        self.view.configure(height=5)
+        self.selected = set(range(len(self.items)))
+        for index in range(len(self.items)):
             self._render_item(index)
         self.view.bind("<Button-1>", self._toggle_item)
         self.view.bind("<Double-1>", self._edit_current)
-        self.sheet_status = tk.StringVar()
-        sheet_label = ttk.Label(self.view.master, textvariable=self.sheet_status, wraplength=740, foreground="#555")
-        sheet_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        sheet_label.bind("<Configure>", lambda event: sheet_label.configure(wraplength=max(200, event.width - 8)))
         self.view.bind("<<TreeviewSelect>>", self._show_sheet_status)
         if self.items:
             self.view.selection_set('0')
-        if self.skipped:
-            ttk.Label(body, text="读取失败：" + "；".join(self.skipped), wraplength=730).pack(fill="x")
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Destroy>", self._destroy_import, add="+")
         if background:
             self._set_working(True, "正在本机读取工作表…")
-            stop = self.stop_requested
-            self.tasks.submit('inventory', lambda cancelled, report: inventory(paths, templates, stop, report),
+            self.tasks.submit('inventory', lambda stop, report: inventory(paths, templates, stop, report),
                 self._inventory_ready, self._work_failed, self.ai_status.set)
+        else:
+            self.after_idle(self._start_review)
+
+    def _own_import(self, active):
+        if active:
+            self.parent.import_busy = True
+            self.parent.import_owner = self
+        elif getattr(self.parent, 'import_owner', None) is self:
+            self.parent.import_busy = False
+            self.parent.import_owner = None
 
     def _destroy_import(self, event):
         if event.widget is self:
             self.stop_requested.set()
             self.ai_cancel.set()
-            if getattr(self.parent, 'import_owner', None) is self:
-                self.parent.import_busy = False
-                self.parent.import_owner = None
+            self._own_import(False)
 
     def _set_working(self, working, text=""):
         self.working = working
+        self._own_import(working or self.ai_running)
         if working:
-            self.parent.import_busy = True
-            self.parent.import_owner = self
             self.stop_requested.clear()
-        elif getattr(self.parent, 'import_owner', None) is self:
-            self.parent.import_busy = False
-            self.parent.import_owner = None
-        for widget in (self.import_button, self.edit_button, self.agent_button, self.ai_toggle):
-            widget.configure(state="disabled" if working else "normal")
-        self.cancel_button.configure(text="停止" if working else "关闭", state="normal")
+        self._update_controls()
         if text:
             self.ai_status.set(text)
 
+    def _update_controls(self):
+        busy = self.working or self.ai_running
+        ready = bool(self.selected) and all(i in self.reviews and self.reviews[i].ready for i in self.selected)
+        self.import_button.configure(state="normal" if ready and not busy and not self._editor else "disabled")
+        self.agent_button.configure(state="normal" if self.selected and not self.working else "disabled")
+        failed = any(i in self.review_errors or (i in self.reviews and not self.reviews[i].ready) for i in self.selected)
+        self.agent_button.configure(style="Accent.TButton" if failed or self._needs_key else "TButton")
+        self.edit_button.configure(state="disabled" if self.working else "normal")
+        self.retry_button.configure(state="disabled" if busy or not self.selected or self._editor else "normal")
+        self.settings_button.configure(state="disabled" if busy or self._editor else "normal")
+        self.cancel_button.configure(text="停止" if self.working else "关闭", state="normal")
+
     def _inventory_ready(self, result):
-        self._set_working(False)
         self.items, self.skipped, self.item_status = result
         self.selected = set(range(len(self.items)))
         for index in range(len(self.items)):
             self._render_item(index)
+        self._set_working(False)
         if self.items:
             self.view.selection_set('0')
-        if not self.items and not self.skipped:
+        elif not self.skipped:
             self.destroy()
             return
-        self.ai_status.set("读取失败：" + "；".join(self.skipped) if self.skipped else f"已读取 {len(self.items)} 张表，请选择导入。")
+        self._start_review()
 
     def _work_failed(self, exc):
         stopped = isinstance(exc, Cancelled) or self.stop_requested.is_set()
-        self._set_working(False, "已停止，已完成的工作表保留；可继续重试。" if stopped else f"处理失败，可重试：{exc}")
+        self._set_working(False, "已停止，已完成的工作表保留；可继续重试。" if stopped else f"处理失败：{exc}；可重试或交给 Agent。")
+
+    def _cancel_review(self):
+        self.tasks.cancel('review')
+        self.ai_cancel.set()
+        self.ai_running = False
+        self.ai_progress.pack_forget()
+        self._own_import(self.working)
 
     def _close(self):
+        if not self.winfo_exists():
+            return
         if self.working:
             self.stop_requested.set()
+            for key in ('verify', 'inventory'):
+                if self.tasks.busy(key):
+                    self.tasks.cancel(key)
+                    self._set_working(False, "已停止；没有写入本次数据，可关闭或重新操作。")
+                    return
             self.ai_status.set("正在停止；当前未完成的工作表不会写入，已完成的保留。")
             self.cancel_button.configure(state="disabled")
             return
-        self.ai_cancel.set()
+        self._cancel_review()
         self.destroy()
 
-    def _toggle_ai(self):
-        if self.use_ai.get():
-            self.ai_hint.configure(text="DeepSeek Flash 仅分析 1 行表头；业务数据和疑点行保留在本机。", foreground="#555")
+    def _use_local_mode(self):
+        if self.working:
+            return
+        self._cancel_review()
+        self.local_mode = True
+        self.reviews.clear()
+        self.review_errors.clear()
+        self.ai_hint.configure(text="手动模式：仅用本地规则和手动设置；不会发送表头。")
+        self._start_review()
+
+    def _use_ai_mode(self):
+        if self.working:
+            return
+        self._cancel_review()
+        self.local_mode = False
+        self.reviews = {i: review for i, review in self.reviews.items() if i in self.manual}
+        self.review_errors.clear()
+        self.ai_hint.configure(text="DeepSeek Flash 默认分析前 20 行及合并单元格，可能包含真实账目；整表预检留在本机。")
+        self._start_review()
+
+    def _configure_ai(self):
+        if self.working or self.ai_running or self._editor:
+            return
+        self.grab_release()
+        settings = SettingsDialog(self.parent)
+        self.wait_window(settings)
+        if self.winfo_exists():
+            self.grab_set()
+            self._retry_review()
+
+    def _retry_review(self):
+        if self.working or self.ai_running or self._editor:
+            return
+        failed = {i for i in self.selected if i in self.review_errors or
+                  (i in self.reviews and not self.reviews[i].ready)}
+        for index in failed or self.selected:
+            self.reviews.pop(index, None)
+            self.review_errors.pop(index, None)
+            self.item_status.pop(index, None)
+        self._start_review()
+
+    def _start_review(self):
+        if not self.winfo_exists() or self.working or self.ai_running or self._editor:
+            return
+        pending = [i for i in sorted(self.selected) if i not in self.reviews and i not in self.review_errors]
+        _, suggest, get_key = ai_tools(self.parent.controller)
+        api_key = ""
+        self._needs_key = False
+        if any(i not in self.manual for i in pending) and not self.local_mode:
+            try:
+                api_key = get_key()
+            except Exception:
+                api_key = ""
+            if not api_key:
+                self._needs_key = True
+                for i in pending:
+                    if i not in self.manual:
+                        self.review_errors[i] = "尚未设置 AI；点击“设置 AI”，或复制提示词给我的 Agent。"
+                pending = [i for i in pending if i in self.manual]
+        if not pending:
+            self._review_finished()
+            return
+        self.ai_running = True
+        self.ai_cancel.clear()
+        self._own_import(True)
+        self.ai_progress.configure(maximum=len(pending), value=0)
+        self.ai_progress.pack(fill="x", before=self.view.master, pady=(0, 5))
+        self._update_controls()
+        self._review_next(pending, api_key, suggest, 0)
+
+    def _review_next(self, pending, api_key, suggest, done):
+        if not pending:
+            self.ai_running = False
+            self._own_import(False)
+            self.ai_progress.pack_forget()
+            self._review_finished()
+            return
+        index, *rest = pending
+        path, sheet, spec = self.items[index]
+        local = self.local_mode or index in self.manual
+        self.item_status[index] = "正在本机预检…" if local else "AI 正在审查表头…"
+        self._render_item(index)
+        self.ai_status.set(f"正在审查 {path.name}/{sheet}；已完成 {done} 张。")
+
+        def work(stop, report):
+            if local and spec is None:
+                raise ValueError("本地规则无法识别，请从“手动设置…”调整当前表。")
+            return review_sheet(path, sheet, stop, report, suggest=suggest, api_key=api_key,
+                                manual_spec=spec if local else None)
+
+        def finish(review=None, error=None):
+            if review is not None:
+                self.reviews[index] = review
+                self.items[index] = (path, sheet, review.base_spec)
+                self.item_status.pop(index, None)
+            else:
+                self.review_errors[index] = redact_error(error, api_key)
+                self.item_status.pop(index, None)
+            self._render_item(index)
+            self._show_sheet_status()
+            self.ai_progress.configure(value=done + 1)
+            self._review_next(rest, api_key, suggest, done + 1)
+
+        self.tasks.submit('review', work, lambda review: finish(review=review), lambda exc: finish(error=exc), self.ai_status.set)
+
+    def _review_finished(self):
+        for index in range(len(self.items)):
+            self._render_item(index)
+        ready = sum(i in self.reviews and self.reviews[i].ready for i in self.selected)
+        if not self.selected:
+            summary = "请勾选要导入的工作表。"
+        elif ready == len(self.selected):
+            count = sum(self.reviews[i].report.stats.imported_rows for i in self.selected)
+            summary = f"所选 {ready} 张表全部通过，拟导入 {count:,} 行；查看建议后点击“确认导入”。"
         else:
-            self.ai_hint.configure(text="未使用 AI，自动识别可能有误；可双击工作表手动调整列。", foreground="#995300")
-            messagebox.showinfo("请核对列设置", "未使用 AI 时，自动识别可能有误。导入前可双击工作表，手动调整表头、借贷方向和金额列。", parent=self)
+            summary = f"{ready} / {len(self.selected)} 张表已通过；整批尚未导入。可复制提示词给 Agent，或取消勾选问题表。"
+        if self.skipped:
+            summary += " 读取失败：" + "；".join(self.skipped)
+        self.ai_status.set(summary)
+        self._update_controls()
+        self._show_sheet_status()
 
     def _render_item(self, index):
         path, sheet, spec = self.items[index]
+        review = self.reviews.get(index)
+        state = self.item_status.get(index) or self.review_errors.get(index)
+        if not state:
+            if review:
+                state = (f"可导入 · {review.report.stats.imported_rows:,} 行" if review.ready else "需处理：" + review.problem)
+            else:
+                state = "等待审查" if index in self.selected else "未勾选"
         values = ("☑" if index in self.selected else "☐", path.name, sheet,
-            self.LABELS[spec.kind] if spec else "待确认",
-            f"AI 已建议 · 表头第 {spec.header_row} 行" if index in self.ai_ready else
-            (f"手动设置 · 表头第 {spec.header_row} 行" if index in self.manual else
-             (f"表头第 {spec.header_row} 行" if spec else "待 AI 建议／手动设置")))
-        if index in self.item_status:
-            values = (*values[:-1], self.item_status[index])
+                  self.LABELS[spec.kind] if spec else "待识别", state)
         if self.view.exists(str(index)):
             self.view.item(str(index), values=values)
         else:
@@ -1427,22 +1571,45 @@ class BatchImportDialog(tk.Toplevel):
 
     def _show_sheet_status(self, event=None):
         selected = self.view.selection()
-        self.sheet_status.set(self.view.set(selected[0], "state") if selected else "")
+        lines = []
+        if selected:
+            index = int(selected[0])
+            path, sheet, spec = self.items[index]
+            lines = [f"{path.name} / {sheet}", self.view.set(str(index), "state")]
+            review = self.reviews.get(index)
+            if review:
+                lines.append(f"{self.LABELS[review.spec.kind]}；表头第 {review.spec.header_row} 行")
+                if review.report:
+                    lines.append(review.report.summary_line())
+                for field, col in review.spec.mapping.items():
+                    lines.append(f"{FIELD_LABELS.get(field, field)} ← 第 {col + 1} 列：{review.headers[col] or '（空表头）'}")
+                if review.report:
+                    lines.extend(f"提醒：{issue.reason}" for issue in review.report.issues)
+                if review.exclusions:
+                    lines.append(f"本地规则自动排除 {len(review.exclusions)} 行，理由随导入记录保存。")
+                lines.extend(f"说明：{notice}" for notice in review.notices)
+        self.detail.configure(state="normal")
+        self.detail.delete('1.0', 'end')
+        self.detail.insert('1.0', '\n'.join(lines))
+        self.detail.configure(state="disabled")
 
     def _toggle_item(self, event):
-        if self.ai_running or self.working:
+        if self.ai_running or self.working or self._editor:
             return
         item = self.view.identify_row(event.y)
         if item and self.view.identify_column(event.x) == '#1':
             index = int(item)
+            if index in self.completed:
+                return
             if index in self.selected:
                 self.selected.remove(index)
             else:
                 self.selected.add(index)
             self._render_item(index)
+            self._start_review()
 
     def _edit_current(self, event=None):
-        if self.ai_running or self.working:
+        if self.working or self._editor:
             return
         if event is not None:
             item = self.view.identify_row(event.y)
@@ -1451,217 +1618,71 @@ class BatchImportDialog(tk.Toplevel):
         else:
             selection = self.view.selection()
             item = selection[0] if selection else None
-        if item is None:
+        if item is None or int(item) in self.completed:
             return
+        self._cancel_review()
         index = int(item)
         path, sheet, spec = self.items[index]
+
         def save(updated):
             self.items[index] = (path, sheet, updated)
             self.item_status.pop(index, None)
-            self.completed.discard(index)
+            self.review_errors.pop(index, None)
+            self.reviews.pop(index, None)
             self.selected.add(index)
             self.manual.add(index)
-            self.ai_ready.discard(index)
             self._render_item(index)
+
         editor = ImportDialog(self.parent, path, spec=spec, sheet_name=sheet, on_save=save)
+        self._editor = editor
+        self._update_controls()
         editor.transient(self)
+
         def restore(event):
             if event.widget is editor and self.winfo_exists():
+                self._editor = None
                 self.grab_set()
+                self.after_idle(self._start_review)
         editor.bind('<Destroy>', restore, add='+')
 
+    def _copy_agent(self):
+        indices = sorted(self.selected - self.completed)
+        copy_agent_task(self, [(self.items[i][0], self.items[i][1]) for i in indices])
+
     def _import_selected(self) -> None:
-        if self.ai_running or self.working:
+        if self.ai_running or self.working or self._editor or not self.selected:
             return
-        if not self.selected:
-            messagebox.showinfo("未选择表", "请至少勾选一个工作表。", parent=self)
-            return
-        if self.use_ai.get():
-            pending = [i for i in sorted(self.selected) if i not in self.manual | self.ai_ready]
-            if pending:
-                label, suggest, get_key = ai_tools(self.parent.controller)
-                api_key = get_key()
-                if not api_key:
-                    self.grab_release()
-                    settings = SettingsDialog(self.parent)
-                    settings.lift()
-                    settings.grab_set()
-                    self.wait_window(settings)
-                    if not self.winfo_exists():
-                        return
-                    self.grab_set()
-                    label, suggest, get_key = ai_tools(self.parent.controller)
-                    api_key = get_key()
-                    if not api_key:
-                        self.ai_status.set(f"尚未设置 {label} 密钥；可取消勾选 AI 后手动核对列。")
-                        return
-                # 密钥已在偏好设置中保存即视为已确认发送范围，不再逐次弹窗；说明见偏好设置。
-                self.ai_hint.configure(text=f"{label} 正在分析 {len(pending)} 张表的表头（每表仅 1 行）；业务数据不发送。")
-                self._start_ai(pending, api_key, suggest, label)
-                return
-        self._import_ready()
-
-    def _start_ai(self, pending, api_key, suggest, label):
-        self.ai_running = True
-        self.ai_cancel.clear()
-        self.import_button.configure(state="disabled")
-        self.edit_button.configure(state="disabled")
-        self.agent_button.configure(state="disabled")
-        self.ai_toggle.configure(state="disabled")
-        self.ai_progress.configure(maximum=len(pending), value=0)
-        self.ai_progress.pack(fill="x", pady=(2, 5))
-        self.ai_status.set(f"{label} 正在建议列：0 / {len(pending)}")
-
-        queue, stop = self.ai_queue, self.ai_cancel
-        items = [(index, *self.items[index]) for index in pending]
-        kinds = set(self.LABELS)
-        def worker():
-            for index, path, sheet, current in items:
-                if stop.is_set():
-                    return
-                try:
-                    result = suggest_for_import(path, sheet, suggest, api_key, stop.is_set,
-                        header_row=current.header_row if current else None, kind=current.kind if current else None)
-                    if result.kind not in kinds:
-                        raise ValueError("未识别表类型")
-                    spec = ImportSpec(path, sheet, result.header_row, result.kind, result.mapping)
-                    spec.validate()
-                    headers = header_for_row(path, sheet, result.header_row, result.kind)
-                    if not headers or any(column >= len(headers) or column < 0 for column in result.mapping.values()):
-                        raise ValueError("建议列超出工作表范围")
-                    queue.put((index, spec, result.warnings, None))
-                except Exception as exc:
-                    queue.put((index, None, (), redact_error(exc, api_key)))
-            queue.put((None, None, (), None))
-
-        Thread(target=worker, daemon=True).start()
-        self.after(120, self._poll_ai_batch, len(pending), 0, [], label)
-
-    def _poll_ai_batch(self, total, done, problems, label="DeepSeek Flash"):
-        if not self.winfo_exists():
-            return
-        try:
-            while True:
-                index, spec, warnings, error = self.ai_queue.get_nowait()
-                if index is None:
-                    self.ai_running = False
-                    self.import_button.configure(state="normal")
-                    self.edit_button.configure(state="normal")
-                    self.agent_button.configure(state="normal")
-                    self.ai_toggle.configure(state="normal")
-                    self.ai_progress.pack_forget()
-                    if problems:
-                        self.ai_status.set(f"已处理 {done} 张；未通过的表可重试、调整，或复制给我的 Agent。")
-                        messagebox.showwarning("列建议需要核对", "\n".join(problems[:12]), parent=self)
-                    else:
-                        self.ai_status.set(f"{label} 已完成 {done} 张工作表的列建议。")
-                        self._import_ready()
-                    return
-                done += 1
-                if error:
-                    path, sheet, _ = self.items[index]
-                    problems.append(f"{path.name}/{sheet}：{error}")
-                    if self.items[index][2] is not None:
-                        self.view.set(str(index), "state", "已用本地识别列（AI 建议未通过，可直接导入）")
-                    else:
-                        self.view.set(str(index), "state", "AI 失败，需重试或手动设置")
-                else:
-                    path, sheet, _ = self.items[index]
-                    self.items[index] = (path, sheet, spec)
-                    self.ai_ready.add(index)
-                    self._render_item(index)
-                    if warnings:
-                        problems.append(f"{path.name}/{sheet}：" + "；".join(warnings[:3]))
-                self.ai_progress.configure(value=done)
-                self.ai_status.set(f"{label} 正在建议列：{done} / {total}")
-        except Empty:
-            self.after(120, self._poll_ai_batch, total, done, problems, label)
-
-    def _import_ready(self) -> None:
-        if self.ai_running or self.working:
-            return
-        if any(self.items[index][2] is None for index in self.selected):
-            messagebox.showinfo("请确认列设置", "选中的表包含未识别项，请双击手动调整列，或取消勾选。", parent=self)
+        if not all(i in self.reviews and self.reviews[i].ready for i in self.selected):
+            self._review_finished()
             return
         indices = sorted(self.selected)
-        if not indices:
-            messagebox.showinfo("未选择表", "请至少勾选一个工作表。", parent=self)
-            return
-        selected = [(index, self.items[index][2]) for index in indices]
-        if requires_background([spec.path for _, spec in selected]):
-            self._set_working(True, "正在本机整表预检…")
-            stop = self.stop_requested
-            self.tasks.submit('precheck', lambda cancelled, report: prepare_sheets(selected, stop, report),
-                self._prepared_ready, self._work_failed, self.ai_status.set)
-            return
-        work: list[tuple[int, ImportSpec, object]] = []
-        self._precheck_errors = {}
-        for index, spec in selected:
-            try:
-                work.append((index, spec, precheck(spec)))
-            except Exception as exc:
-                self._precheck_errors[index] = str(exc)
-                work.append((index, spec, None))
-        self._apply_batch_resolutions(work, {})
+        reviews = {i: self.reviews[i] for i in indices}
+        self._set_working(True, "正在确认原文件未发生变化…")
 
-    def _prepared_ready(self, result):
-        self._set_working(False)
-        prepared, held, statuses, updated = result
-        self.item_status.update(statuses)
-        for index, spec in updated.items():
-            self.item_status.pop(index, None)
-            self.items[index] = (spec.path, spec.sheet, spec)
-        for index in set(statuses) | set(updated):
-            self._render_item(index)
-        if prepared:
-            self._import_prechecked([(spec, report) for spec, report, reasons in prepared],
-                paused_specs=held, auto_reasons={(spec.sheet, str(spec.path)): reasons for spec, report, reasons in prepared})
-        else:
-            self.ai_status.set("所选表均未通过预检；具体原因见列表，可调整列设置后重试。")
+        def verify(stop, report):
+            fingerprints = {}
+            for index in indices:
+                check_cancelled(stop)
+                path = reviews[index].spec.path
+                if path not in fingerprints:
+                    fingerprints[path] = file_hash(path)
+            return {i for i in indices if fingerprints[reviews[i].spec.path] != reviews[i].fingerprint}
 
-    def _apply_batch_resolutions(self, work: list, labels_by_index: dict) -> None:
-        from .row_triage import pending_reasons, resolve_pending
+        def verified(changed):
+            self._set_working(False)
+            if changed:
+                paths = {reviews[i].spec.path for i in changed}
+                for i, (path, sheet, spec) in enumerate(self.items):
+                    if path in paths:
+                        self.reviews.pop(i, None)
+                        self.review_errors[i] = "原文件已修改，旧审查结果失效；请重新审查。"
+                        self.item_status.pop(i, None)
+                self._review_finished()
+                return
+            self._import_prechecked([(reviews[i].spec, reviews[i].report) for i in indices],
+                auto_reasons={(reviews[i].spec.sheet, str(reviews[i].spec.path)): reviews[i].exclusions for i in indices})
 
-        importable: list[tuple[ImportSpec, object, dict]] = []
-        held_specs: list[ImportSpec] = []
-        for index, spec, result in work:
-            if result is None:
-                self.view.set(str(index), "state", "整表无法预检：" + getattr(self, "_precheck_errors", {}).get(index, "请调整列设置后重试"))
-                held_specs.append(spec)
-                continue
-            if not result.pending_rows:
-                if result.blocked:
-                    self.view.set(str(index), "state", "没有识别到可导入的数据行，未导入")
-                    held_specs.append(spec)
-                    continue
-                importable.append((spec, result, {}))
-                continue
-            outcome = resolve_pending(spec, pending_reasons(result), result.stats.imported_rows,
-                                      labels_by_index.get(index))
-            if not outcome.resolved:
-                self.view.set(str(index), "state", f"{len(outcome.held)} 行疑点为真实数据或结构变化，未自动排除；双击调整列设置")
-                held_specs.append(spec)
-                continue
-            spec2 = spec.with_extra_exclusions(tuple(outcome.excluded)) if outcome.excluded else spec
-            result2 = result
-            if outcome.excluded:
-                try:
-                    result2 = precheck(spec2)
-                except Exception:
-                    result2 = None
-                if result2 is None or result2.blocked:
-                    self.view.set(str(index), "state", "排除疑点行后仍无可导入行，未导入；双击调整列设置")
-                    held_specs.append(spec)
-                    continue
-                self.items[index] = (self.items[index][0], self.items[index][1], spec2)
-                self.view.set(str(index), "state", f"已自动排除 {len(outcome.excluded)} 行疑点，随本次导入")
-            importable.append((spec2, result2, outcome.excluded))
-        if not importable:
-            self.ai_status.set(f"{len(held_specs)} 张表无法自动排除疑点，均未导入；双击对应表调整列设置或修正原表后重试。")
-            return
-        self._import_prechecked([(spec, result) for spec, result, _reasons in importable],
-                                paused_specs=held_specs,
-                                auto_reasons={(spec.sheet, str(spec.path)): reasons for spec, _result, reasons in importable})
+        self.tasks.submit('verify', verify, verified, self._work_failed)
 
     def _import_prechecked(self, work: list, paused_specs: list | None = None, auto_reasons: dict | None = None) -> None:
         work = [(spec, result) for spec, result in work if result is not None and not result.blocked]
@@ -1731,6 +1752,8 @@ class BatchImportDialog(tk.Toplevel):
             if stopped:
                 summary += " 已停止；当前未完成的工作表未写入。"
             self.ai_status.set(summary)
+            self._update_controls()
+            self._show_sheet_status()
             if not stopped:
                 messagebox.showinfo("导入结果", summary, parent=self)
             if not paused_specs and not failures and not stopped:

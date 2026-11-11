@@ -614,36 +614,41 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
         self.assertEqual(self.window.store.sources(), [])
         dialog.destroy()
 
-    def test_batch_import_auto_excludes_and_holds_structural_sheet(self):
-        from unittest.mock import patch
+    def _wait_batch(self, dialog, predicate=None):
+        import time
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            self.app.update()
+            if predicate() if predicate else not dialog.ai_running and not dialog.working:
+                return
+            time.sleep(.005)
+        self.fail("Batch operation did not finish")
 
+    def test_batch_import_auto_excludes_but_holds_entire_batch_for_structural_sheet(self):
+        from unittest.mock import patch
         from ledger_viewer.ui import BatchImportDialog
 
         good = self.base / "正常.csv"
         good.write_text(",".join(ENTRY_HEADER) + "\n2026-06-01,记,1,1002,银行存款,收款,100,0\n", encoding="utf-8")
         bad = self._bad_csv().rename(self.base / "问题.csv")
         structural = self._structural_csv().rename(self.base / "结构.csv")
-        dialog = BatchImportDialog(self.window, [good, bad, structural])
-        shown: list[str] = []
-
-        def record_info(title, message, **_kwargs):
-            shown.append(message)
-
         with patch("ledger_viewer.ui.deepseek_get_api_key", return_value=""), \
-             patch("ledger_viewer.ui.messagebox.showinfo", side_effect=record_info):
-            dialog.use_ai.set(False)
+             patch("ledger_viewer.ui.messagebox.showinfo"):
+            dialog = BatchImportDialog(self.window, [good, bad, structural])
+            dialog._use_local_mode()
+            self._wait_batch(dialog)
+            self.assertEqual(self.window.store.sources(), [])
+            self.assertEqual(str(dialog.import_button['state']), 'disabled')
+            structural_index = next(i for i, item in enumerate(dialog.items) if item[0] == structural)
+            self.assertIn('疑点', dialog.reviews[structural_index].problem)
+            bad_index = next(i for i, item in enumerate(dialog.items) if item[0] == bad)
+            self.assertEqual(len(dialog.reviews[bad_index].exclusions), 1)
+            dialog.selected.remove(structural_index)
+            dialog._start_review()
             dialog._import_selected()
-            self.app.update()
-        # 少量疑点行自动排除后导入；结构变化表保持不导入并在列表标注。
+            self._wait_batch(dialog, lambda: not dialog.winfo_exists())
         self.assertEqual(len(self.window.store.sources()), 2)
-        names = {source["filename"] for source in self.window.store.sources()}
-        self.assertEqual(names, {"正常.csv", "问题.csv"})
-        structural_index = next(index for index, (path, _sheet, _spec) in enumerate(dialog.items) if path.name == "结构.csv")
-        self.assertIn("未自动排除", dialog.view.set(str(structural_index), "state"))
-        bad_index = next(index for index, (path, _sheet, _spec) in enumerate(dialog.items) if path.name == "问题.csv")
-        self.assertIn("自动排除", dialog.view.set(str(bad_index), "state"))
-        self.assertTrue(dialog.winfo_exists())
-        dialog._close()
+        self.assertEqual({source['filename'] for source in self.window.store.sources()}, {'正常.csv', '问题.csv'})
 
     def test_imported_source_precheck_is_viewable_after_import(self):
         from unittest.mock import patch
@@ -654,10 +659,10 @@ class PrecheckDialogFlowTest(PrecheckTestBase):
         good.write_text(",".join(ENTRY_HEADER) + "\n2026-06-01,记,1,1002,银行存款,收款,100,0\n", encoding="utf-8")
         dialog = BatchImportDialog(self.window, [good])
         with patch("ledger_viewer.ui.messagebox.showinfo"):
-            dialog.use_ai.set(False)
+            dialog._use_local_mode()
+            self._wait_batch(dialog)
             dialog._import_selected()
-            self.app.update()
-        dialog._close()
+            self._wait_batch(dialog, lambda: not dialog.winfo_exists())
         self.window.open_utility("导入记录")
         self.app.update()
         self.window.source_view.selection_set(str(self.window.store.sources()[0]["id"]))

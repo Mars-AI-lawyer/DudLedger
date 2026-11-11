@@ -1,103 +1,81 @@
-import tempfile
-import time
-import tkinter as tk
-import unittest
-from pathlib import Path
+import threading
 from unittest.mock import patch
 
-from ledger_viewer.jev_mapping import MappingSuggestion
-from ledger_viewer.ui import Application, BatchImportDialog, copy_agent_task
+from ledger_viewer.ui import BatchImportDialog
+from tests.import_ui_helpers import ImportUiCase
 
 
-class DeepSeekImportUiTest(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.base = Path(self.temp.name)
-        self.source = self.base / "账.csv"
-        self.source.write_text("日期,凭证号,科目编码,科目名称,金额,借贷方向\n"
-                               "2026-09-01,记1,1002,银行存款,10,借\n", encoding="utf-8")
-        try:
-            with patch("ledger_viewer.ui.Path.home", return_value=self.base):
-                self.app = Application()
-        except tk.TclError as exc:
-            self.temp.cleanup()
-            self.skipTest(str(exc))
-        self.assertEqual(self.app.ai_provider, "deepseek")
-        self.window = next(iter(self.app.windows))
-        self.window._use_book(self.base / "existing.sqlite")
-        self.dialog = BatchImportDialog(self.window, [self.source])
-        self.good = MappingSuggestion("entry", 1, {"date": 0, "voucher_no": 1, "account_code": 2,
-                                       "account_name": 3, "amount": 4, "direction": 5}, {}, (), "test")
-
-    def tearDown(self):
-        self.window._close()
-        self.temp.cleanup()
-
-    def wait_done(self):
-        deadline = time.monotonic() + 5
-        while self.dialog.winfo_exists() and self.dialog.ai_running and time.monotonic() < deadline:
-            self.app.update()
-            time.sleep(0.01)
-
-    def test_import_never_calls_jev_even_with_a_jev_key(self):
-        with patch("ledger_viewer.ui.get_api_key", return_value="first"), \
-             patch("ledger_viewer.ui.deepseek_get_api_key", return_value="second"), \
-             patch("ledger_viewer.jev_mapping.suggest_mapping", side_effect=ValueError("无法识别")) as first, \
-             patch("ledger_viewer.ui.deepseek_suggest_mapping", return_value=self.good) as second, \
-             patch("ledger_viewer.ui.messagebox.askokcancel", return_value=True) as consent, \
-             patch("ledger_viewer.ui.messagebox.showinfo"):
-            self.dialog._import_selected()
-            self.wait_done()
-        consent.assert_not_called()  # 密钥已设置即视为确认发送范围，不再弹窗
-        first.assert_not_called()
-        second.assert_called_once()
-        self.assertEqual(len(self.window.store.sources()), 1)
-
-    def test_cancel_consent_sends_nothing(self):
-        class FakeSettings:
-            def __init__(self, parent):
-                pass
-
-            def lift(self):
-                pass
-
-            def grab_set(self):
-                pass
-
-            def destroy(self):
-                pass
-
-        with patch("ledger_viewer.ui.get_api_key", return_value=""), \
-             patch("ledger_viewer.ui.deepseek_get_api_key", return_value=""), \
-             patch("ledger_viewer.jev_mapping.suggest_mapping") as first, \
-             patch("ledger_viewer.ui.deepseek_suggest_mapping") as second, \
-             patch("ledger_viewer.ui.SettingsDialog", FakeSettings), \
-             patch.object(BatchImportDialog, "wait_window", lambda self, window: None):
-            # 未保存任何密钥且直接关闭偏好设置：不发送任何预览。
-            self.dialog._import_selected()
-            self.wait_done()
-        first.assert_not_called()
-        second.assert_not_called()
+class DeepSeekImportUiTest(ImportUiCase):
+    def test_automatic_import_review_never_calls_jev(self):
+        with patch('ledger_viewer.jev_mapping.suggest_mapping') as jev, patch('ledger_viewer.ui.messagebox.askokcancel') as consent:
+            dialog = self.dialog()
+            self.wait_review(dialog)
+        jev.assert_not_called()
+        consent.assert_not_called()
+        self.suggest.assert_called_once()
         self.assertEqual(self.window.store.sources(), [])
 
-    def test_deepseek_failure_leaves_book_empty_and_enables_handoff(self):
-        with patch("ledger_viewer.ui.get_api_key", return_value="first"), \
-             patch("ledger_viewer.ui.deepseek_get_api_key", return_value="second"), \
-             patch("ledger_viewer.jev_mapping.suggest_mapping", side_effect=ValueError("无法识别")), \
-             patch("ledger_viewer.ui.deepseek_suggest_mapping", side_effect=ValueError("仍无法识别")), \
-             patch("ledger_viewer.ui.messagebox.askokcancel", return_value=True), \
-             patch("ledger_viewer.ui.messagebox.showwarning") as warning:
-            self.dialog._import_selected()
-            self.wait_done()
-        warning.assert_called_once()
-        self.assertEqual(self.window.store.sources(), [])
-        self.assertEqual(str(self.dialog.agent_button.cget("state")), "normal")
-        # Intercept clipboard calls so tests do not replace the user's clipboard.
-        with patch.object(self.dialog, "clipboard_clear"), patch.object(self.dialog, "clipboard_append") as copied, \
-             patch("ledger_viewer.ui.messagebox.showinfo"):
-            copy_agent_task(self.dialog, [(self.source, "CSV")])
-        self.assertIn(str(self.source.resolve()), copied.call_args.args[0])
+    def test_missing_key_shows_settings_and_handoff_without_modal_or_network(self):
+        self.key.return_value = ''
+        with patch('ledger_viewer.ui.SettingsDialog') as settings:
+            dialog = self.dialog()
+            self.wait_review(dialog)
+        settings.assert_not_called()
+        self.suggest.assert_not_called()
+        self.assertIn('尚未设置 AI', dialog.detail.get('1.0', 'end'))
+        self.assertEqual(str(dialog.settings_button['state']), 'normal')
+        self.assertEqual(str(dialog.agent_button['state']), 'normal')
+        self.assertEqual(str(dialog.import_button['state']), 'disabled')
 
-    def test_closing_batch_sets_cancellation_event(self):
-        self.dialog._close()
-        self.assertTrue(self.dialog.ai_cancel.is_set())
+    def test_saving_key_from_inline_action_automatically_resumes_review(self):
+        self.key.return_value = ''
+        dialog = self.dialog()
+        self.wait_review(dialog)
+        def save_key(parent):
+            self.key.return_value = 'saved-fake-key'
+            return object()
+        with patch('ledger_viewer.ui.SettingsDialog', side_effect=save_key), patch.object(BatchImportDialog, 'wait_window'):
+            dialog.settings_button.invoke()
+            self.wait_review(dialog)
+        self.assertTrue(dialog.reviews[0].ready)
+        self.suggest.assert_called_once()
+        self.assertEqual(self.window.store.sources(), [])
+
+    def test_failure_is_inline_and_handoff_only_contains_selected_unfinished_sheets(self):
+        other = self.csv('other.csv')
+        self.suggest.side_effect = ValueError('网络失败 fake-key')
+        with patch('ledger_viewer.ui.messagebox.showwarning') as warning:
+            dialog = self.dialog([self.source, other])
+            self.wait_review(dialog)
+        warning.assert_not_called()
+        self.assertIn('[密钥已隐藏]', dialog.detail.get('1.0', 'end'))
+        self.assertNotIn('fake-key', dialog.detail.get('1.0', 'end'))
+        self.assertEqual(dialog.agent_button['style'], 'Accent.TButton')
+        dialog.selected = {0, 1}
+        dialog.completed = {1}
+        with patch.object(dialog, 'clipboard_clear'), patch.object(dialog, 'clipboard_append') as copied, patch('ledger_viewer.ui.messagebox.showinfo'):
+            dialog._copy_agent()
+        content = copied.call_args.args[0]
+        self.assertIn(str(self.source.resolve()), content)
+        self.assertNotIn(str(other.resolve()), content)
+        self.assertNotIn('fake-key', content)
+        self.assertEqual(self.window.store.sources(), [])
+
+    def test_closing_cancels_review_and_drops_late_response(self):
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def slow(preview, key):
+            started.set()
+            release.wait(3)
+            finished.set()
+            return self.suggestion(preview, key)
+        self.suggest.side_effect = slow
+        dialog = self.dialog()
+        self.wait_for(started.is_set)
+        dialog._close()
+        release.set()
+        self.wait_for(finished.is_set)
+        self.assertTrue(dialog.ai_cancel.is_set())
+        self.assertFalse(dialog.winfo_exists())
+        self.assertFalse(self.window.import_busy)
+        self.assertEqual(self.window.store.sources(), [])

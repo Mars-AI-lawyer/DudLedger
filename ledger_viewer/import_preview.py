@@ -1,21 +1,43 @@
-"""Build a minimal, header-only cloud payload; workbook data stays local."""
+"""Bounded spreadsheet preview and local logical-header helpers."""
 
 from pathlib import Path
 
 from .importer import (FIELDS, REPORT_KINDS, classify_sheet, guess_header, header_for_row,
-                       scan_window, text_value)
+                       merged_ranges, rows, scan_window, text_value)
 
+MAX_PREVIEW_ROWS = 20
 MAX_COLUMNS = 40
 MAX_CELL_CHARS = 60
-PRIVACY_NOTICE = "仅发送本地定位的 1 行表头（多层表头在本地合并），最多 40 列、每格 60 字；不发送业务数据行、疑点行、文件名、工作表名或路径。"
+PRIVACY_NOTICE = "默认发送工作表前 20 行及其中的合并单元格位置，最多 40 列、每格 60 字，可能包含真实业务数据；不另发文件名、工作表名或路径。整表预检和疑点处理留在本机。"
 
 
-def preview_headers(path: Path, sheet: str, header_row=None, kind=None) -> dict:
+def preview_for_ai(path: Path, sheet: str, header_row=None, kind=None) -> dict:
+    """Preserve original row/column positions and merges; never read past row 20 for cloud preview."""
+    if header_row is not None:
+        return {**preview_headers(path, sheet, header_row, kind), "mode": "manual_header"}
+    sample = []
+    iterator = rows(path, sheet)
+    try:
+        for number, row in iterator:
+            sample.append({"row": number, "cells": [text_value(value)[:MAX_CELL_CHARS] for value in row[:MAX_COLUMNS]]})
+            if number >= MAX_PREVIEW_ROWS:
+                break
+    finally:
+        iterator.close()
+    if not any(any(item['cells']) for item in sample):
+        raise ValueError("前 20 行为空，无法分析；可手动指定表头或交给 Agent。")
+    merges = [{"start_row": r1, "end_row": r2, "start_col": c1, "end_col": c2}
+              for r1, r2, c1, c2 in merged_ranges(path, sheet)
+              if r1 <= MAX_PREVIEW_ROWS and c1 <= MAX_COLUMNS]
+    return {"sheet": "工作表", "rows": sample, "merged_ranges": merges}
+
+
+def preview_headers(path: Path, sheet: str, header_row=None, kind=None, *, templates=None) -> dict:
     """Locate headers locally and send one logical row, never sample records."""
     if header_row is not None:
         headers = header_for_row(path, sheet, header_row, kind or "entry")
     else:
-        spec = classify_sheet(path, sheet)
+        spec = classify_sheet(path, sheet, templates)
         if spec is not None:
             header_row, kind = spec.header_row, spec.kind
             headers = header_for_row(path, sheet, header_row, kind)

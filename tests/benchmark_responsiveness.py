@@ -122,8 +122,11 @@ def benchmark_import():
                         time.sleep(0.002)
                     assert dialog.items, dialog.ai_status.get()
                     inventory_ms = (time.perf_counter() - started) * 1000
-                    dialog.use_ai.set(False)
-                    dialog._import_ready()
+                    dialog._use_local_mode()
+                    while dialog.ai_running and time.perf_counter() < deadline:
+                        root.update()
+                        time.sleep(0.002)
+                    dialog._import_selected()
                     while dialog.winfo_exists() and dialog.working and time.perf_counter() < deadline:
                         root.update()
                         time.sleep(0.002)
