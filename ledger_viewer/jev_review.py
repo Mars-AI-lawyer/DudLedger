@@ -13,7 +13,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from queue import Queue
 
-from typesafe_sdk import Noul, TypeSafeClient, RetryPolicy
+from typesafe_sdk import Noul, NoulCriteria, TypeSafeClient, RetryPolicy
 
 from .analysis_api import iter_entries
 from .background import check_cancelled, cooperate
@@ -197,6 +197,11 @@ def recover_interrupted(store):
 
 
 def prepare_batch(store, scope: dict, *, cancelled=None, progress=None) -> int:
+    from .specialist_snapshot import prepare_batch as prepare_specialist
+    return prepare_specialist(store, scope, cancelled=cancelled, progress=progress)
+
+
+def prepare_legacy_batch(store, scope: dict, *, cancelled=None, progress=None) -> int:
     """Save a complete local snapshot; never invokes the network or credentials."""
     version, rules = load_rules(store)
     feature_context = FeatureContext(store)
@@ -261,7 +266,7 @@ def discard_preview(store, batch_id):
 
 
 def preview_page(store, batch_id, page=0, page_size=20):
-    return store.db.execute('SELECT id,input_json,status FROM jev_results WHERE batch_id=? ORDER BY id LIMIT ? OFFSET ?',
+    return store.db.execute('SELECT id,input_json,status,features_json,voucher_key FROM jev_results WHERE batch_id=? ORDER BY id LIMIT ? OFFSET ?',
                             (batch_id, page_size, page * page_size)).fetchall()
 
 
@@ -292,6 +297,13 @@ def batch_counts(store, batch_id) -> dict:
 
 
 def refresh_staleness(store, batch_id):
+    info = batch_info(store, batch_id)
+    if info and json.loads(info['body_json']).get('profile'):
+        from .specialist_snapshot import snapshot_current
+        if not snapshot_current(store, info):
+            with store.db:
+                store.db.execute('UPDATE jev_results SET stale=1 WHERE batch_id=?', (batch_id,))
+            return
     current = {row['id']: fingerprint(row, send_fields(row)) for row in store.db.execute('''
         SELECT e.*,a.code,a.name,s.sha256,s.original_path,s.sheet FROM jev_results r
         JOIN entries e ON e.id=r.entry_id JOIN accounts a ON a.key=e.account_key
@@ -306,10 +318,18 @@ def refresh_staleness(store, batch_id):
 
 def questions_for(rules):
     common = rules['common'] + '\n\n'
-    questions = {topic['id']: Noul(instructions=common + topic['question']) for topic in rules['topics']}
+    criteria = NoulCriteria(
+        true='输入提供了当前问题要求的具体主体、交易或记录，并满足该问题的命中条件。',
+        false='输入没有当前问题要求的具体依据，或只符合其排除情形。不能借用其他审查问题的命中理由。') if rules.get('profile') else None
+    questions = {topic['id']: Noul(instructions=common + topic['question'],
+        criteria=NoulCriteria(**topic['bailian_criteria'])
+        if rules['model'] == 'decision-model-preview' and topic.get('bailian_criteria') else criteria)
+        for topic in rules['topics']}
     if rules.get('review'):
         questions['review'] = Noul(instructions=common + rules['review'])
-    questions['insufficient'] = Noul(instructions=common + rules['insufficient'])
+    questions['insufficient'] = Noul(instructions=common + rules['insufficient'], criteria=NoulCriteria(
+        true='原始字段对具体交易存在矛盾，或具体交易线索严重含糊到无法分类。',
+        false='凭证描述足以识别交易，或仅缺少外部文件、账龄、银行流水等补充资料；或者完全没有具体线索。') if rules.get('profile') else None)
     return questions
 
 
@@ -358,6 +378,15 @@ def validate_response(data, rules):
 def error_kind(exc):
     name = type(exc).__name__
     status = getattr(exc, 'status_code', None)
+    code = str(getattr(exc, 'code', '')).lower().replace('_', '')
+    if name == 'ReviewCancelled':
+        return 'cancelled', '已取消'
+    if name == 'ReviewSnapshotChanged':
+        return 'stale', '来源已变化，请重新预览'
+    if status == 402 or any(word in code for word in ('arrearage', 'insufficientbalance', 'balanceexhausted', 'insufficientquota', 'allocationquota')) or any(word in str(exc).lower() for word in ('insufficient balance', 'insufficient_balance', 'insufficient credits', 'insufficient_credits', 'credit balance', '余额不足', 'quota_exceeded', 'insufficient_quota')):
+        return 'quota', '模型余额或额度不足'
+    if name == 'BailianAPIError' and status == 404:
+        return 'unavailable', '百炼接口或模型不可用（404），请在设置中核对业务空间决策接口地址'
     if status in (401, 403) or name in ('TypeSafeAuthenticationError', 'TypeSafePermissionDeniedError'):
         return 'auth', '认证失败，请检查或替换 API Key'
     if status == 413 or (status in (400, 422) and any(word in str(exc).lower() for word in ('context length', 'context_length', 'too many tokens', 'token limit', 'context window', 'maximum context'))):
@@ -394,10 +423,14 @@ def _request_once(payload, rules, api_key, cancel, client_factory=TypeSafeClient
             return {'status': 'success', 'data': data, 'attempts': attempt}
         except Exception as exc:
             kind, message = error_kind(exc)
+            if kind in ('cancelled', 'stale'):
+                return {'status': 'cancelled' if kind == 'cancelled' else 'interrupted',
+                        'stale': kind == 'stale', 'error': message, 'attempts': attempt}
             if kind == 'auth':
                 cancel.set()
             if kind != 'retry' or attempt == 3:
-                return {'status': 'failed', 'error': message, 'auth': kind == 'auth', 'length': kind == 'length', 'attempts': attempt}
+                return {'status': 'failed', 'error': message, 'auth': kind == 'auth', 'quota': kind == 'quota',
+                        'unavailable': kind == 'unavailable', 'length': kind == 'length', 'attempts': attempt}
         finally:
             REQUEST_SLOTS.release()
         cancel.wait(min(2 ** (attempt - 1), 4))
@@ -407,6 +440,26 @@ def _request_once(payload, rules, api_key, cancel, client_factory=TypeSafeClient
 def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClient, before_send=None, parties=None, features=None):
     if not isinstance(payload, list):
         return _request_once(payload, rules, api_key, cancel, client_factory, before_send)
+    if rules.get('profile') and len(rules['topics']) > 10:
+        # Keep each question group below the native 16-question limit and the
+        # serialized request budget. Every group sees the same complete state.
+        results, attempts = [], 0
+        for start in range(0, len(rules['topics']), 10):
+            subset = copy.deepcopy(rules)
+            subset['topics'] = rules['topics'][start:start + 10]
+            result = request_review(payload, subset, api_key, cancel, client_factory, before_send, parties, features)
+            attempts += result['attempts']
+            if result['status'] != 'success':
+                return {**result, 'attempts': attempts}
+            results.append(result['items'][0])
+        merged = copy.deepcopy(results[0])
+        merged['answers'] = {key: value for data in results for key, value in data['answers'].items() if key != 'insufficient'}
+        merged['answers']['insufficient'] = {'type': 'noul', 'noul': max(data['answers']['insufficient']['noul'] for data in results)}
+        merged['usage'] = {key: sum(data['usage'][key] for data in results) for key in ('input_tokens', 'output_tokens')}
+        merged.update(question_batches=len(results), chunks=max(data['chunks'] for data in results),
+            needs_manual_review=any(data['needs_manual_review'] for data in results), question_results=results,
+            request_group=digest([REQUEST_VERSION, payload, rules, parties]))
+        return {'status': 'success', 'items': [merged for _ in payload], 'attempts': attempts}
     questions = voucher_questions(payload, rules)
     serialized = {k: q.model_dump(mode='json') for k, q in questions.items()}
     question_bytes = len(encode(serialized).encode('utf-8'))
@@ -484,11 +537,20 @@ def iter_voucher_groups(store, batch_id):
 
 
 class ReviewJob:
-    def __init__(self, path, batch_id, api_key, client_factory=TypeSafeClient):
+    def __init__(self, path, batch_id, api_key, client_factory=TypeSafeClient, *, deepseek_key='', deepseek_chat=None,
+                 bailian_key='', bailian_post=None):
         self.path = Path(path)
         self.batch_id = batch_id
         self._key = api_key
         self.client_factory = client_factory
+        self._deepseek_key = deepseek_key
+        self.deepseek_chat = deepseek_chat
+        self._jev_exhausted = threading.Event()
+        self._bailian_key = bailian_key
+        self.bailian_post = bailian_post
+        self._bailian_exhausted = threading.Event()
+        self._provider_order = ('bailian', 'jev', 'deepseek')
+        self._bailian_endpoint = None
         self.cancel = threading.Event()
         self.events = Queue()
         self.thread = None
@@ -496,8 +558,6 @@ class ReviewJob:
     def start(self, store):
         """Called only by the explicit confirm action after previewing this batch."""
         path = str(self.path.resolve())
-        if not self._key:
-            raise ValueError('请先设置 Jev API Key')
         with _ACTIVE_LOCK:
             if path in _ACTIVE:
                 raise ValueError('当前账套已有正在运行的审查批次')
@@ -505,13 +565,30 @@ class ReviewJob:
                 info = batch_info(store, self.batch_id)
                 if not info or info['status'] != 'preview':
                     raise ValueError('批次已确认或失效，请重新预览')
+                special = json.loads(info['body_json']).get('profile') == 'account-special-v1'
+                if not self._key and not (special and (self._deepseek_key or self._bailian_key)):
+                    raise ValueError('请先在设置中保存百炼、Jev 或 DeepSeek API Key')
+                if special:
+                    from .bailian_review import DEFAULT_ENDPOINT, validate_endpoint
+                    scope = json.loads(info['scope_json'])
+                    self._bailian_endpoint = validate_endpoint(scope.get('bailian_endpoint', DEFAULT_ENDPOINT))
+                    if scope.get('preferred_provider') == 'jev':
+                        self._provider_order = ('jev', 'bailian', 'deepseek')
                 # Lock the database while validating the scope and marking consent.
                 store.db.execute('UPDATE jev_batches SET snapshot_hash=snapshot_hash WHERE id=?', (self.batch_id,))
-                hashes = [fingerprint(row, send_fields(row)) for row in iter_entries(store, **json.loads(info['scope_json']))]
-                snapshot = digest({'entries': hashes, 'parties': party_names(store.related_parties())})
-                if snapshot != info['snapshot_hash'] or store.db.execute('SELECT 1 FROM jev_results WHERE batch_id=? AND stale=1 LIMIT 1', (self.batch_id,)).fetchone():
+                if special:
+                    from .specialist_snapshot import snapshot_current
+                    current = snapshot_current(store, info)
+                else:
+                    hashes = [fingerprint(row, send_fields(row)) for row in iter_entries(store, **json.loads(info['scope_json']))]
+                    current = digest({'entries': hashes, 'parties': party_names(store.related_parties())}) == info['snapshot_hash']
+                if not current or store.db.execute('SELECT 1 FROM jev_results WHERE batch_id=? AND stale=1 LIMIT 1', (self.batch_id,)).fetchone():
                     raise ValueError('分录或关联方名单已变化，请重新选择范围并确认')
-                current_rule, _ = load_rules(store)
+                if special:
+                    from .specialist_rules import load_rules as load_specialist_rules
+                    current_rule, _ = load_specialist_rules(store)
+                else:
+                    current_rule, _ = load_rules(store)
                 if current_rule != info['rule_id']:
                     raise ValueError('规则已变化，请重新预览并确认')
                 store.db.execute("UPDATE jev_batches SET status='running',confirmed_at=CURRENT_TIMESTAMP WHERE id=?", (self.batch_id,))
@@ -525,10 +602,12 @@ class ReviewJob:
                 data = result['data']
                 # A voucher's headline probability is its strongest hit (any category or
                 # the overall review judgment), never an average.
-                score = max(value['noul'] for key, value in data['answers'].items() if key != 'insufficient') * 100
+                deepseek = data.get('provider') == 'deepseek'
+                score = None if deepseek else max(value['noul'] for key, value in data['answers'].items() if key != 'insufficient') * 100
+                insufficient = int(data['insufficient']) if deepseek else data['answers']['insufficient']['noul']
                 store.db.execute('''UPDATE jev_results SET status='success',response_json=?,score=?,confidence=NULL,
                     insufficient=?,cached=?,attempts=?,error='',updated_at=CURRENT_TIMESTAMP WHERE id=?''',
-                    (encode(data), score, data['answers']['insufficient']['noul'],
+                    (encode(data), score, insufficient,
                      int(cached), result.get('attempts', 0), row['id']))
             else:
                 store.db.execute('UPDATE jev_results SET status=?,error=?,attempts=?,stale=MAX(stale,?),updated_at=CURRENT_TIMESTAMP WHERE id=?',
@@ -564,7 +643,10 @@ class ReviewJob:
                                     'error': '本凭证的选定分录已变化，请重新预览'})
                             self.events.put(('progress', None))
                             continue
-                        cached = [store.db.execute("SELECT response_json FROM jev_results WHERE cache_key=? AND status='success' AND stale=0 AND id<>? ORDER BY id DESC LIMIT 1", (row['cache_key'], row['id'])).fetchone() for row in group]
+                        special = rules.get('profile') == 'account-special-v1'
+                        provider = self._preferred_available()
+                        # Never let an old Flash answer suppress a newly available Jev review.
+                        cached = [store.db.execute("SELECT response_json FROM jev_results WHERE cache_key=? AND status='success' AND stale=0 AND id<>? AND (?=0 OR COALESCE(json_extract(response_json,'$.provider'),'jev')=?) ORDER BY id DESC LIMIT 1", (row['cache_key'], row['id'], int(special), provider)).fetchone() for row in group]
                         if all(cached):
                             for row, previous in zip(group, cached):
                                 self._save(store, row, {'status': 'success', 'data': json.loads(previous['response_json'])}, cached=True)
@@ -573,9 +655,13 @@ class ReviewJob:
                         with store.db:
                             store.db.executemany("UPDATE jev_results SET status='running' WHERE id=?", [(row['id'],) for row in group])
                         payloads = [json.loads(row['input_json']) for row in group]
-                        features = json.loads(group[0]['features_json'])['facts'] if group[0]['features_json'] else None
-                        future = pool.submit(request_review, payloads, rules, self._key, self.cancel, self.client_factory,
-                            lambda snapshots=group: all(snapshot_is_current(self.path, row) for row in snapshots), parties, features)
+                        feature = json.loads(group[0]['features_json']) if group[0]['features_json'] else {}
+                        before_send = lambda snapshots=group: all(snapshot_is_current(self.path, row) for row in snapshots)
+                        if special:
+                            future = pool.submit(self._request_specialist, payloads, rules, feature, parties, before_send, info)
+                        else:
+                            future = pool.submit(request_review, payloads, rules, self._key, self.cancel, self.client_factory,
+                                before_send, parties, feature.get('facts'))
                         pending[future] = group
                     if self.cancel.is_set():
                         exhausted = True
@@ -606,11 +692,69 @@ class ReviewJob:
                     store.db.execute("UPDATE jev_batches SET status='interrupted' WHERE id=?", (self.batch_id,))
         finally:
             self._key = ''
+            self._deepseek_key = ''
+            self._bailian_key = ''
             if store:
                 store.close()
             with _ACTIVE_LOCK:
                 _ACTIVE.pop(str(self.path.resolve()), None)
             self.events.put(('done', self.batch_id))
+
+    def _preferred_available(self):
+        for provider in self._provider_order:
+            if provider == 'bailian' and self._bailian_key and not self._bailian_exhausted.is_set():
+                return provider
+            if provider == 'jev' and self._key and not self._jev_exhausted.is_set():
+                return provider
+        return 'deepseek'
+
+    def _request_specialist(self, payloads, rules, feature, parties, before_send, info):
+        from .specialist_rules import rules_for_accounts
+        from .specialist_snapshot import snapshot_current
+        from .deepseek_review import request_review as flash_review, chat
+        from .bailian_review import DecisionClient, MODEL as BAILIAN_MODEL, post
+        from .store import LedgerStore
+        adapted = rules_for_accounts(rules, feature['review_accounts'])
+        def current():
+            reader = LedgerStore.connect_existing(self.path)
+            try:
+                return before_send() and snapshot_current(reader, info, check_entries=False)
+            finally:
+                reader.close()
+        attempts, reasons = 0, []
+        for provider in self._provider_order:
+            if provider == 'jev':
+                if not self._key or self._jev_exhausted.is_set():
+                    continue
+                result = request_review(payloads, adapted, self._key, self.cancel, self.client_factory, current,
+                    parties, {'facts': feature['facts'], 'background': feature['background']})
+            elif provider == 'bailian':
+                if not self._bailian_key or self._bailian_exhausted.is_set():
+                    continue
+                bailian_rules = copy.deepcopy(adapted)
+                bailian_rules['model'] = BAILIAN_MODEL
+                def factory(**options):
+                    return DecisionClient(**options, endpoint=self._bailian_endpoint, post_fn=self.bailian_post or post,
+                        cancelled=self.cancel.is_set, before_send=current)
+                result = request_review(payloads, bailian_rules, self._bailian_key, self.cancel, factory, current,
+                    parties, {'facts': feature['facts'], 'background': feature['background']})
+            else:
+                result = flash_review(payloads, adapted, self._deepseek_key, self.cancel, before_send=current,
+                    parties=parties, features=feature['facts'], background=feature['background'],
+                    chat_fn=self.deepseek_chat or chat)
+            attempts += result['attempts']
+            if (result.get('quota') or result.get('unavailable')) and provider != 'deepseek':
+                (self._jev_exhausted if provider == 'jev' else self._bailian_exhausted).set()
+                reasons.append(result['error'] if result.get('unavailable') else ('Jev' if provider == 'jev' else '百炼') + ' 余额或额度不足')
+                continue
+            if result['status'] == 'success':
+                for item in result['items']:
+                    item['provider'] = provider
+                    if reasons:
+                        item['fallback_reason'] = '；'.join(reasons)
+            result['attempts'] = attempts
+            return result
+        return {'status': 'failed', 'error': '没有可用的模型，请检查 API Key 或余额', 'attempts': attempts}
 
 
 def save_review(store, key, status, note):
@@ -651,20 +795,32 @@ def clear_category_override(store, key, category):
         store.db.execute('DELETE FROM dd_category_overrides WHERE voucher_key=? AND category=?', (key, category))
 
 
-CATEGORY_SOURCE_LABELS = {'rule': '规则', 'jev': 'Jev', 'user': '用户'}
+CATEGORY_SOURCE_LABELS = {'rule': '规则', 'jev': 'Jev', 'bailian': '百炼', 'deepseek': 'DeepSeek Flash', 'user': '用户'}
 
 
-def effective_categories(successful, rules, features, overrides):
+def effective_categories(successful, rules, features, overrides, *, minimum=None):
     """一张凭证可同时进入多个尽调分类：Jev 命中 ∪ 规则命中 ± 律师调整。"""
     probabilities: dict[str, float] = {}
+    sources = {}
     for row in successful:
+        provider = json.loads(row['response_json']).get('provider', 'jev') if row['response_json'] else 'jev'
         for key, value in topic_probabilities(row).items():
             probabilities[key] = max(probabilities.get(key, 0.0), value)
+            sources.setdefault(key, set()).add(provider)
     topics = {topic['id']: topic for topic in rules['topics']}
     entries: dict[str, dict] = {}
+    if minimum is None:
+        minimum = rules['thresholds']['谨慎'] / 100 if rules.get('profile') else 0.35
     for identifier, probability in probabilities.items():
-        if identifier in topics and probability >= 0.35:
-            entries[identifier] = {'label': topics[identifier]['label'], 'sources': {'jev'}, 'probability': probability}
+        if identifier in topics and probability >= minimum:
+            entries[identifier] = {'label': topics[identifier]['label'], 'sources': sources[identifier], 'probability': probability}
+    for row in successful:
+        data = json.loads(row['response_json']) if row['response_json'] else {}
+        if data.get('provider') == 'deepseek':
+            for hit in data.get('hits', []):
+                identifier = hit['id']
+                if identifier in topics:
+                    entries[identifier] = {'label': topics[identifier]['label'], 'sources': {'deepseek'}, 'probability': None}
     for identifier in features.get('rule_categories', []):
         if identifier in topics:
             item = entries.setdefault(identifier, {'label': topics[identifier]['label'], 'sources': set(), 'probability': None})
@@ -694,21 +850,30 @@ def priority_label(score, thresholds) -> str:
 def topic_labels(result, rules):
     if not result['response_json']:
         return []
-    answers = json.loads(result['response_json'])['answers']
+    data = json.loads(result['response_json'])
+    if data.get('provider') == 'deepseek':
+        identifiers = {hit['id'] for hit in data['hits']}
+        return [(topic['id'], topic['label']) for topic in rules['topics'] if topic['id'] in identifiers]
+    answers = data['answers']
+    model_thresholds = rules.get('bailian_thresholds', rules['thresholds']) if data.get('provider') == 'bailian' else rules['thresholds']
+    minimum = model_thresholds['谨慎'] / 100 if rules.get('profile') else 0.35
     return [(topic['id'], topic['label'] + ('（主题待确认）' if answers[topic['id']]['noul'] < 0.65 else ''))
-            for topic in rules['topics'] if answers[topic['id']]['noul'] >= 0.35]
+            for topic in rules['topics'] if topic['id'] in answers and answers[topic['id']]['noul'] >= minimum]
 
 
 def topic_probabilities(row) -> dict:
     if not row['response_json']:
         return {}
-    answers = json.loads(row['response_json'])['answers']
+    answers = json.loads(row['response_json']).get('answers', {})
     return {key: float(value['noul']) for key, value in answers.items()
             if key != 'insufficient' and isinstance(value, dict) and 'noul' in value}
 
 
 def has_topic_hit(row, threshold) -> bool:
     """Any single topic reaching the tier threshold makes the voucher a problem voucher."""
+    data = json.loads(row['response_json']) if row['response_json'] else {}
+    if data.get('provider') == 'deepseek':
+        return bool(data.get('hits'))
     return any(probability * 100 >= threshold for probability in topic_probabilities(row).values())
 
 
@@ -744,7 +909,11 @@ def voucher_result_context(store, batch_id, totals=None):
     if not info:
         return None
     rules = json.loads(info['body_json'])
-    _, display_rules = load_rules(store)
+    if rules.get('profile'):
+        from .specialist_rules import load_rules as load_specialist_rules
+        _, display_rules = load_specialist_rules(store)
+    else:
+        _, display_rules = load_rules(store)
     groups = {}
     for number, raw in enumerate(store.db.execute('SELECT * FROM jev_results WHERE batch_id=? ORDER BY id', (batch_id,)), 1):
         cancelled = getattr(store, 'cancelled', None)
@@ -755,6 +924,7 @@ def voucher_result_context(store, batch_id, totals=None):
         row['themes'] = topic_labels(row, rules)
         groups.setdefault(row['voucher_key'], []).append(row)
     return dict(info=dict(info), rules=rules, thresholds=display_rules['thresholds'],
+        bailian_thresholds=display_rules.get('bailian_thresholds', display_rules['thresholds']),
         notes={r['voucher_key']: dict(r) for r in store.db.execute('SELECT * FROM jev_reviews')},
         overrides=category_overrides(store), totals=voucher_totals(store) if totals is None else totals, groups=groups)
 
@@ -763,13 +933,15 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', c
     context = context if context is not None else voucher_result_context(store, batch_id)
     if context is None:
         return []
-    rules, thresholds = context['rules'], context['thresholds']
-    threshold = thresholds[tier]
+    rules = context['rules']
     notes, overrides, totals, groups = (context[key] for key in ('notes', 'overrides', 'totals', 'groups'))
     result = []
     for key, lines in groups.items():
         successful = [r for r in lines if r['status'] == 'success' and not r['stale']]
-        max_score = max((r['score'] for r in successful), default=None)
+        provider = json.loads(successful[0]['response_json']).get('provider', 'jev') if successful else ''
+        thresholds = context.get('bailian_thresholds', context['thresholds']) if provider == 'bailian' else context['thresholds']
+        threshold = thresholds[tier]
+        max_score = max((r['score'] for r in successful if r['score'] is not None), default=None)
         if lane == 'completed':
             hits = lines if all(r['status'] in ('success', 'failed', 'skipped') for r in lines) else []
         elif lane == 'candidates':
@@ -798,7 +970,15 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', c
             if line['features_json']:
                 features = json.loads(line['features_json'])
                 break
-        categories = effective_categories(successful, rules, features or {}, overrides.get(key, {}))
+        categories = effective_categories(successful, rules, features or {}, overrides.get(key, {}),
+            minimum=threshold / 100 if rules.get('profile') else None)
+        if rules.get('profile'):
+            # Display and filter the exact questions which met the selected Jev threshold.
+            accepted = {identifier for row in successful for identifier, probability in topic_probabilities(row).items()
+                        if probability * 100 >= threshold}
+            accepted.update(hit['id'] for row in successful
+                for hit in json.loads(row['response_json']).get('hits', []))
+            categories = [item for item in categories if item[0] in accepted or 'user' in item[2]]
         if category:
             identifiers = [identifier for identifier, _label, _sources, _probability in categories]
             if category == 'unclassified':
@@ -817,7 +997,9 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', c
             amounts[currency] = max(amounts.get(currency, 0), abs(local['debit_cents']), abs(local['credit_cents']))
         currencies = tuple(sorted(amounts))
         result.append({'key': key, 'lines': lines, 'hits': hits, 'score': max_score,
-            'priority': priority_label(max_score, thresholds),
+            'review_accounts': (features or {}).get('review_accounts', []),
+            'provider': provider,
+            'priority': priority_label(max_score, thresholds) if max_score is not None else ('明确命中' if categories else ''),
             'categories': categories,
             'labels': [label for _identifier, label, _sources, _probability in categories] or ['待分类'],
             'reasons': (features or {}).get('facts', []),

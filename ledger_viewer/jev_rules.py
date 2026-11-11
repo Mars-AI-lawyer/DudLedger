@@ -253,7 +253,7 @@ def save_rules(store, rules: dict) -> int:
 
 
 def load_rules(store) -> tuple[int, dict]:
-    row = store.db.execute('SELECT id,body_json FROM jev_rules ORDER BY id DESC LIMIT 1').fetchone()
+    row = store.db.execute("SELECT id,body_json FROM jev_rules WHERE json_extract(body_json,'$.profile') IS NULL ORDER BY id DESC LIMIT 1").fetchone()
     if row is None:
         rules = default_rules()
         return save_rules(store, rules), rules

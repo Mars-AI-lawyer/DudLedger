@@ -13,7 +13,7 @@ from ledger_viewer.analysis_api import iter_entries
 from ledger_viewer.importer import ImportSpec, guess_header
 from ledger_viewer.jev_rules import LEGACY_V3_RULES, default_rules, load_rules, save_rules, validate_rules
 from ledger_viewer.jev_review import (ReviewJob, SEND_FIELDS, batch_counts, batch_info, discard_preview,
-    prepare_batch, preview_page, questions_for, recover_interrupted, refresh_staleness,
+    prepare_legacy_batch as prepare_batch, preview_page, questions_for, recover_interrupted, refresh_staleness,
     request_review, save_review, send_fields, test_connection, validate_response, voucher_results)
 from ledger_viewer.store import LedgerStore
 from ledger_viewer.voucher_notes import save_mark, voucher_key

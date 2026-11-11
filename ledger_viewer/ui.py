@@ -22,6 +22,9 @@ from .import_work import inventory, prepare_sheets, preview_data, requires_backg
 from .background import BackgroundTasks, Cancelled, check_cancelled
 from .checks import run_checks
 from .deepseek_mapping import delete_api_key as deepseek_delete_api_key, get_api_key as deepseek_get_api_key, key_memory_only as deepseek_memory_only, save_api_key as deepseek_save_api_key, suggest_mapping as deepseek_suggest_mapping
+from .bailian_review import (DEFAULT_ENDPOINT as BAILIAN_ENDPOINT, delete_api_key as bailian_delete_api_key,
+    get_api_key as bailian_get_api_key, key_memory_only as bailian_memory_only,
+    save_api_key as bailian_save_api_key, validate_endpoint as validate_bailian_endpoint)
 from .detail_filters import EntryCondition, FILTER_COLUMNS
 from .detail_filter_ui import DetailFilterDialog, filter_arrow, heading_filter_column
 from .grid_lines import DashedGrid
@@ -219,8 +222,18 @@ class SettingsDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._finish)
-        body = ttk.Frame(self, padding=16)
-        body.pack(fill="both", expand=True)
+        viewport = ttk.Frame(self)
+        viewport.pack(fill='both', expand=True)
+        canvas = tk.Canvas(viewport, width=610, height=min(640, max(420, self.winfo_screenheight() - 180)), highlightthickness=0)
+        scrollbar = ttk.Scrollbar(viewport, orient='vertical', command=canvas.yview)
+        scrollbar.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        body = ttk.Frame(canvas, padding=16)
+        content = canvas.create_window(0, 0, window=body, anchor='nw')
+        body.bind('<Configure>', lambda _event: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(content, width=event.width))
+        self.bind('<MouseWheel>', lambda event: canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units'))
         ttk.Label(body, text="凭证打开方式").pack(anchor="w")
         current = parent.store.setting("voucher_open_mode", "replace") if parent.store else "replace"
         self.mode = tk.StringVar(value=current if current in ("replace", "multiple") else "replace")
@@ -256,8 +269,20 @@ class SettingsDialog(tk.Toplevel):
         ttk.Separator(body).pack(fill="x", pady=12)
         ttk.Label(body, text="导入识别：仅 DeepSeek Flash（低思考）").pack(anchor="w")
         self.provider = tk.StringVar(value=PROVIDER_LABELS["deepseek"])
-        ttk.Label(body, text="Jev API Key（仅用于凭证尽调筛查）").pack(anchor="w", pady=(7, 0))
-        key_row = ttk.Frame(body)
+        preference = ttk.Frame(body)
+        preference.pack(fill='x', pady=(8, 5))
+        ttk.Label(preference, text='凭证抽查优先模型').pack(side='left')
+        self.review_preferred = tk.StringVar(value='Jev 优先' if parent.controller.preferences.get('review_preferred_provider') == 'jev' else '百炼优先（默认）')
+        ttk.Combobox(preference, textvariable=self.review_preferred, values=('百炼优先（默认）', 'Jev 优先'), state='readonly', width=18).pack(side='left', padx=8)
+        provider_tabs = ttk.Notebook(body)
+        provider_tabs.pack(fill='x', pady=5)
+        jev_host, bailian_host, deepseek_host = (ttk.Frame(provider_tabs, padding=8) for _ in range(3))
+        provider_tabs.add(bailian_host, text='阿里百炼决策模型')
+        provider_tabs.add(jev_host, text='Jev（可选）')
+        provider_tabs.add(deepseek_host, text='DeepSeek Flash（兜底）')
+        self.provider_tabs = provider_tabs
+        ttk.Label(jev_host, text="Jev API Key（仅用于凭证尽调筛查）").pack(anchor="w", pady=(7, 0))
+        key_row = ttk.Frame(jev_host)
         key_row.pack(fill="x", pady=(5, 0))
         try:
             self.api_key = tk.StringVar(value=get_api_key())
@@ -268,10 +293,11 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(key_row, text="保存密钥", command=self._save_api_key).pack(side="left", padx=5)
         ttk.Button(key_row, text="删除密钥", command=self._delete_api_key).pack(side="left")
         self.key_status = tk.StringVar()
-        ttk.Label(body, textvariable=self.key_status, foreground="#555").pack(anchor="w", pady=(4, 0))
+        ttk.Label(jev_host, textvariable=self.key_status, foreground="#555").pack(anchor="w", pady=(4, 0))
         self._refresh_key_status()
-        ttk.Label(body, text="DeepSeek API Key").pack(anchor="w", pady=(7, 0))
-        deepseek_row = ttk.Frame(body)
+        self._build_bailian_settings(bailian_host)
+        ttk.Label(deepseek_host, text="DeepSeek API Key").pack(anchor="w", pady=(7, 0))
+        deepseek_row = ttk.Frame(deepseek_host)
         deepseek_row.pack(fill="x", pady=(5, 0))
         try:
             self.deepseek_key = tk.StringVar(value=deepseek_get_api_key())
@@ -282,20 +308,64 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(deepseek_row, text="保存密钥", command=self._save_deepseek_key).pack(side="left", padx=5)
         ttk.Button(deepseek_row, text="删除密钥", command=self._delete_deepseek_key).pack(side="left")
         self.deepseek_status = tk.StringVar()
-        ttk.Label(body, textvariable=self.deepseek_status, foreground="#555").pack(anchor="w", pady=(4, 0))
+        ttk.Label(deepseek_host, textvariable=self.deepseek_status, foreground="#555").pack(anchor="w", pady=(4, 0))
         self._refresh_deepseek_status()
         self.show_key = tk.BooleanVar(value=False)
-        ttk.Checkbutton(body, text="显示明文（两个密钥）", variable=self.show_key, command=self._toggle_key_visible).pack(anchor="w", pady=(2, 0))
+        ttk.Checkbutton(body, text="显示明文（三个密钥）", variable=self.show_key, command=self._toggle_key_visible).pack(anchor="w", pady=(2, 0))
         jev_actions = ttk.Frame(body)
         jev_actions.pack(fill="x", pady=6)
         from .jev_ui import launch_connection_test
-        ttk.Button(jev_actions, text="测试连接（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
-        ttk.Button(jev_actions, text="Jev 审查规则与尽调筛选设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
+        ttk.Button(jev_actions, text="测试 Jev（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
+        ttk.Button(jev_actions, text="AI 抽查提示词与专项审查设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
         ttk.Label(body, text="AI 建议列使用 DeepSeek Flash。" + PRIVACY_NOTICE
             + "保存密钥后可直接建议列；也可取消 AI 改用手动核对。完整账簿的解析、预检和疑点处理均在本机完成。",
             foreground="#555", wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
         ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
-        ttk.Button(body, text="保存并完成", command=self._finish).pack(anchor="e", pady=(12, 0))
+        footer = ttk.Frame(self, padding=(16, 8))
+        footer.pack(fill='x')
+        ttk.Button(footer, text="保存并完成", command=self._finish).pack(side='right')
+
+    def _build_bailian_settings(self, host):
+        ttk.Label(host, text='百炼 API Key（decision-model-preview）').pack(anchor='w')
+        self.bailian_key = tk.StringVar(value=bailian_get_api_key())
+        row = ttk.Frame(host)
+        row.pack(fill='x', pady=5)
+        self.bailian_entry = ttk.Entry(row, textvariable=self.bailian_key, show='•', width=29)
+        self.bailian_entry.pack(side='left', fill='x', expand=True)
+        ttk.Button(row, text='保存密钥', command=self._save_bailian_key).pack(side='left', padx=5)
+        ttk.Button(row, text='删除密钥', command=self._delete_bailian_key).pack(side='left')
+        self.bailian_status = tk.StringVar()
+        ttk.Label(host, textvariable=self.bailian_status, foreground='#555').pack(anchor='w')
+        self._refresh_bailian_status()
+        ttk.Label(host, text='决策接口地址（默认北京试用域名；可改为控制台的业务空间专属地址）').pack(anchor='w', pady=(6, 0))
+        self.bailian_endpoint = tk.StringVar(value=self.parent.controller.preferences.get('bailian_endpoint', BAILIAN_ENDPOINT))
+        ttk.Entry(host, textvariable=self.bailian_endpoint).pack(fill='x', pady=4)
+        from .jev_ui import launch_connection_test
+        ttk.Button(host, text='测试百炼连接（虚构内容）', command=lambda: launch_connection_test(self, self.bailian_status,
+            provider='bailian', api_key=self.bailian_key.get(), endpoint=self.bailian_endpoint.get())).pack(anchor='w', pady=4)
+        ttk.Label(host, text='默认百炼 → Jev → DeepSeek；也可改为 Jev 优先。北京试用地址用于快速体验，正式长期使用可换为业务空间专属域名。', foreground='#555', wraplength=510).pack(anchor='w')
+
+    def _refresh_bailian_status(self):
+        self.bailian_status.set(('密钥仅保留在本次运行内存' if bailian_memory_only() else '密钥已保存到系统安全凭据库') if bailian_get_api_key() else '尚未保存百炼密钥')
+
+    def _save_bailian_key(self):
+        try:
+            bailian_save_api_key(self.bailian_key.get())
+        except Exception as exc:
+            messagebox.showerror('保存失败', str(exc), parent=self)
+            return False
+        self.bailian_key.set(bailian_get_api_key())
+        self._refresh_bailian_status()
+        return True
+
+    def _delete_bailian_key(self):
+        try:
+            bailian_delete_api_key()
+        except Exception as exc:
+            messagebox.showerror('删除失败', str(exc), parent=self)
+            return
+        self.bailian_key.set('')
+        self._refresh_bailian_status()
 
     def _save_mode(self) -> None:
         if self.parent.store:
@@ -322,6 +392,7 @@ class SettingsDialog(tk.Toplevel):
         show = "" if self.show_key.get() else "•"
         self.key_entry.configure(show=show)
         self.deepseek_entry.configure(show=show)
+        self.bailian_entry.configure(show=show)
 
     def _save_api_key(self) -> bool:
         try:
@@ -344,10 +415,20 @@ class SettingsDialog(tk.Toplevel):
         return True
 
     def _finish(self) -> None:
+        try:
+            endpoint = validate_bailian_endpoint(self.bailian_endpoint.get())
+        except ValueError as exc:
+            messagebox.showerror('百炼地址无效', str(exc), parent=self)
+            return
         if self.api_key.get() and self.api_key.get() != get_api_key() and not self._save_api_key():
             return
         if self.deepseek_key.get() and self.deepseek_key.get() != deepseek_get_api_key() and not self._save_deepseek_key():
             return
+        if self.bailian_key.get() and self.bailian_key.get() != bailian_get_api_key() and not self._save_bailian_key():
+            return
+        self.parent.controller.preferences.update(bailian_endpoint=endpoint,
+            review_preferred_provider='jev' if self.review_preferred.get() == 'Jev 优先' else 'bailian')
+        self.parent.controller._save_preferences()
         self.destroy()
 
     def _delete_api_key(self) -> None:
@@ -1774,9 +1855,14 @@ class App(tk.Toplevel):
         self.page_ids = ("accounts", "entries", "reports", "marks", "review")
         nav_icons = ("accounts", "entries", "balance", "marks", "review")
         for index, (title, icon) in enumerate(zip(self.page_names, nav_icons)):
+            if index == 3:
+                self.sidebar_section_divider = ttk.Frame(self.sidebar_pages, height=22, style='Sidebar.TFrame')
+                self.sidebar_section_divider.pack(fill='x', padx=9, pady=(8, 6))
+                self.sidebar_section_divider.pack_propagate(False)
+                ttk.Separator(self.sidebar_section_divider).pack(fill='x', pady=(10, 0))
             button = self._sidebar_button(self.sidebar_pages, title, icon, lambda page=self.page_ids[index]: self.select_page(page))
             if index in (0, 3):
-                heading = ttk.Label(self.sidebar_pages, text="账簿" if index == 0 else "尽调",
+                heading = ttk.Label(self.sidebar_pages, text="查看账簿" if index == 0 else "功能",
                                     style="SidebarHint.TLabel")
                 self.sidebar_groups.append((heading, button))
             self.nav_buttons.append(button)

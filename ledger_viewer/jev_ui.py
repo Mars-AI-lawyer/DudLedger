@@ -14,7 +14,9 @@ from .store import LedgerStore
 from .importer import format_money
 from .dd_features import load_basis_overrides, load_config, materiality_bases, save_basis_overrides, save_config
 from .jev_mapping import get_api_key
-from .jev_rules import default_rules, load_rules, save_rules
+from .deepseek_mapping import get_api_key as get_deepseek_key
+from .bailian_review import get_api_key as get_bailian_key, DEFAULT_ENDPOINT as BAILIAN_ENDPOINT
+from .specialist_rules import ACCOUNTS, default_rules, load_rules, save_rules
 from .related_parties import party_names, role_grouped_names
 from .jev_review import (BOUNDARY, PRIORITY_LABELS, STATUS_LABELS, SEND_FIELDS,
     ReviewJob, active_job, batch_counts, batch_info, discard_preview,
@@ -22,13 +24,15 @@ from .jev_review import (BOUNDARY, PRIORITY_LABELS, STATUS_LABELS, SEND_FIELDS,
     refresh_staleness, save_feedback, test_connection, voucher_results, voucher_result_context)
 
 CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、往来单位、辅助核算、非零一侧的借贷金额，'
-    '以及当前账套尽调主体名单中的名称与身份（不含备注），发送至 TypeSafe 的 Jev 服务，'
+    '以及当前账套尽调主体名单中的名称与身份（不含备注），默认依次使用阿里百炼决策模型、TypeSafe Jev、DeepSeek Flash（不思考）；可在设置中改为 Jev 优先，前一级未配置或余额不足时尝试下一级，'
     '用于筛选值得法律尽调律师进一步查看的凭证。\n\n'
     '同时随每张凭证发送程序预计算的“程序特征”事实：命中尽调主体名单、摘要关键词线索、'
     '金额关注线与占净资产／总资产／营业收入比例（如设置）、科目单笔金额分位、交易对手金额排名。'
     '这些字段可能包含客户商业信息或个人信息。请确认本次使用符合项目的保密安排，并仅选择本次审查所需的范围。'
+    '先按所选科目定位凭证，再发送同一凭证的完整分录作为上下文；不会因此扫描银行存款等其他科目的全部凭证。'
+    '部分凭证附带同名往来单位90日内同币种、同金额的历史候选（最多20条，不证明资金流转或长期挂账）。'
     '原始账簿文件不会上传，具体发送内容可在下方逐页预览。\n\n'
-    'AI 结果是尽调线索的查看优先级，不是法律风险评级；最终判断仍需结合相关材料由律师完成。')
+    '百炼与 Jev 分别保留每题概率、使用各自阈值；DeepSeek 保留有原文依据的分类，不换算为决策概率。最终由律师核查。')
 
 
 def wrapped_label(parent, **options):
@@ -51,8 +55,8 @@ def display_input(payload):
     return '\n'.join(lines) if lines else '（无内容）'
 
 
-def launch_connection_test(parent, status):
-    key = get_api_key()
+def launch_connection_test(parent, status, *, provider='jev', api_key=None, endpoint=BAILIAN_ENDPOINT):
+    key = api_key if api_key is not None else get_api_key()
     if not key:
         messagebox.showinfo('尚未设置密钥', '请先输入并保存 API Key。', parent=parent)
         return
@@ -63,7 +67,11 @@ def launch_connection_test(parent, status):
     status.set('正在使用固定虚构内容测试连接…')
     def work():
         try:
-            result = test_connection(key)
+            if provider == 'bailian':
+                from .bailian_review import test_connection as test_bailian
+                result = test_bailian(key, endpoint)
+            else:
+                result = test_connection(key)
             queue.put('连接成功（仅发送虚构样例）' if result['status'] == 'success' else result.get('error', '连接测试取消'))
         except Exception:
             queue.put('连接测试失败，请检查网络与密钥')
@@ -84,13 +92,19 @@ class ReviewRulesDialog(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.store = app.store
-        self.title('Jev 审查规则与尽调筛选设置 · 当前账套')
+        self.title('AI 抽查提示词与专项审查设置 · 当前账套')
         self.geometry('820x720')
         self.minsize(660, 560)
         self.transient(app)
         self.version, self.rules = load_rules(self.store)
-        ttk.Label(self, text=f'当前规则 v{self.version} · jev-1.13.0 · 保存生成新版本，历史结果保留原规则', padding=10).pack(anchor='w')
-        thresholds = ttk.LabelFrame(self, text='命中阈值（分类／整体判断概率×100，对应查看优先级）', padding=8)
+        ttk.Label(self, text=f'当前专项规则 v{self.version} · 6 类科目 / 30 项问题 · 保存生成新版本，历史结果保留原规则', padding=10).pack(anchor='w')
+        model_row = ttk.Frame(self, padding=(10, 0))
+        model_row.pack(fill='x')
+        ttk.Label(model_row, text='Jev 模型').pack(side='left')
+        self.model = tk.StringVar(value=self.rules['model'])
+        ttk.Combobox(model_row, textvariable=self.model, values=('jev-1.13.0', 'jev-1.14.0'), state='readonly', width=16).pack(side='left', padx=8)
+        ttk.Label(model_row, text='默认百炼优先；可在偏好设置改为 Jev 优先').pack(side='left')
+        thresholds = ttk.LabelFrame(self, text='Jev 专用命中阈值（每题概率×100；不适用于 DeepSeek）', padding=8)
         thresholds.pack(fill='x', padx=10)
         self.thresholds = {}
         for label in ('谨慎', '中', '宽松'):
@@ -98,15 +112,27 @@ class ReviewRulesDialog(tk.Toplevel):
             var = tk.StringVar(value=str(self.rules['thresholds'][label]))
             self.thresholds[label] = var
             ttk.Entry(thresholds, textvariable=var, width=7).pack(side='left', padx=(0, 16))
-        ttk.Label(self, text='必须保持：谨慎 < 中 < 宽松。任一分类或整体判断达到“谨慎”即进入待核线索；'
+        bailian_thresholds = ttk.LabelFrame(self, text='百炼专用命中阈值（独立校准，不套用 Jev 阈值）', padding=8)
+        bailian_thresholds.pack(fill='x', padx=10)
+        self.bailian_thresholds = {}
+        for label in ('谨慎', '中', '宽松'):
+            ttk.Label(bailian_thresholds, text=label).pack(side='left', padx=(5, 3))
+            var = tk.StringVar(value=str(self.rules['bailian_thresholds'][label]))
+            self.bailian_thresholds[label] = var
+            ttk.Entry(bailian_thresholds, textvariable=var, width=7).pack(side='left', padx=(0, 16))
+        ttk.Label(self, text='必须保持：谨慎 < 中 < 宽松。任一专项问题达到所选档位即进入待核线索；'
             f'达到“宽松”显示为“{PRIORITY_LABELS["宽松"]}”、“中”为“{PRIORITY_LABELS["中"]}”、'
             f'“谨慎”为“{PRIORITY_LABELS["谨慎"]}”。查看优先级反映尽调相关程度，不是法律风险评级，'
             '概率也不代表违法事实已获证实。', padding=10).pack(anchor='w')
         self._build_filter_settings()
-        self.paths = {'通用判断边界': ('common',), '整体是否值得查看 · 提问': ('review',), '信息不足提问': ('insufficient',)}
+        self.paths = {'基础提示词（三种模型共用）': ('common',), '信息不足提问（百炼／Jev）': ('insufficient',)}
         for i, topic in enumerate(self.rules['topics']):
-            self.paths[f"{topic['label']} · 提问"] = ('topics', i, 'question')
-            self.paths[f"{topic['label']} · 核查建议"] = ('topics', i, 'advice')
+            title = f"{topic['account']} / {topic['id']} {topic['label']}"
+            self.paths[f"{title} · 提问"] = ('topics', i, 'question')
+            self.paths[f"{title} · 核查建议"] = ('topics', i, 'advice')
+            if topic.get('bailian_criteria'):
+                self.paths[f"{title} · 百炼命中条件"] = ('topics', i, 'bailian_criteria', 'true')
+                self.paths[f"{title} · 百炼排除条件"] = ('topics', i, 'bailian_criteria', 'false')
         self.selection = tk.StringVar(value=next(iter(self.paths)))
         combo = ttk.Combobox(self, textvariable=self.selection, values=list(self.paths), state='readonly')
         combo.pack(fill='x', padx=10, pady=5)
@@ -225,6 +251,9 @@ class ReviewRulesDialog(tk.Toplevel):
 
     def _reset(self):
         self.rules = default_rules()
+        self.model.set(self.rules['model'])
+        for label, var in self.bailian_thresholds.items():
+            var.set(str(self.rules['bailian_thresholds'][label]))
         for label, var in self.thresholds.items():
             var.set(str(self.rules['thresholds'][label]))
         self.editor.delete('1.0', 'end')
@@ -235,6 +264,8 @@ class ReviewRulesDialog(tk.Toplevel):
         try:
             self._save_filter_settings()
             self.rules['thresholds'] = {label: float(var.get()) for label, var in self.thresholds.items()}
+            self.rules['bailian_thresholds'] = {label: float(var.get()) for label, var in self.bailian_thresholds.items()}
+            self.rules['model'] = self.model.get()
             save_rules(self.store, self.rules)
         except (ValueError, TypeError, AttributeError) as exc:
             messagebox.showerror('规则未保存', str(exc), parent=self)
@@ -251,7 +282,7 @@ class ConsentDialog(tk.Toplevel):
         counts = batch_counts(self.store, batch_id)
         self.total = counts['total']
         self.voucher_total = counts['vouchers']
-        self.title('使用 Jev 云端辅助审查')
+        self.title('AI 专项抽查 · 发送预览')
         self.geometry('810x730')
         self.minsize(670, 560)
         self.transient(panel.app)
@@ -259,22 +290,20 @@ class ConsentDialog(tk.Toplevel):
         info = batch_info(self.store, batch_id)
         scope = json.loads(info['scope_json'])
         description = []
-        labels = {'account': '科目', 'search': '关键词', 'fiscal_year': '年度', 'period': '期间', 'source_ids': '来源编号', 'include_descendants': '包含下级科目'}
+        labels = {'account': '科目', 'search': '关键词', 'fiscal_year': '年度', 'period': '期间', 'source_ids': '来源编号', 'include_descendants': '包含下级科目', 'review_accounts': '专项科目', 'bailian_endpoint': '百炼接口'}
         for field, value in scope.items():
-            if value:
-                description.append(f'{labels[field]}：{value}')
-        wrapped_label(self, text=CONSENT_TEXT, wraplength=750, padding=12).pack(fill='x')
+            if value and field in labels:
+                description.append(f'{labels[field]}：' + ('、'.join(value) if isinstance(value, list) else str(value)))
+        wrapped_label(self, text='本次将选定凭证及其完整分录、尽调主体名单和程序特征发送至下列模型服务；可能包含客户商业信息或个人信息，请确认符合项目保密安排。原始文件不上传。完整说明、名单及实际发送字段见下方预览。', wraplength=750, padding=12).pack(fill='x')
+        order = 'Jev → 百炼 → DeepSeek Flash' if scope.get('preferred_provider') == 'jev' else '百炼 → Jev → DeepSeek Flash'
+        wrapped_label(self, text='本次优先顺序：' + order, padding=(12, 0)).pack(fill='x')
         wrapped_label(self, text=f'账套：{self.store.path.name}\n范围：' + ('；'.join(description) or '全部明细分录') + f'\n共 {self.total} 条分录，归为 {self.voucher_total} 张凭证／无号来源行；每张凭证去重合并后核查（相同行合并金额并标注次数，仅发送非零一侧金额）；超长内容分段 · 规则 v{info["rule_id"]} · {info["model"]}', padding=(12, 4), wraplength=750).pack(fill='x')
         parties = party_names(self.store.related_parties())
         grouped = role_grouped_names(self.store.related_parties())
-        party_preview = '；'.join(f'{role}：{"、".join(names[:4])}' for role, names in grouped.items())
-        if len(party_preview) > 220:
-            party_preview = party_preview[:220] + '…'
-        wrapped_label(self, text='完整发送字段：' + '、'.join(SEND_FIELDS.values()) + f'（空白字段与零金额不发送）'
-            + (f'\n尽调主体名单：共 {len(parties)} 个名称，按身份分组随每张凭证一并发送（仅名称、别名与身份，不含备注）：{party_preview}' if parties else '\n当前账套未设置尽调主体名单；可在「查看 → 尽调主体名单」中维护或批量导入。')
-            + '\n程序特征：命中主体名单、摘要关键词线索、金额关注线与占比、科目单笔分位、交易对手排名等本地事实。'
-            + '\n文件名、路径、制单人、原始行及凭证标识只在本地关联，不发送。', padding=12, wraplength=750).pack(fill='x')
-        wrapped_label(self, text=f"已排除结转损益／低价值机械凭证 {counts['skipped_vouchers']} 张（仍可在结果中查看，出现异常特征会自动恢复送审）；只核查其余凭证。", padding=(12, 0)).pack(fill='x')
+        self.party_payload = grouped
+        wrapped_label(self, text='发送字段：' + '、'.join(SEND_FIELDS.values())
+            + f'；尽调主体名单共 {len(parties)} 个名称（仅名称、别名和身份）。文件名、路径、制单人及凭证标识留在本地。', padding=(12, 4), wraplength=750).pack(fill='x')
+        wrapped_label(self, text=f"已排除结转损益凭证 {counts['skipped_vouchers']} 张；仅对本次专项科目的凭证提问，不使用整体风险判断。", padding=(12, 0)).pack(fill='x')
         self.preview = read_only_text(self, '', height=13)
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(side='bottom', fill='x', before=self.preview.frame)
@@ -294,7 +323,16 @@ class ConsentDialog(tk.Toplevel):
     def _page(self, delta):
         self.page = min(max(0, self.page + delta), (self.total - 1) // 20)
         rows = preview_page(self.store, self.batch_id, self.page)
-        text = '\n\n'.join(f'第 {self.page * 20 + index} 条' + ('（结转损益，不发送）' if row['status'] == 'skipped' else '') + f'\n{display_input(json.loads(row["input_json"]))}' for index, row in enumerate(rows, 1))
+        blocks, seen = [], set()
+        if self.page == 0:
+            blocks.extend([CONSENT_TEXT, '本次尽调主体名单：\n' + json.dumps(self.party_payload, ensure_ascii=False, indent=2)])
+        for index, row in enumerate(rows, 1):
+            blocks.append(f'第 {self.page * 20 + index} 条' + ('（结转损益，不发送）' if row['status'] == 'skipped' else '') + f'\n{display_input(json.loads(row["input_json"]))}')
+            if row['features_json'] and row['voucher_key'] not in seen:
+                seen.add(row['voucher_key'])
+                feature = json.loads(row['features_json'])
+                blocks.append('程序特征及历史背景：\n' + json.dumps({k: feature[k] for k in ('facts', 'background', 'review_accounts', 'check_ids') if k in feature}, ensure_ascii=False, indent=2))
+        text = '\n\n'.join(blocks)
         self.preview.configure(state='normal')
         self.preview.delete('1.0', 'end')
         self.preview.insert('1.0', text)
@@ -307,7 +345,7 @@ class ConsentDialog(tk.Toplevel):
 
     def _confirm(self):
         try:
-            job = ReviewJob(self.store.path, self.batch_id, get_api_key())
+            job = ReviewJob(self.store.path, self.batch_id, get_api_key(), deepseek_key=get_deepseek_key(), bailian_key=get_bailian_key())
             job.start(self.store)
         except Exception as exc:
             messagebox.showerror('未开始审查', str(exc), parent=self)
@@ -341,13 +379,18 @@ class ReviewPanel(ttk.Frame):
         self.pack(fill='both', expand=True)
         actions = ttk.Frame(self, padding=6)
         actions.pack(fill='x')
-        self.start_button = ttk.Button(actions, text='筛选全部凭证', command=self.new_batch, style='Accent.TButton')
+        self.start_button = ttk.Button(actions, text='开始 AI 专项抽查', command=self.new_batch, style='Accent.TButton')
         self.start_button.pack(side='left')
         self.cancel_button = ttk.Button(actions, text='停止', command=self.cancel, state='disabled')
         self.cancel_button.pack(side='left', padx=5)
         self.more_button = ttk.Button(actions, text='更多选项', command=self._toggle_options)
         self.more_button.pack(side='right')
-        self.progress = tk.StringVar(value='筛选当前账套的全部凭证：程序先算特征，Jev 判断是否值得律师查看，完成一张即显示一张。')
+        selection = ttk.LabelFrame(self, text='选择抽查科目（可多选；未选时默认以下六类）', padding=(6, 2))
+        selection.pack(fill='x', padx=6)
+        self.review_accounts = {name: tk.BooleanVar(value=False) for name in ACCOUNTS}
+        for index, (name, var) in enumerate(self.review_accounts.items()):
+            ttk.Checkbutton(selection, text=name, variable=var).grid(row=index // 3, column=index % 3, sticky='w', padx=(0, 24))
+        self.progress = tk.StringVar(value='只抽查所选科目的凭证；默认百炼优先，Jev 可选，DeepSeek Flash 兜底。')
         wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050).pack(fill='x')
         self.progress_bar = ttk.Progressbar(self, mode='determinate', maximum=1, value=0)
         self.progress_bar.pack(fill='x', padx=8, pady=(0, 7))
@@ -389,8 +432,8 @@ class ReviewPanel(ttk.Frame):
         self.period_combo = combo
         ttk.Checkbutton(filters, text='显示已忽略', variable=self.show_ignored, command=self.refresh_rows).pack(side='left', padx=5)
         ttk.Button(filters, text='筛选', command=self.refresh_rows).pack(side='left')
-        self.view = tree(self, [('voucher', '凭证', 140), ('amount', '金额', 110), ('summary', '摘要', 200),
-            ('categories', '尽调分类', 190), ('priority', '查看优先级', 80), ('score', '相关度', 65),
+        self.view = tree(self, [('voucher', '凭证', 140), ('account', '抽查科目', 110), ('amount', '金额', 110), ('summary', '摘要', 200),
+            ('categories', '审查问题 / 编号', 190), ('priority', '查看优先级', 80), ('score', '决策概率%', 75),
             ('analysis', '状态', 110)])
         self.view.bind('<Double-1>', self.open_detail)
         bottom = ttk.Frame(self, padding=6)
@@ -463,11 +506,13 @@ class ReviewPanel(ttk.Frame):
         if active_job(self.app.store.path):
             messagebox.showinfo('审查正在运行', '当前账套同一时间只运行一个批次。', parent=self)
             return
-        self.prepare({})
+        self.prepare({'review_accounts': [name for name, var in self.review_accounts.items() if var.get()]})
 
     def prepare(self, scope):
         if self.preparing or self.app.import_busy:
             return
+        scope = {**scope, 'preferred_provider': self.app.controller.preferences.get('review_preferred_provider', 'bailian'),
+                 'bailian_endpoint': self.app.controller.preferences.get('bailian_endpoint', BAILIAN_ENDPOINT)}
         if not self.app.store.large_book():
             try:
                 batch_id = prepare_batch(self.app.store, scope)
@@ -585,7 +630,7 @@ class ReviewPanel(ttk.Frame):
             self.view.delete(*self.view.get_children())
             self.rows = {}
             self.progress_bar.configure(maximum=1, value=0)
-            self.count_label.set('尚无结果，点击“筛选全部凭证”开始。')
+            self.count_label.set('尚无结果，选择科目后点击“开始 AI 专项抽查”。')
             self.result_prev.configure(state='disabled')
             self.result_next.configure(state='disabled')
             for child in self.category_frame.winfo_children():
@@ -642,6 +687,8 @@ class ReviewPanel(ttk.Frame):
             row = group['hits'][0]['local']
             voucher = f"{row['fiscal_year']}/{row['period']} {row['voucher_type']}{row['voucher_no']}" if row['voucher_no'] else f"无凭证号 · {row['filename']}:{row['row_no']}"
             states = list(dict.fromkeys('已过期' if r['stale'] else STATUS_LABELS[r['status']] for r in group['lines']))
+            if group.get('provider'):
+                states.append({'bailian': '百炼', 'jev': 'Jev', 'deepseek': 'DeepSeek Flash'}[group['provider']])
             if any(r['status'] == 'success' and is_uncertain(r) for r in group['lines']):
                 states.append('需人工复核')
             if group['feedback'] == 'ignore':
@@ -650,8 +697,8 @@ class ReviewPanel(ttk.Frame):
                 states.append('仅覆盖部分分录')
             currencies = group['sort_currency']
             amount = f"{format_money(group['sort_amount'], comma=True)} {currencies[0]}" if len(currencies) == 1 and currencies[0] != '币种未注明' else (f"{format_money(group['sort_amount'], comma=True)}" if len(currencies) == 1 else '多币种')
-            values = (voucher, amount, '；'.join(dict.fromkeys(r['local']['summary'] for r in group['hits'])),
-                '、'.join(group['labels']), group['priority'],
+            values = (voucher, '、'.join(group.get('review_accounts', [])) or '历史通用审查', amount, '；'.join(dict.fromkeys(r['local']['summary'] for r in group['hits'])),
+                '、'.join(f'{identifier} {label}' for identifier, label, _sources, _probability in group['categories']) or '待分类', group['priority'],
                 f"{group['score']:.1f}" if group['score'] is not None else '—', '、'.join(states))
             if item in old_items:
                 self.view.item(item, values=values)
@@ -718,14 +765,37 @@ class ReviewDetail(tk.Toplevel):
         self.title(f'AI 尽调线索 · {voucher_title}')
         self.geometry('840x560')
         self.minsize(640, 420)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
         info = batch_info(self.store, panel.batch_id)
         self.rules = json.loads(info['body_json'])
+        models = list(dict.fromkeys(json.loads(row['response_json'])['model'] for row in group['lines'] if row['response_json']))
         wrapped_label(self, text=f"尽调分类：{'、'.join(group['labels'])} · 查看优先级：{group['priority'] or '—'} · "
-            f"规则 v{info['rule_id']} · 请求模型 {info['model']}\n{BOUNDARY}", padding=10, wraplength=760).pack(fill='x')
+            f"规则 v{info['rule_id']} · 实际模型 {'、'.join(models) or '尚未调用'}\n{BOUNDARY}", padding=10, wraplength=760).grid(row=0, column=0, sticky='ew')
+        self.detail_panes = ttk.Panedwindow(self, orient='vertical')
+        self.detail_panes.grid(row=1, column=0, sticky='nsew', padx=10)
+        self.voucher_area = ttk.Frame(self.detail_panes)
+        self.detail_panes.add(self.voucher_area, weight=0)
+        self.preview_tabs = ttk.Notebook(self.voucher_area)
+        self.preview_tabs.pack(fill='both', expand=True)
+        self.voucher_page = ttk.Frame(self.preview_tabs)
+        self.preview_tabs.add(self.voucher_page, text='完整凭证')
+        topics = {topic['id']: topic for topic in self.rules['topics']}
+        suggestions = []
+        for identifier, label, _sources, _probability in group['categories']:
+            topic = topics[identifier]
+            suggestions.append(f"{topic.get('account', '')} · {identifier} {label}\n建议核查：{topic['advice']}"
+                + (f"\n待归入法律尽调问题；建议分类：{topic['category']}，也可选择律师自定义问题。" if topic.get('category') else ''))
+        if suggestions:
+            advice_page = ttk.Frame(self.preview_tabs)
+            self.preview_tabs.add(advice_page, text='核查建议')
+            read_only_text(advice_page, '\n\n'.join(suggestions), height=4)
         # 完整凭证：与明细账双击打开的凭证同一份数据与列格式。
         self.entry_id = group['lines'][0]['entry_id']
         lines = self.store.voucher_lines(self.entry_id)
-        self.voucher_view = tree(self, VIEW_COLUMNS['voucher'])
+        self.voucher_view = tree(self.voucher_page, VIEW_COLUMNS['voucher'])
+        self._voucher_rows = min(6, max(2, len(lines)))
+        self.voucher_view.configure(height=self._voucher_rows)
         self.app._register_column_view('voucher', self.voucher_view)
         mark_for_entry, _remove_mark, _save_mark, _list_marks = self._mark_tools
         existing_mark = mark_for_entry(self.store, self.entry_id)
@@ -737,34 +807,42 @@ class ReviewDetail(tk.Toplevel):
                 tags=('marked',) if existing_mark else ((side_tag,) if side_tag else ()))
         debit = sum(line['debit_cents'] for line in lines)
         credit = sum(line['credit_cents'] for line in lines)
-        ttk.Label(self, text=f"{len(lines)} 行分录   借方 {amount(debit) or '0.00'}   贷方 {amount(credit) or '0.00'}   差额 {amount(debit - credit) or '0.00'}",
-            padding=(12, 5)).pack(anchor='w')
-        # 底部操作：JSON 按需展开；忽略与关注（关注展开备注区，与凭证窗口一致）。
+        ttk.Label(self.voucher_page, text=f"{len(lines)} 行分录   借方 {amount(debit) or '0.00'}   贷方 {amount(credit) or '0.00'}   差额 {amount(debit - credit) or '0.00'}",
+            padding=(2, 5)).pack(side='bottom', anchor='w', before=self.voucher_view.master)
+        # A separate grid row reserves the action bar before distributing space
+        # between the voucher and the note editor, including at minimum size.
         self.actions = ttk.Frame(self, padding=(10, 4))
-        self.actions.pack(side='bottom', fill='x')
+        self.actions.grid(row=2, column=0, sticky='ew')
+        self.actions.columnconfigure(2, weight=1)
         self.json_button = ttk.Button(self.actions, text='查看 JSON 返回结果 ▾', command=self._toggle_json)
-        self.json_button.pack(side='left')
+        self.json_button.grid(row=0, column=0, columnspan=2, sticky='w', pady=3)
         self.ignore_var = tk.BooleanVar(value=group['feedback'] == 'ignore')
-        ttk.Checkbutton(self.actions, text='忽略此线索', variable=self.ignore_var, command=self._save_ignore).pack(side='left', padx=(16, 0))
-        ttk.Button(self.actions, text='关闭', command=self.request_close).pack(side='right')
+        ttk.Checkbutton(self.actions, text='忽略此线索', variable=self.ignore_var, command=self._save_ignore).grid(row=0, column=2, sticky='w', padx=8)
+        self.close_button = ttk.Button(self.actions, text='关闭', command=self.request_close)
+        self.close_button.grid(row=1, column=4, sticky='e', padx=(6, 0), pady=3)
+        ttk.Button(self.actions, text='加入尽调问题…', command=lambda: self.app.workbench.choose_issue([group['key']])).grid(row=0, column=3, columnspan=2, sticky='e')
         collapsed = '查看 / 编辑关注备注' if existing_mark else '关注这张凭证'
         self.note_toggle = ttk.Button(self.actions, text=collapsed, command=self._toggle_notes, style='Accent.TButton')
-        self.note_toggle.pack(side='right', padx=8)
-        self.note_area = ttk.Frame(self, padding=(12, 5, 12, 10))
+        self.note_toggle.grid(row=1, column=0, columnspan=2, sticky='w', pady=3)
+        self.note_area = ttk.Frame(self.detail_panes, padding=(2, 8, 2, 0))
         self.attention = tk.BooleanVar(value=bool(existing_mark))
         ttk.Checkbutton(self.note_area, text='关注这张凭证', variable=self.attention).pack(anchor='w')
-        self.note = ScrolledText(self.note_area, height=4, wrap='word', undo=True)
-        self.note.pack(fill='x')
+        self.note = ScrolledText(self.note_area, height=6, wrap='word', undo=True)
+        self.note.pack(fill='both', expand=True)
         if existing_mark:
             self.note.insert('1.0', existing_mark['note'])
         self._saved_note = (self.attention.get(), self.note.get('1.0', 'end-1c'))
         self.feedback = tk.StringVar()
         self.note_key = voucher_key(lines[0]) if lines else group['key']
         self.note_draft = self.app.note_hub.bind(self, self.note, self.note_key, self.feedback, on_saved=self._note_saved)
-        ttk.Label(self.note_area, textvariable=self.feedback, foreground='#555').pack(anchor='w')
-        ttk.Button(self.note_area, text='保存关注与注释', command=self._save_attention, style='Accent.TButton').pack(anchor='e', pady=(6, 0))
-        ttk.Button(self.note_area, text='重读已保存备注…', command=lambda: self.app.note_hub.reload(self.note)).pack(anchor='e')
-        self.json_area = ttk.Frame(self)
+        ttk.Label(self.note_area, textvariable=self.feedback, foreground='#555').pack(side='bottom', anchor='w', before=self.note.frame)
+        self.note_save_button = ttk.Button(self.actions, text='保存关注与备注', command=self._save_attention, style='Accent.TButton')
+        self.note_save_button.grid(row=1, column=3, sticky='e', pady=3)
+        self.note_reload_button = ttk.Button(self.actions, text='重读备注…', command=lambda: self.app.note_hub.reload(self.note))
+        self.note_reload_button.grid(row=1, column=2, sticky='w', padx=8)
+        self.note_save_button.grid_remove()
+        self.note_reload_button.grid_remove()
+        self.json_area = ttk.Frame(self.preview_tabs)
         self.json_text = None
         self.bind('<Escape>', lambda _event: self.request_close())
         self.protocol('WM_DELETE_WINDOW', self.request_close)
@@ -790,13 +868,14 @@ class ReviewDetail(tk.Toplevel):
         self.app.update_mark_indicators(self.note_key)
 
     def _toggle_json(self):
-        if self.json_text is not None and self.json_text.winfo_manager():
-            self.json_area.pack_forget()
+        if str(self.json_area) in self.preview_tabs.tabs():
+            self.preview_tabs.forget(self.json_area)
             self.json_button.configure(text='查看 JSON 返回结果 ▾')
             return
         if self.json_text is None:
             self.json_text = read_only_text(self.json_area, self._json_content(), height=14)
-        self.json_area.pack(fill='both', expand=True, before=self.actions)
+        self.preview_tabs.add(self.json_area, text='模型返回')
+        self.preview_tabs.select(self.json_area)
         self.json_button.configure(text='收起 JSON 返回结果 ▴')
 
     def _json_content(self) -> str:
@@ -804,15 +883,27 @@ class ReviewDetail(tk.Toplevel):
         for row in self.group['lines']:
             if row['response_json']:
                 data = json.loads(row['response_json'])
+                if data.get('provider') == 'deepseek':
+                    parts = [f"实际模型：{data['model']} · DeepSeek 明确命中（不显示决策概率） · 信息不足：{data['insufficient']}"]
+                    if data.get('fallback_reason'):
+                        parts.append('切换原因：' + data['fallback_reason'])
+                    topics = {topic['id']: topic for topic in self.rules['topics']}
+                    for hit in data['hits']:
+                        topic = topics[hit['id']]
+                        parts.append(f"{topic.get('account', '')} · {hit['id']} {topic['label']}\n原文依据：{hit['evidence']}\n建议核查：{topic['advice']}")
+                    parts += ['', '完整结构化返回：', json.dumps(data, ensure_ascii=False, indent=2)]
+                    return '\n'.join(parts)
                 answers = data['answers']
-                parts = [f"实际模型：{data['model']} · 相关度：{row['score']:.1f}（任一分类或整体判断的最高概率） · "
+                provider_label = '百炼' if data.get('provider') == 'bailian' else 'Jev'
+                parts = [f"实际模型：{data['model']} · {provider_label} 相关度：{row['score']:.1f}（当前问题的最高概率） · "
                          f"信息不足：{row['insufficient']:.3f} · 分段数：{data.get('chunks', 1)} · "
                          f"{'缓存复用，未再次请求' if row['cached'] else '本次请求'}"]
                 if 'review' in answers:
                     parts.append(f"整体判断（是否值得律师查看）：{answers['review']['noul']:.3f}")
                 for topic in self.rules['topics']:
-                    probability = answers[topic['id']]['noul']
-                    if probability >= 0.35:
+                    probability = answers.get(topic['id'], {}).get('noul', 0)
+                    thresholds = self.rules.get('bailian_thresholds', self.rules['thresholds']) if data.get('provider') == 'bailian' else self.rules['thresholds']
+                    if topic['id'] in answers and probability >= thresholds['谨慎'] / 100:
                         parts.append(f"命中分类：{topic['label']}（{probability:.3f}{'，分类待确认' if probability < 0.65 else ''}）\n建议核查：{topic['advice']}")
                 if data.get('chunks', 1) > 1:
                     parts.append('分段结果：各分类信号取片段最大值，不是整张凭证的总体概率；需人工结合全文复核。')
@@ -824,14 +915,31 @@ class ReviewDetail(tk.Toplevel):
         return '（本凭证未送 AI，或尚无返回结果）'
 
     def _toggle_notes(self):
-        if self.note_area.winfo_manager():
-            self.note_area.pack_forget()
+        if str(self.note_area) in self.detail_panes.panes():
+            if not self.note_draft.flush():
+                self.note.focus_set()
+                return
+            self.detail_panes.forget(self.note_area)
+            self.note_save_button.grid_remove()
+            self.note_reload_button.grid_remove()
             mark_for_entry, _remove, _save, _list = self._mark_tools
             self.note_toggle.configure(text='查看 / 编辑关注备注' if mark_for_entry(self.store, self.entry_id) else '关注这张凭证')
         else:
             self.attention.set(True)
-            self.note_area.pack(fill='x', before=self.actions)
+            self.detail_panes.add(self.note_area, weight=1)
+            self.note_toggle.configure(text='收起备注')
+            self.note_save_button.grid()
+            self.note_reload_button.grid()
+            self.after_idle(self._size_note_panes)
             self.note.focus_set()
+
+    def _size_note_panes(self):
+        if not self.winfo_exists() or str(self.note_area) not in self.detail_panes.panes():
+            return
+        row_height = int(ttk.Style(self).lookup('Treeview', 'rowheight') or 24)
+        preferred = max(self.voucher_area.winfo_reqheight(), self._voucher_rows * row_height + 84)
+        available = self.detail_panes.winfo_height()
+        self.detail_panes.sashpos(0, min(preferred, max(60, int(available * 0.42))))
 
     def _save_attention(self):
         from .issue_store import write_note

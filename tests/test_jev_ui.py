@@ -9,8 +9,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ledger_viewer.importer import ImportSpec, guess_header
-from ledger_viewer.jev_review import ReviewJob, batch_counts, prepare_batch, batch_info
+from ledger_viewer.jev_review import ReviewJob, batch_counts, prepare_legacy_batch as prepare_batch, batch_info
 from ledger_viewer.jev_rules import load_rules
+from ledger_viewer.specialist_rules import load_rules as load_specialist_rules
 from ledger_viewer.jev_ui import ConsentDialog, ReviewDetail, ReviewRulesDialog
 from ledger_viewer.ui import Application
 from ledger_viewer.voucher_notes import list_marks
@@ -58,13 +59,13 @@ class ReviewUITest(unittest.TestCase):
             dialog._cancel()
             start.assert_not_called()
         self.assertIsNone(batch_info(self.app.store, batch))
-        old, _ = load_rules(self.app.store)
+        old, _ = load_specialist_rules(self.app.store)
         editor = ReviewRulesDialog(self.app)
         self.root.update()
         editor.editor.insert('end', '\n仅为线索。')
         editor.thresholds['谨慎'].set('35')
         editor._save()
-        new, rules = load_rules(self.app.store)
+        new, rules = load_specialist_rules(self.app.store)
         self.assertGreater(new, old)
         self.assertEqual(rules['thresholds']['谨慎'], 35)
         self.assertTrue(rules['common'].endswith('仅为线索。'))
@@ -96,7 +97,7 @@ class ReviewUITest(unittest.TestCase):
         self.app.search.set('不存在的关键词')
         with patch.object(self.panel, 'prepare') as prepare:
             self.panel.new_batch()
-        prepare.assert_called_once_with({})
+        prepare.assert_called_once_with({'review_accounts': []})
 
     def test_progress_and_low_score_result_visible_before_all_done(self):
         self.app.select_page("review")
@@ -181,7 +182,7 @@ class ReviewUITest(unittest.TestCase):
         self.root.update()
         self.assertEqual(self.panel.category.get(), financing)
         self.assertEqual(len(self.panel.view.get_children()), 1)
-        self.assertIn('股东借款', self.panel.view.item(self.panel.view.get_children()[0], 'values')[2])
+        self.assertIn('股东借款', self.panel.view.item(self.panel.view.get_children()[0], 'values')[3])
         labels = [b.cget('text') for b in self.panel.category_frame.winfo_children()]
         self.assertTrue(any(text.startswith(equity) for text in labels))
 
@@ -189,8 +190,8 @@ class ReviewUITest(unittest.TestCase):
         batch = prepare_batch(self.app.store, {'account': 'C:2241'})
         dialog = ConsentDialog(self.panel, batch)
         original = ReviewJob.__init__
-        def factory(job, path, batch_id, api_key):
-            original(job, path, batch_id, api_key, FakeClient)
+        def factory(job, path, batch_id, api_key, **options):
+            original(job, path, batch_id, api_key, FakeClient, **options)
         with patch('ledger_viewer.jev_ui.get_api_key', return_value='fake-key'), patch.object(ReviewJob, '__init__', factory):
             dialog._confirm()
             self.panel.job.thread.join(5)

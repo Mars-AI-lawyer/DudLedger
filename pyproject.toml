@@ -16,4 +16,4 @@ legal-ledger-viewer = "ledger_viewer.ui:main"
 include = ["ledger_viewer*"]
 
 [tool.setuptools.package-data]
-ledger_viewer = ["skills/dudledger-import/*.md"]
+ledger_viewer = ["skills/dudledger-import/*.md", "specialist_rules.json"]

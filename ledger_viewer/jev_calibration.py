@@ -15,14 +15,25 @@ def _needs_manual_review(prediction) -> bool:
         return False
 
 
-def metrics(samples, predictions, thresholds=None):
+def _detected(prediction, threshold):
+    data = json.loads(prediction.get('response_json') or '{}')
+    if data.get('provider') == 'deepseek':
+        return bool(data.get('hits'))
+    return prediction['score'] is not None and prediction['score'] >= threshold
+
+
+def metrics(samples, predictions, thresholds=None, *, provider_thresholds=None, _group_providers=True):
     thresholds = thresholds or {'谨慎': 35, '中': 50, '宽松': 65}
+    provider_thresholds = provider_thresholds or {'bailian': {'谨慎':50, '中':65, '宽松':85}}
+    def detected(prediction, tier):
+        provider = json.loads(prediction.get('response_json') or '{}').get('provider', 'jev')
+        return _detected(prediction, provider_thresholds.get(provider, thresholds)[tier])
     approved = [s for s in samples if s['标注状态'] == '已确认']
     for row in approved:
         if row['律师确认优先级'] not in ('0', '1', '2', '3', '4'):
             raise ValueError(f"{row['样例编号']} 缺少有效的律师优先级标注")
     report = {'样例总数': len(samples), '律师确认数': len(approved),
-              '指标口径': '人工优先级 ≥ 2 为需核查正例；任一主题概率达到各档阈值即判为检出（不再使用加权优先分）；仅统计律师已确认且分析成功的样例。理想做法是按主题分别标注样例后逐主题统计。',
+              '指标口径': '人工优先级 ≥ 2 为需核查正例；百炼与 Jev 分别按自己的问题概率阈值判定，DeepSeek 按明确命中判定（不套用决策模型阈值）。仅统计律师已确认且分析成功的样例，分别按模型统计；理想做法是按问题编号逐项标注和统计。',
               '状态': '可计算' if approved else '待律师标注，不提供准确率或召回率结论', '分组': {}}
     for split in ('校准', '验证'):
         selected = [s for s in approved if s['数据集'] == split]
@@ -32,13 +43,25 @@ def metrics(samples, predictions, thresholds=None):
         for tier, threshold in thresholds.items():
             positive = [(s,p) for s,p in scored if int(s['律师确认优先级']) >= 2]
             negative = [(s,p) for s,p in scored if int(s['律师确认优先级']) < 2]
-            tp = sum(p['score'] >= threshold for _,p in positive)
-            fp = sum(p['score'] >= threshold for _,p in negative)
+            tp = sum(detected(p, tier) for _,p in positive)
+            fp = sum(detected(p, tier) for _,p in negative)
             result['三档'][tier] = {'阈值': threshold, '需核查正例数': len(positive), '检出正例': tp, '误报数': fp,
                 '召回率': tp / len(positive) if positive else None,
                 '误报率': fp / len(negative) if negative else None,
-                '未命中样例': [s['样例编号'] for s,p in positive if p['score'] < threshold]}
+                '各模型阈值': {'jev': threshold, 'bailian': provider_thresholds.get('bailian', thresholds)[tier], 'deepseek': '明确命中，不使用概率阈值'},
+                '未命中样例': [s['样例编号'] for s,p in positive if not detected(p, tier)]}
         report['分组'][split] = result
+    if _group_providers:
+        providers = {}
+        for identifier, prediction in predictions.items():
+            data = json.loads(prediction.get('response_json') or '{}')
+            provider = data.get('provider', 'jev')
+            model = data.get('model', '历史未记录模型')
+            providers.setdefault(f'{provider} / {model}', {})[identifier] = prediction
+        report['按模型分别统计'] = {provider: metrics(
+            [sample for sample in samples if sample['样例编号'] in subset], subset,
+            provider_thresholds.get(provider.split(' / ')[0], thresholds), provider_thresholds=provider_thresholds,
+            _group_providers=False) for provider, subset in providers.items()}
     return report
 
 
@@ -60,7 +83,9 @@ def main():
             raise ValueError('指定批次不存在')
         predictions = {json.loads(r['local_json'])['voucher_no']: dict(r) for r in db.execute(
             "SELECT * FROM jev_results WHERE batch_id=? AND status='success' AND stale=0", (args.batch,))}
-        report = metrics(samples, predictions, json.loads(batch['body_json'])['thresholds'])
+        rules = json.loads(batch['body_json'])
+        report = metrics(samples, predictions, rules['thresholds'],
+            provider_thresholds={'bailian': rules.get('bailian_thresholds', {'谨慎':50, '中':65, '宽松':85})})
         report.update({'批次': args.batch, '规则版本': batch['rule_id'], '请求模型': batch['model']})
     finally:
         db.close()
