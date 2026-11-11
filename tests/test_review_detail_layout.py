@@ -3,6 +3,7 @@ import json
 import unittest
 
 import test_jev_ui as fixtures
+from test_specialist_review import decision_answer
 from ledger_viewer.jev_review import ReviewJob, prepare_batch, voucher_results
 from ledger_viewer.jev_ui import ReviewDetail
 from ledger_viewer.voucher_notes import list_marks
@@ -15,8 +16,7 @@ class ReviewDetailLayoutTest(unittest.TestCase):
     def detail(self, geometry='840x560'):
         batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款']})
         def post(key, payload, endpoint):
-            return {'model': 'decision-model-preview', 'answers': {key: {'type': 'noul',
-                'noul': .9 if key == 'OP01' else .01} for key in payload['questions']},
+            return {'model': 'decision-model-preview', 'answers': {key: decision_answer(key == 'OP01') for key in payload['questions']},
                 'usage': {'input_tokens': 10}}
         job = ReviewJob(self.app.store.path, batch, '', bailian_key='fictional-key', bailian_post=post)
         job.start(self.app.store)

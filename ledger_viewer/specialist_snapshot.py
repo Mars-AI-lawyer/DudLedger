@@ -5,7 +5,7 @@ import json
 
 from .analysis_api import iter_entries
 from .background import check_cancelled, cooperate
-from .dd_features import FeatureContext, closing_voucher, voucher_feature
+from .dd_features import closing_voucher
 from .related_parties import role_grouped_names
 from .specialist_rules import account_for, account_prefixes, load_rules, selected_accounts
 from .voucher_notes import voucher_key
@@ -32,7 +32,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
                 relevant_parties.add(row['counterparty'].strip())
     if not keys:
         raise ValueError('选定范围没有六类专项科目的凭证，请检查科目选择或导入的科目名称')
-    context = FeatureContext(store)
+    parties = role_grouped_names(store.related_parties())
     # One local pass provides complete vouchers and exact-counterparty history.
     groups, history_index = {}, {}
     for index, row in enumerate(iter_entries(store)):
@@ -47,7 +47,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
     saved_scope = {**filters, 'review_accounts': accounts, 'profile': rules['profile'],
                    'preferred_provider': preferred, 'bailian_endpoint': endpoint,
                    'data_revision': store.setting('data_revision', '0'),
-                   'party_hash': digest(context.grouped_parties)}
+                   'party_hash': digest(parties)}
     hashes = []
     with store.db:
         batch = store.db.execute('INSERT INTO jev_batches(rule_id,model,scope_json,snapshot_hash) VALUES(?,?,?,?)',
@@ -56,7 +56,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
             if cancelled is not None:
                 check_cancelled(cancelled)
             active = [name for name in accounts if any(account_for(row, prefixes) == name for row in rows)]
-            feature = voucher_feature(context, rows)
+            feature = {'decision_mode': 'prompt', 'facts': [], 'rule_categories': []}
             feature['review_accounts'] = active
             feature['check_ids'] = [t['id'] for t in rules['topics'] if t['account'] in active]
             history = []
@@ -90,7 +90,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
                 'history_truncated': total > len(history),
                 'limits': '未提供账龄及完整银行流水；历史为同名往来单位90日内同金额候选，不证明资金流转、未清偿或关联关系。不得自行推断长期挂账或抽逃出资。'}
             payloads = [send_fields(row) for row in rows]
-            base = digest(['account-special-v1', payloads, context.grouped_parties, feature, version, rules, endpoint])
+            base = digest(['account-special-v1', payloads, parties, feature, version, rules, endpoint])
             for index, (row, payload) in enumerate(zip(rows, payloads)):
                 fp = fingerprint(row, payload)
                 hashes.append(fp)

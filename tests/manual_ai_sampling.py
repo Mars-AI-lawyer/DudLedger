@@ -53,10 +53,8 @@ def run(provider, sample):
         data=result['items'][0]
         item['model']=data['model']
         if provider in ('jev', 'bailian'):
-            probabilities={k:v['noul'] for k,v in data['answers'].items()}
-            item['probabilities']=probabilities
-            hits=[k for k,v in probabilities.items() if k!='insufficient' and v>=.5]
-            item['insufficient']=probabilities['insufficient']>=.5
+            hits=[k for k,v in data['answers'].items() if k!='insufficient' and v['choice']=='hit']
+            item['insufficient']=data['answers']['insufficient']['choice']=='hit'
         else:
             hits=[hit['id'] for hit in data['hits']]
             item['evidence']=data['hits']

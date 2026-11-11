@@ -51,7 +51,6 @@ def main():
         app.geometry('1160x690')
         app.title('DudLedger 交互验收（临时合成数据）')
         app.workbench.show()
-        app.workbench.edit_issue(1)
         app.status.set('全部为临时合成数据；关闭程序后删除。可验证框选、多选、跨页与原生拖曳。')
         try:
             root.mainloop()

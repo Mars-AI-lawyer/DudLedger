@@ -63,11 +63,11 @@ class ReviewUITest(unittest.TestCase):
         editor = ReviewRulesDialog(self.app)
         self.root.update()
         editor.editor.insert('end', '\n仅为线索。')
-        editor.thresholds['谨慎'].set('35')
         editor._save()
         new, rules = load_specialist_rules(self.app.store)
         self.assertGreater(new, old)
-        self.assertEqual(rules['thresholds']['谨慎'], 35)
+        self.assertEqual(rules['decision_mode'], 'prompt')
+        self.assertNotIn('thresholds', rules)
         self.assertTrue(rules['common'].endswith('仅为线索。'))
 
     def test_minimum_window_keeps_main_review_actions_visible(self):
@@ -219,10 +219,8 @@ class ReviewUITest(unittest.TestCase):
         self.assertEqual(marks[0]['note'], '补充借款合同')
         detail.destroy()
         count = len(FakeClient.calls)
-        self.panel.tier.set('宽松')
-        self.panel._tier_change()
-        self.panel.tier.set('谨慎')
-        self.panel._tier_change()
+        self.panel.refresh_rows()
+        self.assertFalse(hasattr(self.panel, 'tier'))
         self.assertEqual(len(FakeClient.calls), count)
 
 

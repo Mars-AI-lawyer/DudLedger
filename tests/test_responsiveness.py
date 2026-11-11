@@ -14,7 +14,7 @@ from tkinter import ttk
 
 from ledger_viewer.background import Cancelled
 from ledger_viewer.importer import classify_sheet
-from ledger_viewer.jev_review import (prepare_batch, voucher_result_context,
+from ledger_viewer.jev_review import (prepare_legacy_batch as prepare_batch, voucher_result_context,
                                       voucher_results, voucher_totals)
 from ledger_viewer.precheck import precheck
 from ledger_viewer.store import LedgerStore

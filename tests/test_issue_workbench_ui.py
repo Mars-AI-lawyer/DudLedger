@@ -57,6 +57,8 @@ class IssueWorkbenchUITest(unittest.TestCase):
         return next(item for item in self.app.note_hub.items.values() if item['editor'] is self.app.mark_note)
 
     def issue_target(self, issue_id):
+        if self.panel.view_mode != 'directory':
+            self.assertTrue(self.panel.back_to_directory())
         self.panel.tree.see(f'i:{issue_id}')
         self.root.update()
         x, y, w, h = self.panel.tree.bbox(f'i:{issue_id}', 'title')
@@ -74,6 +76,158 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.app.drag.motion(event)
         self.app.drag.release(event)
         self.root.update()
+
+    def test_single_selection_does_not_load_vouchers_or_create_draft(self):
+        self.panel.reset()
+        self.panel.show()
+        self.root.update()
+        with patch.object(self.panel, 'load_issue') as loaded:
+            self.panel.tree.selection_set(f'i:{self.other}')
+            self.panel.tree.focus(f'i:{self.other}')
+            self.root.update()
+            self.assertEqual(self.panel.selected_issue_id, self.other)
+            self.assertIsNone(self.panel.issue_id)
+            self.assertIsNone(self.panel.draft)
+            self.assertEqual(self.panel.view_mode, 'directory')
+            self.panel.tree.focus_set()
+            self.panel.tree.event_generate('<Up>')
+            self.root.update()
+            self.assertEqual(self.panel.selected_issue_id, self.issue)
+            self.assertIsNone(self.panel.draft)
+            loaded.assert_not_called()
+
+    def test_double_click_opens_details_and_enter_opens_selected_problem(self):
+        self.panel.back_to_directory()
+        self.root.update()
+        box = self.panel.tree.bbox(f'i:{self.other}', 'title')
+        for stamp in (10000, 10070):
+            self.panel.tree.event_generate('<ButtonPress-1>', x=box[0] + 30, y=box[1] + 10, time=stamp)
+            self.panel.tree.event_generate('<ButtonRelease-1>', x=box[0] + 30, y=box[1] + 10, time=stamp + 10)
+        self.root.update()
+        self.assertEqual(self.panel.view_mode, 'detail')
+        self.assertEqual(self.panel.issue_id, self.other)
+        self.assertEqual(self.panel.detail_tab, 'vouchers')
+        self.assertEqual(self.app.current_page(), 'entries')
+        self.panel.back_to_directory()
+        self.panel.tree.selection_set(f'i:{self.issue}')
+        self.panel.tree.focus_set()
+        self.root.update()
+        self.panel.tree.event_generate('<Return>')
+        self.root.update()
+        self.assertEqual(self.panel.issue_id, self.issue)
+        self.assertEqual(self.panel.view_mode, 'detail')
+
+    def test_back_restores_directory_search_selection_and_scroll(self):
+        self.panel.back_to_directory()
+        for index in range(50):
+            issues.create_issue(self.app.store, f'核查事项{index:02d}')
+        self.panel.search.set('核查事项')
+        self.root.update()
+        self.panel.tree.yview_moveto(.5)
+        self.root.update()
+        row = self.panel.tree.identify_row(70)
+        self.assertTrue(row)
+        self.panel.tree.selection_set(row)
+        self.root.update()
+        position = self.panel.tree.yview()[0]
+        self.panel._open_selected_issue()
+        self.root.update()
+        self.assertTrue(self.panel.back_to_directory())
+        self.root.update()
+        self.assertEqual(self.panel.search.get(), '核查事项')
+        self.assertEqual(self.panel.tree.selection(), (row,))
+        self.assertAlmostEqual(self.panel.tree.yview()[0], position, delta=.025)
+
+    def test_new_issue_and_batch_add_stay_in_directory_without_loading(self):
+        self.panel.back_to_directory()
+        with patch.object(self.panel, 'load_issue') as loaded:
+            with patch('ledger_viewer.workbench.simpledialog.askstring', return_value='新增问题'):
+                self.panel.new_issue()
+            new_id = self.panel.selected_issue_id
+            self.assertNotEqual(new_id, self.issue)
+            self.assertEqual(self.panel.view_mode, 'directory')
+            self.assertEqual(self.panel.tree.set(f'i:{new_id}', 'count'), '0')
+            self.panel.add_to_issue(new_id, [self.key, self.second_key])
+            self.assertEqual(self.panel.view_mode, 'directory')
+            self.assertEqual(self.panel.tree.set(f'i:{new_id}', 'count'), '2')
+            self.panel.add_to_issue(new_id, self.key)
+            self.assertEqual(self.panel.tree.set(f'i:{new_id}', 'count'), '2')
+            loaded.assert_not_called()
+
+    def test_detail_tabs_each_use_full_height_and_default_to_vouchers(self):
+        self.root.update()
+        self.assertTrue(self.panel.vouchers_page.winfo_ismapped())
+        self.assertFalse(self.panel.record_page.winfo_ismapped())
+        self.panel.detail_tabs.select(self.panel.record_page)
+        self.root.update()
+        self.assertEqual(self.panel.detail_tab, 'record')
+        self.assertTrue(self.panel.record_page.winfo_ismapped())
+        self.assertFalse(self.panel.voucher_view.winfo_ismapped())
+        self.assertGreater(self.panel.canvas.winfo_height(), self.panel.details_body.winfo_height() * .65)
+        self.panel.back_to_directory()
+        self.panel.edit_issue(self.issue)
+        self.root.update()
+        self.assertEqual(self.panel.detail_tab, 'vouchers')
+        self.assertGreater(self.panel.voucher_view.winfo_height(), self.panel.details_body.winfo_height() * .5)
+
+    def test_failed_save_blocks_back_and_tab_switch(self):
+        self.panel.detail_tabs.select(self.panel.record_page)
+        self.root.update()
+        self.panel.notes.insert('end', '未保存草稿')
+        with patch('ledger_viewer.issue_store.save_issue', side_effect=OSError('磁盘写入失败')):
+            self.assertFalse(self.panel.back_to_directory())
+            self.panel.detail_tabs.select(self.panel.vouchers_page)
+            self.root.update()
+            self.assertEqual(self.panel.detail_tabs.select(), str(self.panel.record_page))
+            self.assertEqual(self.panel.view_mode, 'detail')
+            self.assertIn('未保存草稿', self.panel.notes.get('1.0', 'end'))
+        self.assertTrue(self.panel.flush())
+
+    def test_reopening_workbench_starts_at_directory(self):
+        self.panel.hide()
+        self.panel.show()
+        self.root.update()
+        self.assertEqual(self.panel.view_mode, 'directory')
+        self.assertTrue(self.panel.directory_body.winfo_ismapped())
+        self.assertFalse(self.panel.details_body.winfo_ismapped())
+
+    def test_rehost_preserves_detail_tab_or_directory_selection(self):
+        self.panel.detail_tabs.select(self.panel.record_page)
+        self.root.update()
+        self.panel.notes.insert('end', '切换宿主保留')
+        self.panel.detach()
+        self.root.update()
+        self.assertEqual(self.panel.view_mode, 'detail')
+        self.assertEqual(self.panel.detail_tab, 'record')
+        self.assertEqual(self.panel.notes.get('1.0', 'end-1c'), '切换宿主保留')
+        self.panel.back_to_directory()
+        self.panel.tree.selection_set(f'i:{self.other}')
+        self.root.update()
+        self.panel.dock()
+        self.root.update()
+        self.assertEqual(self.panel.view_mode, 'directory')
+        self.assertEqual(self.panel.selected_issue_id, self.other)
+        self.assertEqual(self.panel.tree.selection(), (f'i:{self.other}',))
+        self.assertEqual(self.panel.issue_id, self.issue)
+
+    def test_hover_back_save_failure_keeps_drag_and_editor_in_detail(self):
+        self.panel.add_to_issue(self.issue, self.key)
+        self.panel.notes.insert('end', '保存失败不能离开')
+        view = self.panel.voucher_view
+        self.root.update()
+        box = view.bbox(next(iter(self.panel.rows)), '#0')
+        view.event_generate('<ButtonPress-1>', x=box[0] + 45, y=box[1] + 10)
+        back = self.panel.back_button
+        event = SimpleNamespace(widget=view, x_root=back.winfo_rootx() + 20, y_root=back.winfo_rooty() + 10)
+        with patch('ledger_viewer.issue_store.save_issue', side_effect=OSError('保存失败')):
+            self.app.drag.motion(event)
+            self.app.drag._open_directory()
+            self.assertEqual(self.panel.view_mode, 'detail')
+            self.assertTrue(self.app.drag.active)
+            self.app.drag.cancel()
+            self.assertFalse(self.app.drag.active)
+            self.assertIsNone(self.app.grab_current())
+        self.assertTrue(self.panel.flush())
 
     def test_issue_autosave_and_page_switch_preserve_current_problem(self):
         self.panel.notes.insert('end', '核对银行流水')
@@ -213,11 +367,31 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.assertIn('当前草稿', self.root.clipboard_get())
         self.assertEqual(self.panel.notes.get('1.0', 'end-1c'), '另一份笔记')
 
-    def test_drag_between_issues_copies_reference(self):
+    def test_drag_between_issues_survives_hover_return_to_directory(self):
         self.panel.add_to_issue(self.issue, self.key)
         self.root.update()
-        self.drag_to(self.panel.voucher_view, next(iter(self.panel.rows)), self.issue_target(self.other))
+        view = self.panel.voucher_view
+        row = next(iter(self.panel.rows))
+        box = view.bbox(row, '#0')
+        view.event_generate('<ButtonPress-1>', x=box[0] + 45, y=box[1] + 10)
+        back = self.panel.back_button
+        x, y = back.winfo_rootx() + 30, back.winfo_rooty() + 10
+        view.event_generate('<B1-Motion>', x=x-view.winfo_rootx(), y=y-view.winfo_rooty(), rootx=x, rooty=y, state=256)
+        self.assertTrue(self.app.drag.active)
+        self.assertIs(self.app.grab_current(), self.app)
+        done = tk.BooleanVar(value=False)
+        self.root.after(550, lambda: done.set(True))
+        self.root.wait_variable(done)
+        self.assertEqual(self.panel.view_mode, 'directory')
+        self.assertFalse(view.winfo_ismapped())
+        x, y = self.issue_target(self.other)
+        self.app.event_generate('<B1-Motion>', x=x-self.app.winfo_rootx(), y=y-self.app.winfo_rooty(), rootx=x, rooty=y, state=256)
+        self.app.event_generate('<ButtonRelease-1>', x=x-self.app.winfo_rootx(), y=y-self.app.winfo_rooty(), rootx=x, rooty=y)
+        self.root.update()
+        self.assertFalse(self.app.drag.active)
+        self.assertIsNone(self.app.grab_current())
         self.assertEqual([item['count'] for item in issues.list_issues(self.app.store)], [1, 1])
+        self.assertEqual(self.panel.view_mode, 'directory')
 
     def test_edge_hover_opens_panel_and_cancel_restores_closed_state(self):
         self.panel.hide()
@@ -279,15 +453,25 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.assertFalse(self.panel.rows)
         self.assertEqual(self.panel.voucher_view.get_children(), ())
 
-    def test_editor_toggle_and_tool_state_remain_visible_when_docked(self):
-        self.assertTrue(self.panel.editor_toggle.winfo_ismapped())
-        self.assertTrue(self.app.workbench_button.instate(['selected']))
-        self.assertFalse(self.panel.more_button.winfo_ismapped())
-        self.panel.editor_toggle.invoke()
+    def test_directory_uses_full_height_without_editor_or_horizontal_scroll(self):
+        self.panel.back_to_directory()
+        for index in range(30):
+            issues.create_issue(self.app.store, f'核查问题{index:02d}')
+        self.panel.refresh_directory()
         self.root.update()
-        self.assertTrue(self.panel.editor_expanded)
-        self.assertTrue(self.panel.editor_holder.winfo_ismapped())
-        self.assertGreater(self.panel.voucher_view.winfo_height(), 40)
+        self.assertTrue(self.app.workbench_button.instate(['selected']))
+        self.assertEqual(tuple(self.panel.tree['columns']), ('title', 'count'))
+        self.assertTrue(self.panel.directory_body.winfo_ismapped())
+        self.assertFalse(self.panel.details_body.winfo_ismapped())
+        self.assertFalse(self.panel.voucher_view.winfo_ismapped())
+        self.assertGreater(self.panel.tree.winfo_height(), self.panel.issue_body.winfo_height() * .65)
+        self.assertEqual(self.panel.tree.cget('xscrollcommand'), '')
+        visible = {self.panel.tree.identify_row(y) for y in range(0, self.panel.tree.winfo_height(), 4)} - {''}
+        self.assertGreaterEqual(len(visible), 10)
+        self.root.set_font_size(18, persist=False)
+        self.root.update()
+        visible = {self.panel.tree.identify_row(y) for y in range(0, self.panel.tree.winfo_height(), 4)} - {''}
+        self.assertGreaterEqual(len(visible), 7)
 
     def test_calculator_can_coexist_with_detached_workbench(self):
         self.panel.detach()

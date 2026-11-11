@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 import re
 from pathlib import Path
 
@@ -32,15 +31,15 @@ def validate_rules(rules):
                 raise ValueError('百炼正反判断条件不能为空')
     if any(not isinstance(rules.get(k), str) or not rules[k].strip() for k in ('common', 'insufficient')):
         raise ValueError('基础提示词及信息不足提问不能为空')
-    for field, label in (('thresholds', 'Jev'), ('bailian_thresholds', '百炼')):
-        values = rules.get(field, {})
-        if set(values) != {'谨慎', '中', '宽松'} or any(type(v) not in (int, float) or not math.isfinite(v) for v in values.values()):
-            raise ValueError(f'需要三个有效的{label}阈值')
-        if not 0 <= values['谨慎'] < values['中'] < values['宽松'] <= 100:
-            raise ValueError(f'{label}阈值必须满足 0 ≤ 谨慎 < 中 < 宽松 ≤ 100')
+    if rules.get('decision_mode') != 'prompt':
+        raise ValueError('专项审查须按提示词直接判断')
 
 
 def save_rules(store, rules):
+    rules = copy.deepcopy(rules)
+    rules['decision_mode'] = 'prompt'
+    rules.pop('thresholds', None)
+    rules.pop('bailian_thresholds', None)
     validate_rules(rules)
     with store.db:
         return store.db.execute('INSERT INTO jev_rules(body_json) VALUES(?)',
@@ -51,10 +50,10 @@ def load_rules(store):
     row = store.db.execute("SELECT id,body_json FROM jev_rules WHERE json_extract(body_json,'$.profile')=? ORDER BY id DESC LIMIT 1", (PROFILE,)).fetchone()
     if row:
         rules = json.loads(row['body_json'])
-        changed = False
-        if 'bailian_thresholds' not in rules:
-            rules['bailian_thresholds'] = default_rules()['bailian_thresholds']
-            changed = True
+        changed = rules.get('decision_mode') != 'prompt' or 'thresholds' in rules or 'bailian_thresholds' in rules
+        rules['decision_mode'] = 'prompt'
+        rules.pop('thresholds', None)
+        rules.pop('bailian_thresholds', None)
         defaults = {topic['id']: topic for topic in default_rules()['topics']}
         for topic in rules['topics']:
             if 'bailian_criteria' in defaults[topic['id']] and 'bailian_criteria' not in topic:

@@ -12,13 +12,12 @@ from threading import Thread
 from .background import check_cancelled
 from .store import LedgerStore
 from .importer import format_money
-from .dd_features import load_basis_overrides, load_config, materiality_bases, save_basis_overrides, save_config
 from .jev_mapping import get_api_key
 from .deepseek_mapping import get_api_key as get_deepseek_key
 from .bailian_review import get_api_key as get_bailian_key, DEFAULT_ENDPOINT as BAILIAN_ENDPOINT
 from .specialist_rules import ACCOUNTS, default_rules, load_rules, save_rules
 from .related_parties import party_names, role_grouped_names
-from .jev_review import (BOUNDARY, PRIORITY_LABELS, STATUS_LABELS, SEND_FIELDS,
+from .jev_review import (BOUNDARY, STATUS_LABELS, SEND_FIELDS,
     ReviewJob, active_job, batch_counts, batch_info, discard_preview,
     is_uncertain, prepare_batch, preview_page, recover_interrupted,
     refresh_staleness, save_feedback, test_connection, voucher_results, voucher_result_context)
@@ -26,13 +25,12 @@ from .jev_review import (BOUNDARY, PRIORITY_LABELS, STATUS_LABELS, SEND_FIELDS,
 CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、往来单位、辅助核算、非零一侧的借贷金额，'
     '以及当前账套尽调主体名单中的名称与身份（不含备注），默认依次使用阿里百炼决策模型、TypeSafe Jev、DeepSeek Flash（不思考）；可在设置中改为 Jev 优先，前一级未配置或余额不足时尝试下一级，'
     '用于筛选值得法律尽调律师进一步查看的凭证。\n\n'
-    '同时随每张凭证发送程序预计算的“程序特征”事实：命中尽调主体名单、摘要关键词线索、'
-    '金额关注线与占净资产／总资产／营业收入比例（如设置）、科目单笔金额分位、交易对手金额排名。'
+    '同时提供本次启用的专项问题及明确取得的历史背景。'
     '这些字段可能包含客户商业信息或个人信息。请确认本次使用符合项目的保密安排，并仅选择本次审查所需的范围。'
     '先按所选科目定位凭证，再发送同一凭证的完整分录作为上下文；不会因此扫描银行存款等其他科目的全部凭证。'
     '部分凭证附带同名往来单位90日内同币种、同金额的历史候选（最多20条，不证明资金流转或长期挂账）。'
     '原始账簿文件不会上传，具体发送内容可在下方逐页预览。\n\n'
-    '百炼与 Jev 分别保留每题概率、使用各自阈值；DeepSeek 保留有原文依据的分类，不换算为决策概率。最终由律师核查。')
+    '三种模型均逐项按提示词判断命中或不命中，不另设分档、概率阈值或金额占比筛选。最终由律师核查。')
 
 
 def wrapped_label(parent, **options):
@@ -92,7 +90,7 @@ class ReviewRulesDialog(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.store = app.store
-        self.title('AI 抽查提示词与专项审查设置 · 当前账套')
+        self.title('AI审查设置 · 当前账套')
         self.geometry('820x720')
         self.minsize(660, 560)
         self.transient(app)
@@ -104,27 +102,7 @@ class ReviewRulesDialog(tk.Toplevel):
         self.model = tk.StringVar(value=self.rules['model'])
         ttk.Combobox(model_row, textvariable=self.model, values=('jev-1.13.0', 'jev-1.14.0'), state='readonly', width=16).pack(side='left', padx=8)
         ttk.Label(model_row, text='默认百炼优先；可在偏好设置改为 Jev 优先').pack(side='left')
-        thresholds = ttk.LabelFrame(self, text='Jev 专用命中阈值（每题概率×100；不适用于 DeepSeek）', padding=8)
-        thresholds.pack(fill='x', padx=10)
-        self.thresholds = {}
-        for label in ('谨慎', '中', '宽松'):
-            ttk.Label(thresholds, text=label).pack(side='left', padx=(5, 3))
-            var = tk.StringVar(value=str(self.rules['thresholds'][label]))
-            self.thresholds[label] = var
-            ttk.Entry(thresholds, textvariable=var, width=7).pack(side='left', padx=(0, 16))
-        bailian_thresholds = ttk.LabelFrame(self, text='百炼专用命中阈值（独立校准，不套用 Jev 阈值）', padding=8)
-        bailian_thresholds.pack(fill='x', padx=10)
-        self.bailian_thresholds = {}
-        for label in ('谨慎', '中', '宽松'):
-            ttk.Label(bailian_thresholds, text=label).pack(side='left', padx=(5, 3))
-            var = tk.StringVar(value=str(self.rules['bailian_thresholds'][label]))
-            self.bailian_thresholds[label] = var
-            ttk.Entry(bailian_thresholds, textvariable=var, width=7).pack(side='left', padx=(0, 16))
-        ttk.Label(self, text='必须保持：谨慎 < 中 < 宽松。任一专项问题达到所选档位即进入待核线索；'
-            f'达到“宽松”显示为“{PRIORITY_LABELS["宽松"]}”、“中”为“{PRIORITY_LABELS["中"]}”、'
-            f'“谨慎”为“{PRIORITY_LABELS["谨慎"]}”。查看优先级反映尽调相关程度，不是法律风险评级，'
-            '概率也不代表违法事实已获证实。', padding=10).pack(anchor='w')
-        self._build_filter_settings()
+        ttk.Label(self, text='逐项按照提示词直接判断命中或不命中，结果由律师核查。', padding=10).pack(anchor='w')
         self.paths = {'基础提示词（三种模型共用）': ('common',), '信息不足提问（百炼／Jev）': ('insufficient',)}
         for i, topic in enumerate(self.rules['topics']):
             title = f"{topic['account']} / {topic['id']} {topic['label']}"
@@ -148,88 +126,6 @@ class ReviewRulesDialog(tk.Toplevel):
         ttk.Button(actions, text='取消', command=self.destroy).pack(side='right', padx=8)
         self.grab_set()
 
-    def _build_filter_settings(self):
-        config = load_config(self.store)
-        bases = materiality_bases(self.store)
-        overrides = load_basis_overrides(self.store)
-        frame = ttk.LabelFrame(self, text='尽调筛选设置（本地计算“程序特征”随每张凭证发送；金额口径是律师筛选参数，不是审计重大性标准）', padding=8)
-        frame.pack(fill='x', padx=10, pady=(0, 4))
-        row = ttk.Frame(frame)
-        row.pack(fill='x')
-        self.filter_vars = {}
-        ttk.Label(row, text='金额关注线（元）').pack(side='left', padx=(5, 3))
-        amount_var = tk.StringVar(value=str(config['amount_yuan']) if config['amount_yuan'] is not None else '')
-        self.filter_vars['amount_yuan'] = amount_var
-        ttk.Entry(row, textvariable=amount_var, width=12).pack(side='left', padx=(0, 6))
-        ttk.Label(row, foreground='#555', text='默认不设；填写后达到该金额的凭证会标注“达到金额关注线”，机械凭证也会因此恢复送审').pack(side='left')
-        detail_row = ttk.Frame(frame)
-        detail_row.pack(fill='x', pady=(5, 0))
-        for label, key, width in (
-            ('净资产关注比例 %', 'net_asset_pct', 8),
-            ('总资产关注比例 %', 'asset_pct', 8),
-            ('营业收入关注比例 %', 'revenue_pct', 8),
-        ):
-            ttk.Label(detail_row, text=label).pack(side='left', padx=(5, 3))
-            var = tk.StringVar(value=str(config[key]))
-            self.filter_vars[key] = var
-            ttk.Entry(detail_row, textvariable=var, width=width).pack(side='left', padx=(0, 10))
-        ttk.Label(detail_row, text='科目分位线').pack(side='left', padx=(5, 3))
-        self.percentile = tk.StringVar(value='P99' if config['percentile'] >= 0.99 else 'P95')
-        ttk.Combobox(detail_row, textvariable=self.percentile, values=('P95', 'P99'), state='readonly', width=5).pack(side='left')
-        basis_row = ttk.Frame(frame)
-        basis_row.pack(fill='x', pady=(6, 0))
-        detected = []
-        for key, title in (('net_assets', '净资产'), ('total_assets', '总资产'), ('revenue', '营业收入')):
-            detected.append(f"{title} {format_money(bases[key])}" if key in bases else f"{title} 未取得")
-        ttk.Label(basis_row, text='占比基数自动取最新资产负债表／利润表：' + '；'.join(detected)
-            + '。可手动覆盖（元，留空用自动值）：', wraplength=760).pack(anchor='w')
-        fields = ttk.Frame(basis_row)
-        fields.pack(anchor='w')
-        self.basis_vars = {}
-        for key, title in (('net_assets', '净资产'), ('total_assets', '总资产'), ('revenue', '营业收入')):
-            ttk.Label(fields, text=title).pack(side='left', padx=(5, 3))
-            var = tk.StringVar(value=str(overrides[key] // 100) if key in overrides else '')
-            self.basis_vars[key] = var
-            ttk.Entry(fields, textvariable=var, width=14).pack(side='left', padx=(0, 12))
-        ttk.Label(frame, foreground='#555', text='折旧／摊销／汇兑等机械凭证默认不送 AI，但命中主体名单、摘要线索或达到金额关注线（如设置）时会自动恢复送审。',
-            wraplength=760).pack(anchor='w', pady=(4, 0))
-
-    def _parse_number(self, var, title, minimum=0.0):
-        try:
-            value = float(var.get())
-        except (TypeError, ValueError):
-            raise ValueError(f'{title}必须是数字')
-        if value < minimum:
-            raise ValueError(f'{title}不能小于 {minimum}')
-        return value
-
-    def _save_filter_settings(self):
-        from .importer import money
-        amount_text = self.filter_vars['amount_yuan'].get().strip()
-        config = {'amount_yuan': None}  # 留空＝默认不设金额关注线
-        if amount_text:
-            config['amount_yuan'] = self._parse_number(self.filter_vars['amount_yuan'], '金额关注线')
-            if config['amount_yuan'] <= 0:
-                raise ValueError('金额关注线必须是正数，或留空表示不设')
-        for key, title in (('net_asset_pct', '净资产关注比例'), ('asset_pct', '总资产关注比例'),
-                           ('revenue_pct', '营业收入关注比例')):
-            config[key] = self._parse_number(self.filter_vars[key], title)
-        config['percentile'] = 0.99 if self.percentile.get() == 'P99' else 0.95
-        save_config(self.store, config)
-        overrides = {}
-        for key, var in self.basis_vars.items():
-            text = var.get().strip()
-            if not text:
-                continue
-            try:
-                cents = money(text)
-            except ValueError as exc:
-                raise ValueError(f'占比基数：{exc}') from None
-            if cents <= 0:
-                raise ValueError('占比基数只能填正数金额（元），留空表示自动读取')
-            overrides[key] = cents
-        save_basis_overrides(self.store, overrides)
-
     def _value(self, path):
         value = self.rules
         for field in path:
@@ -252,19 +148,12 @@ class ReviewRulesDialog(tk.Toplevel):
     def _reset(self):
         self.rules = default_rules()
         self.model.set(self.rules['model'])
-        for label, var in self.bailian_thresholds.items():
-            var.set(str(self.rules['bailian_thresholds'][label]))
-        for label, var in self.thresholds.items():
-            var.set(str(self.rules['thresholds'][label]))
         self.editor.delete('1.0', 'end')
         self.editor.insert('1.0', self._value(self.paths[self.current]))
 
     def _save(self):
         self._stash()
         try:
-            self._save_filter_settings()
-            self.rules['thresholds'] = {label: float(var.get()) for label, var in self.thresholds.items()}
-            self.rules['bailian_thresholds'] = {label: float(var.get()) for label, var in self.bailian_thresholds.items()}
             self.rules['model'] = self.model.get()
             save_rules(self.store, self.rules)
         except (ValueError, TypeError, AttributeError) as exc:
@@ -389,7 +278,7 @@ class ReviewPanel(ttk.Frame):
         selection.pack(fill='x', padx=6)
         self.review_accounts = {name: tk.BooleanVar(value=False) for name in ACCOUNTS}
         for index, (name, var) in enumerate(self.review_accounts.items()):
-            ttk.Checkbutton(selection, text=name, variable=var).grid(row=index // 3, column=index % 3, sticky='w', padx=(0, 24))
+            ttk.Checkbutton(selection, text=name, variable=var, style='Sampling.TCheckbutton').grid(row=index // 3, column=index % 3, sticky='w', padx=(0, 24))
         self.progress = tk.StringVar(value='只抽查所选科目的凭证；默认百炼优先，Jev 可选，DeepSeek Flash 兜底。')
         wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050).pack(fill='x')
         self.progress_bar = ttk.Progressbar(self, mode='determinate', maximum=1, value=0)
@@ -401,7 +290,7 @@ class ReviewPanel(ttk.Frame):
         batch_row = ttk.Frame(self.options, padding=(6, 0))
         batch_row.pack(fill='x')
         ttk.Label(batch_row, text='历史批次').pack(side='left', padx=(0, 5))
-        ttk.Button(batch_row, text='审查规则与筛选设置', command=app.open_review_rules).pack(side='right', padx=5)
+        ttk.Button(batch_row, text='AI审查设置', command=app.open_review_rules).pack(side='right', padx=5)
         self.batch = tk.StringVar()
         self.batch_combo = ttk.Combobox(batch_row, textvariable=self.batch, state='readonly')
         self.batch_combo.pack(fill='x', expand=True)
@@ -416,12 +305,8 @@ class ReviewPanel(ttk.Frame):
             self.lane_buttons[value] = button
         filters = ttk.Frame(self.options, padding=6)
         filters.pack(fill='x')
-        self.tier, self.account, self.period = (tk.StringVar(value=v) for v in ('谨慎', '', '全部期间'))
+        self.account, self.period = (tk.StringVar(value=v) for v in ('', '全部期间'))
         self.show_ignored = tk.BooleanVar(value=False)
-        ttk.Label(filters, text='范围').pack(side='left')
-        tier = ttk.Combobox(filters, textvariable=self.tier, values=('宽松', '中', '谨慎'), state='readonly', width=6)
-        tier.pack(side='left', padx=5)
-        tier.bind('<<ComboboxSelected>>', self._tier_change)
         ttk.Label(filters, text='科目').pack(side='left')
         entry = ttk.Entry(filters, textvariable=self.account, width=13)
         entry.pack(side='left', padx=5)
@@ -433,7 +318,7 @@ class ReviewPanel(ttk.Frame):
         ttk.Checkbutton(filters, text='显示已忽略', variable=self.show_ignored, command=self.refresh_rows).pack(side='left', padx=5)
         ttk.Button(filters, text='筛选', command=self.refresh_rows).pack(side='left')
         self.view = tree(self, [('voucher', '凭证', 140), ('account', '抽查科目', 110), ('amount', '金额', 110), ('summary', '摘要', 200),
-            ('categories', '审查问题 / 编号', 190), ('priority', '查看优先级', 80), ('score', '决策概率%', 75),
+            ('categories', '审查问题 / 编号', 260),
             ('analysis', '状态', 110)])
         self.view.bind('<Double-1>', self.open_detail)
         bottom = ttk.Frame(self, padding=6)
@@ -562,11 +447,6 @@ class ReviewPanel(ttk.Frame):
         self.batch_id = self.batch_options.get(self.batch.get())
         self.refresh()
 
-    def _tier_change(self, _event=None):
-        if self.app.store:
-            self.app.store.save_setting('jev_tier', self.tier.get())
-        self.refresh_rows()
-
     def refresh(self):
         store = self.app.store
         if not store or self.preparing or self.app.import_busy:
@@ -578,7 +458,6 @@ class ReviewPanel(ttk.Frame):
         if self.batch_id not in self.batch_options.values():
             self.batch_id = batches[0]['id'] if batches else None
         self.batch.set(next((label for label, value in self.batch_options.items() if value == self.batch_id), '尚无审查批次'))
-        self.tier.set(store.setting('jev_tier', '谨慎'))
         if store.large_book() and not self._visible():
             self._rows_dirty = True
             return
@@ -641,7 +520,7 @@ class ReviewPanel(ttk.Frame):
         self._last_refresh = time.monotonic()
         self._rows_dirty = False
         store, batch_id = self.app.store, self.batch_id
-        options = (self.tier.get(), self.lane.get(), self.account.get().strip(),
+        options = (None, self.lane.get(), self.account.get().strip(),
             self.category_ids.get(self.category.get(), ''),
             '' if self.period.get() == '全部期间' else self.period.get(), self.show_ignored.get())
         cache = self._totals_cache
@@ -698,8 +577,7 @@ class ReviewPanel(ttk.Frame):
             currencies = group['sort_currency']
             amount = f"{format_money(group['sort_amount'], comma=True)} {currencies[0]}" if len(currencies) == 1 and currencies[0] != '币种未注明' else (f"{format_money(group['sort_amount'], comma=True)}" if len(currencies) == 1 else '多币种')
             values = (voucher, '、'.join(group.get('review_accounts', [])) or '历史通用审查', amount, '；'.join(dict.fromkeys(r['local']['summary'] for r in group['hits'])),
-                '、'.join(f'{identifier} {label}' for identifier, label, _sources, _probability in group['categories']) or '待分类', group['priority'],
-                f"{group['score']:.1f}" if group['score'] is not None else '—', '、'.join(states))
+                '、'.join(f'{identifier} {label}' for identifier, label, _sources, _probability in group['categories']) or '待分类', '、'.join(states))
             if item in old_items:
                 self.view.item(item, values=values)
                 old_items.remove(item)
@@ -707,7 +585,7 @@ class ReviewPanel(ttk.Frame):
                 self.view.insert('', 'end', iid=item, values=values)
             self.view.move(item, '', index)
         self.view.delete(*old_items)
-        self.count_label.set(f'共 {total:,} 张 · 第 {self.result_offset // 500 + 1}/{max(1, (total + 499) // 500)} 页 · 双击查看完整凭证。查看优先级不是法律风险评级。')
+        self.count_label.set(f'共 {total:,} 张 · 第 {self.result_offset // 500 + 1}/{max(1, (total + 499) // 500)} 页 · 双击查看完整凭证及提示词命中事项。')
 
     def open_detail(self, _event=None):
         selected = self.view.selection()
@@ -770,7 +648,7 @@ class ReviewDetail(tk.Toplevel):
         info = batch_info(self.store, panel.batch_id)
         self.rules = json.loads(info['body_json'])
         models = list(dict.fromkeys(json.loads(row['response_json'])['model'] for row in group['lines'] if row['response_json']))
-        wrapped_label(self, text=f"尽调分类：{'、'.join(group['labels'])} · 查看优先级：{group['priority'] or '—'} · "
+        wrapped_label(self, text=f"命中事项：{'、'.join(group['labels'])} · "
             f"规则 v{info['rule_id']} · 实际模型 {'、'.join(models) or '尚未调用'}\n{BOUNDARY}", padding=10, wraplength=760).grid(row=0, column=0, sticky='ew')
         self.detail_panes = ttk.Panedwindow(self, orient='vertical')
         self.detail_panes.grid(row=1, column=0, sticky='nsew', padx=10)
@@ -884,7 +762,7 @@ class ReviewDetail(tk.Toplevel):
             if row['response_json']:
                 data = json.loads(row['response_json'])
                 if data.get('provider') == 'deepseek':
-                    parts = [f"实际模型：{data['model']} · DeepSeek 明确命中（不显示决策概率） · 信息不足：{data['insufficient']}"]
+                    parts = [f"实际模型：{data['model']} · DeepSeek 明确命中 · 信息不足：{data['insufficient']}"]
                     if data.get('fallback_reason'):
                         parts.append('切换原因：' + data['fallback_reason'])
                     topics = {topic['id']: topic for topic in self.rules['topics']}
@@ -895,18 +773,19 @@ class ReviewDetail(tk.Toplevel):
                     return '\n'.join(parts)
                 answers = data['answers']
                 provider_label = '百炼' if data.get('provider') == 'bailian' else 'Jev'
-                parts = [f"实际模型：{data['model']} · {provider_label} 相关度：{row['score']:.1f}（当前问题的最高概率） · "
-                         f"信息不足：{row['insufficient']:.3f} · 分段数：{data.get('chunks', 1)} · "
+                parts = [f"实际模型：{data['model']} · {provider_label} · "
+                         f"信息不足：{'是' if is_uncertain(row) else '否'} · 分段数：{data.get('chunks', 1)} · "
                          f"{'缓存复用，未再次请求' if row['cached'] else '本次请求'}"]
-                if 'review' in answers:
-                    parts.append(f"整体判断（是否值得律师查看）：{answers['review']['noul']:.3f}")
+                accepted = {item[0] for item in self.group['categories']}
                 for topic in self.rules['topics']:
-                    probability = answers.get(topic['id'], {}).get('noul', 0)
-                    thresholds = self.rules.get('bailian_thresholds', self.rules['thresholds']) if data.get('provider') == 'bailian' else self.rules['thresholds']
-                    if topic['id'] in answers and probability >= thresholds['谨慎'] / 100:
-                        parts.append(f"命中分类：{topic['label']}（{probability:.3f}{'，分类待确认' if probability < 0.65 else ''}）\n建议核查：{topic['advice']}")
+                    answer = answers.get(topic['id'])
+                    if answer is None:
+                        continue
+                    hit = answer.get('choice') == 'hit' if answer.get('type') == 'choice' else topic['id'] in accepted
+                    parts.append(f"{topic['id']} {topic['label']}：{'命中' if hit else '不命中'}"
+                        + (f"\n建议核查：{topic['advice']}" if hit else ''))
                 if data.get('chunks', 1) > 1:
-                    parts.append('分段结果：各分类信号取片段最大值，不是整张凭证的总体概率；需人工结合全文复核。')
+                    parts.append('分段结果：合并各片段明确命中的事项，需人工结合全文复核。')
                 parts.append(f"同次请求用量（{data.get('shared_entries', 1)} 条分录共用，不逐行累加）：{data['usage']}")
                 parts += ['', '完整结构化回答：', json.dumps(answers, ensure_ascii=False, indent=2)]
                 return '\n'.join(parts)

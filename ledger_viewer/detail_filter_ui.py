@@ -68,6 +68,11 @@ class DetailFilterDialog(tk.Toplevel):
         self.field.pack(fill="x", pady=(4, 10))
         self.field.set(self.field_labels[column])
         self.field.bind("<<ComboboxSelected>>", self._field_changed)
+        sorting = ttk.Frame(body)
+        sorting.pack(fill="x", pady=(0, 10))
+        ttk.Button(sorting, text="↑ 升序（从小到大）", command=lambda: self._sort(False)).pack(side="left")
+        ttk.Button(sorting, text="↓ 降序（从大到小）", command=lambda: self._sort(True)).pack(side="left", padx=(6, 0))
+        ttk.Separator(body).pack(fill="x", pady=(0, 10))
         self.editor = ttk.Frame(body)
         self.editor.pack(fill="x")
         self.error = tk.StringVar(self)
@@ -190,6 +195,12 @@ class DetailFilterDialog(tk.Toplevel):
 
     def _clear(self):
         self._commit(None)
+
+    def _sort(self, descending):
+        column = self.column
+        self.destroy()
+        if self.app.store is self.store:
+            self.app.sort_details(column, descending=descending)
 
     def _apply(self):
         if self.column == "period":

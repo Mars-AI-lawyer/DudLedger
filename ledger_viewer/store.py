@@ -6,7 +6,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .detail_filters import EntryCondition, VALID_DATE_SQL, compare_original_amount, condition_clause
+from .detail_filters import EntryCondition, TEXT_COLUMNS, VALID_DATE_SQL, compare_original_amount, condition_clause
 from .importer import (
     DISPOSITION_IMPORT,
     DISPOSITION_PENDING,
@@ -97,6 +97,17 @@ CREATE INDEX IF NOT EXISTS ix_report_rows_source ON report_rows(source_id,row_no
 
 def account_key(code: str, name: str) -> str:
     return "C:" + code if code else "N:" + name
+
+
+ENTRY_SORT_COLUMNS = {
+    **{key: (expression,) for key, expression in TEXT_COLUMNS.items()},
+    "date": ("e.entry_date",),
+    "year": ("CAST(e.fiscal_year AS INTEGER)", "e.fiscal_year"),
+    "period": ("CAST(e.fiscal_year AS INTEGER)", "CAST(e.period AS INTEGER)"),
+    "voucher": ("e.voucher_type", "CAST(e.voucher_no AS INTEGER)", "e.voucher_no"),
+    "debit": ("e.debit_cents",), "credit": ("e.credit_cents",),
+    "original": ("e.original_amount COLLATE ledger_decimal",),
+}
 
 
 class LedgerStore:
@@ -524,13 +535,21 @@ class LedgerStore:
             args.extend((year, year, period))
         return " AND ".join(clauses), args
 
-    @staticmethod
-    def _entry_order(sort_by: str, descending: bool) -> str:
-        columns = {"date": "e.entry_date", "voucher": "e.voucher_type,CAST(e.voucher_no AS INTEGER),e.voucher_no",
-                   "code": "a.code", "name": "a.name", "summary": "e.summary",
-                   "debit": "e.debit_cents", "credit": "e.credit_cents"}
+    def _entry_order(self, sort_by: str, descending: bool) -> str:
+        if sort_by == "original" and not getattr(self, "_has_decimal_collation", False):
+            from .importer import decimal_amount
+            def compare(left, right):
+                def key(raw):
+                    try:
+                        return (1, decimal_amount(raw))
+                    except ValueError:
+                        return (0, raw)
+                a, b = key(left), key(right)
+                return (a > b) - (a < b)
+            self.db.create_collation("ledger_decimal", compare)
+            self._has_decimal_collation = True
         direction = " DESC" if descending else " ASC"
-        return ",".join(column + direction for column in columns.get(sort_by, "e.entry_date").split(",")) + ",e.id"
+        return ",".join(column + direction for column in ENTRY_SORT_COLUMNS.get(sort_by, ENTRY_SORT_COLUMNS["date"])) + ",e.id"
 
     def entry(self, entry_id: int) -> sqlite3.Row | None:
         return self.db.execute("""SELECT e.*,a.code,a.name,s.filename,s.sheet,s.original_path

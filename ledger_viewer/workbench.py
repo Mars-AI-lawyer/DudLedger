@@ -171,7 +171,8 @@ class RightWorkbench(ttk.Frame):
         self.app = app
         self.visible = False
         self.mode = 'issues'
-        self.width = 480
+        self.width = 440
+        self.calculator_width = 320
         self.active_tools = self.last_tools = None
         self.current = self.draft = None
         self.issue_rows, self.rows, self.offsets = {}, {}, {}
@@ -185,8 +186,11 @@ class RightWorkbench(ttk.Frame):
         self.limit = 100
         self.pinned = {}
         self.host_layouts = {}
-        self.editor_expanded = False
-        self.editor_ratio = .62
+        self.view_mode = 'directory'
+        self.selected_issue_id = None
+        self.directory_y = 0
+        self.directory_query = ''
+        self.detail_tab = 'vouchers'
         self.search = tk.StringVar()
         self.search.trace_add('write', lambda *_: self.refresh_directory())
         self.feedback = tk.StringVar(value='新建问题后，勾选或拖入凭证。')
@@ -206,8 +210,11 @@ class RightWorkbench(ttk.Frame):
         self.calc_source_label = ttk.Label(self.calc_body, textvariable=self.calc_source, padding=8, wraplength=420)
         self.calc_source_label.grid(row=0, column=0, sticky='ew')
         self.calc_hosts = {}
-        self.grip = ttk.Frame(app.content, width=5, cursor='sb_h_double_arrow')
+        self.grip = ttk.Frame(app.content, width=8, cursor='sb_h_double_arrow', style='Resize.TFrame')
+        self.grip.bind('<ButtonPress-1>', self._start_resize)
         self.grip.bind('<B1-Motion>', self._resize)
+        self.grip.bind('<ButtonRelease-1>', self._finish_resize)
+        app.navigation_tooltip.attach(self.grip, lambda: '左右拖动，调整工具区宽度')
         self._build_issues(self)
 
     @property
@@ -229,35 +236,37 @@ class RightWorkbench(ttk.Frame):
             ttk.Button(header, text='停靠右侧', command=self.dock).pack(side='right')
             ttk.Button(header, text='收起', command=self.hide_issues).pack(side='right', padx=4)
             self.issue_body.pack(fill='both', expand=True)
-        self.outer = ttk.Panedwindow(self.issue_body, orient='horizontal' if self.detached else 'vertical')
-        self.outer.grid(row=1, column=0, sticky='nsew')
-        directory = ttk.Frame(self.outer, padding=6)
-        header = ttk.Frame(directory)
+
+        self.pages = ttk.Frame(self.issue_body)
+        self.pages.grid(row=1, column=0, sticky='nsew')
+        self.pages.columnconfigure(0, weight=1)
+        self.pages.rowconfigure(0, weight=1)
+        self.directory_body = ttk.Frame(self.pages, padding=6)
+        self.directory_body.grid(row=0, column=0, sticky='nsew')
+        header = ttk.Frame(self.directory_body)
         header.pack(fill='x')
         ttk.Label(header, text='尽调问题').pack(side='left')
         ttk.Button(header, text='新建问题', command=self.new_issue).pack(side='right')
-        search = ttk.Entry(directory, textvariable=self.search)
+        search = ttk.Entry(self.directory_body, textvariable=self.search)
         search.pack(fill='x', pady=4)
-        self.tree = self._table(directory, [('title', '问题', 200), ('status', '状态', 80), ('count', '凭证', 50)], height=3)
+        self.tree = self._table(self.directory_body, [('title', '问题名称', 300), ('count', '凭证数', 72)], height=14, horizontal=False)
         self.tree.column('title', stretch=True)
+        self.tree.column('count', anchor='e', minwidth=65)
         CellTooltip(self.tree)
         self.tree.bind('<<TreeviewSelect>>', self._select)
+        self.tree.bind('<Double-1>', self._open_selected_issue)
+        self.tree.bind('<Return>', self._open_selected_issue)
         self.tree.bind('<Button-3>', self._issue_menu)
         self.tree.bind('<Button-2>', self._issue_menu)
         self.tree.tag_configure('drop', background='#DDEBDD')
-        self.outer.add(directory, weight=1)
-        right = ttk.Frame(self.outer)
-        self.outer.add(right, weight=4)
-        self.split = ttk.Panedwindow(right, orient='vertical')
-        self.split.pack(fill='both', expand=True)
-        self.split.bind('<Configure>', self._fit_editor_panes)
-        self.split.bind('<ButtonRelease-1>', self._remember_editor_ratio)
-        vouchers = ttk.Frame(self.split, padding=6)
-        header = ttk.Frame(vouchers)
-        header.pack(fill='x')
-        self.issue_title = tk.StringVar(value='请选择问题')
-        ttk.Label(header, textvariable=self.issue_title, wraplength=280).pack(side='left')
-        more = ttk.Menubutton(header, text='更多')
+
+        self.details_body = ttk.Frame(self.pages, padding=6)
+        self.details_body.grid(row=0, column=0, sticky='nsew')
+        controls = ttk.Frame(self.details_body)
+        controls.pack(fill='x')
+        self.back_button = ttk.Button(controls, text='‹ 返回问题列表', command=self.back_to_directory)
+        self.back_button.pack(side='left')
+        more = ttk.Menubutton(controls, text='更多')
         more.pack(side='right')
         menu = tk.Menu(more, tearoff=False)
         menu.add_command(label='加入其他问题…', command=lambda: self.choose_issue(self.voucher_selection.action_keys()))
@@ -268,7 +277,19 @@ class RightWorkbench(ttk.Frame):
         menu.add_command(label='重读已保存问题…', command=lambda: self.reload_issue(self.issue_id) if self.issue_id else None)
         menu.add_command(label='删除当前问题…', command=lambda: self.remove_issue(self.issue_id) if self.issue_id else None)
         more.configure(menu=menu)
-        self.voucher_view = self._table(vouchers, [('date', '日期', 80), ('voucher', '凭证号', 72), ('summary', '摘要', 116), ('amount', '金额', 116), ('status', '状态', 120)], height=7)
+        self.issue_title = tk.StringVar(value='请选择问题')
+        self.caption = ttk.Label(self.details_body, textvariable=self.issue_title, wraplength=440, padding=(0, 5))
+        self.caption.pack(fill='x')
+        self.details_body.bind('<Configure>', lambda e: self.caption.configure(wraplength=max(150, e.width - 12)))
+        self.detail_tabs = ttk.Notebook(self.details_body)
+        self.detail_tabs.pack(fill='both', expand=True)
+        self.vouchers_page = ttk.Frame(self.detail_tabs)
+        self.record_page = ttk.Frame(self.detail_tabs)
+        self.detail_tabs.add(self.vouchers_page, text='相关凭证')
+        self.detail_tabs.add(self.record_page, text='问题记录')
+        self.detail_tabs.bind('<<NotebookTabChanged>>', self._detail_tab_changed)
+        vouchers = self.vouchers_page
+        self.voucher_view = self._table(vouchers, [('date', '日期', 80), ('voucher', '凭证号', 72), ('summary', '摘要', 116), ('amount', '金额', 116), ('status', '状态', 120)], height=12)
         self.voucher_view.column('summary', stretch=True)
         self.voucher_view.column('amount', anchor='e')
         self.voucher_tools = TableTools(self.voucher_view, set(), show_stats=False)
@@ -279,14 +300,9 @@ class RightWorkbench(ttk.Frame):
         self.voucher_tools.menu.add_separator()
         self.voucher_tools.menu.add_command(label='移除所选关联', command=self.remove_selected_links)
         self.more_button = ttk.Button(vouchers, text='加载更多凭证', command=lambda: self.load_issue(self.issue_id, more=True))
-        self.more_button.pack(side='bottom', anchor='e', pady=2, before=self.voucher_view.master)
-        self.split.add(vouchers, weight=5)
-        self.editor_holder = ttk.Frame(self.split)
-        editor_toggle = ttk.Button(right, text='问题描述与核查笔记 ▾', command=self.toggle_editor)
-        editor_toggle.pack(side='bottom', fill='x', before=self.split)
-        self.editor_toggle = editor_toggle
-        self.canvas = tk.Canvas(self.editor_holder, highlightthickness=0, width=1, height=170, background='#FAF9F5')
-        scroll = ttk.Scrollbar(self.editor_holder, command=self.canvas.yview)
+
+        self.canvas = tk.Canvas(self.record_page, highlightthickness=0, width=1, height=1, background='#FAF9F5')
+        scroll = ttk.Scrollbar(self.record_page, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=scroll.set)
         self.canvas.pack(side='left', fill='both', expand=True)
         scroll.pack(side='right', fill='y')
@@ -295,20 +311,19 @@ class RightWorkbench(ttk.Frame):
         self.detail.bind('<Configure>', lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
         self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfigure(self.detail_window, width=e.width))
         self.canvas.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
-        if self.editor_expanded:
-            self.split.add(self.editor_holder, weight=2)
         ttk.Label(self.issue_body, textvariable=self.feedback, style='Hint.TLabel', wraplength=440, padding=6).grid(row=2, column=0, sticky='ew')
         self.empty_detail()
         if hasattr(self.app, 'drag'):
             self.app.drag.attach(self.voucher_view, lambda row: self.rows[row][1])
+            if self.app.drag.active:
+                self.app.drag.capture_widgets(host.winfo_toplevel())
         self.refresh_directory()
-        if self.issue_id and self.app.store:
-            self.edit_issue(self.issue_id)
-        self._update_editor_label()
-        self.issue_body.after_idle(self._initial_sashes)
+        if self.issue_id and self.app.store and self.view_mode == 'detail':
+            self.edit_issue(self.issue_id, tab=self.detail_tab, reveal=False)
+        self._display_issue_view()
 
     @staticmethod
-    def _table(parent, columns, height=5):
+    def _table(parent, columns, height=5, horizontal=True):
         holder = ttk.Frame(parent)
         holder.pack(fill='both', expand=True)
         holder.columnconfigure(0, weight=1)
@@ -318,39 +333,60 @@ class RightWorkbench(ttk.Frame):
             view.heading(key, text=title)
             view.column(key, width=width, minwidth=60, stretch=False)
         y = ttk.Scrollbar(holder, command=view.yview)
-        x = ttk.Scrollbar(holder, orient='horizontal', command=view.xview)
-        view.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+        view.configure(yscrollcommand=y.set)
         view.grid(row=0, column=0, sticky='nsew')
         y.grid(row=0, column=1, sticky='ns')
-        x.grid(row=1, column=0, sticky='ew')
+        if horizontal:
+            x = ttk.Scrollbar(holder, orient='horizontal', command=view.xview)
+            view.configure(xscrollcommand=x.set)
+            x.grid(row=1, column=0, sticky='ew')
         return view
 
-    def _initial_sashes(self):
-        if self.outer.winfo_exists():
-            self.outer.sashpos(0, 245 if self.detached else 145)
-        self._fit_editor_panes()
-
-    def _fit_editor_panes(self, _event=None):
-        if self.editor_expanded and len(self.split.panes()) > 1:
-            height = self.split.winfo_height()
-            if height > 125:
-                self.split.sashpos(0, max(60, min(height - 65, int(height * self.editor_ratio))))
-
-    def _remember_editor_ratio(self, _event=None):
-        if self.editor_expanded and len(self.split.panes()) > 1:
-            self.editor_ratio = self.split.sashpos(0) / max(1, self.split.winfo_height())
-
-    def _update_editor_label(self):
-        self.editor_toggle.configure(text='问题描述与核查笔记 ' + ('▾' if self.editor_expanded else '▸'))
-
-    def toggle_editor(self):
-        self.editor_expanded = not self.editor_expanded
-        if self.editor_expanded:
-            self.split.add(self.editor_holder, weight=2)
-            self.issue_body.after_idle(self._fit_editor_panes)
+    def _display_issue_view(self):
+        if self.view_mode == 'detail':
+            self.directory_body.grid_remove()
+            self.details_body.grid(row=0, column=0, sticky='nsew')
         else:
-            self.split.forget(self.editor_holder)
-        self._update_editor_label()
+            self.details_body.grid_remove()
+            self.directory_body.grid(row=0, column=0, sticky='nsew')
+            self.tree.yview_moveto(self.directory_y)
+
+    def back_to_directory(self):
+        if not self.flush():
+            return False
+        if self.view_mode == 'directory':
+            self.directory_y = self.tree.yview()[0]
+        self.view_mode = 'directory'
+        self._display_issue_view()
+        return True
+
+    def _open_selected_issue(self, event=None):
+        if event is not None and event.type == tk.EventType.ButtonPress:
+            row = self.tree.identify_row(event.y)
+            if not row:
+                return 'break'
+            self.selected_issue_id = int(row[2:])
+        if self.selected_issue_id is not None:
+            self.edit_issue(self.selected_issue_id)
+        return 'break'
+
+    def _detail_tab_changed(self, _event=None):
+        selected = self.detail_tabs.select()
+        tab = 'record' if selected == str(self.record_page) else 'vouchers'
+        if tab == self.detail_tab:
+            return
+        if not self.flush():
+            previous = self.record_page if self.detail_tab == 'record' else self.vouchers_page
+            self.detail_tabs.select(previous)
+            return
+        self.detail_tab = tab
+
+    def _update_issue_caption(self):
+        if self.issue_id not in self.issue_rows:
+            return
+        item = self.issue_rows[self.issue_id]
+        self.issue_title.set(f'{item["title"]} · {item["count"]} 张凭证')
+        self.detail_tabs.tab(self.vouchers_page, text=f'相关凭证（{item["count"]}）')
 
     def _clear_detail(self):
         if self.draft:
@@ -377,7 +413,9 @@ class RightWorkbench(ttk.Frame):
         frame.columnconfigure(0, weight=1)
         window = canvas.create_window(0, 0, window=frame, anchor='nw')
         frame.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(window, width=e.width))
+        def resize(event):
+            canvas.itemconfigure(window, width=event.width, height=max(event.height, frame.winfo_reqheight()))
+        canvas.bind('<Configure>', resize)
         canvas.bind('<MouseWheel>', lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
         self.calc_hosts[name] = holder
         return frame
@@ -399,7 +437,7 @@ class RightWorkbench(ttk.Frame):
             if context == name:
                 frame.grid(row=1, column=0, sticky='nsew')
                 tools.panel.grid(row=0, column=0, sticky='nsew')
-                tools.set_compact_width(None)
+                tools.set_compact_width(self.calculator_width - 8)
             else:
                 frame.grid_remove()
         self.calc_source.set(f'计算来源：{name}')
@@ -433,11 +471,13 @@ class RightWorkbench(ttk.Frame):
             return self.show()
         return self.hide() if self.visible and self.mode == 'issues' else self.show()
 
-    def show(self):
+    def show(self, reset_directory=True):
         if not self.app.store:
             self.app.status.set('请先打开账套。')
             return False
         if not self.flush():
+            return False
+        if reset_directory and not self.back_to_directory():
             return False
         if self.detached:
             self.window.title('问题工作台 · ' + self.app.book_name.get())
@@ -483,7 +523,9 @@ class RightWorkbench(ttk.Frame):
         self.host_layouts[self.detached] = {'tree_y': self.tree.yview()[0], 'x': self.voucher_view.xview()[0], 'columns': {key: self.voucher_view.column(key, 'width') for key in self.voucher_view['columns']}}
         old_scroll = self.voucher_view.yview()[0]
         old_checks = set(self.voucher_selection.checked)
-        old_sashes = [self.split.sashpos(i) for i in range(max(0, len(self.split.panes()) - 1))]
+        directory_y = self.tree.yview()[0] if self.view_mode == 'directory' else self.directory_y
+        selected_issue = self.selected_issue_id
+        record_y = self.canvas.yview()[0]
         if self.draft:
             self.draft.dispose()
         self.issue_body.destroy()
@@ -510,6 +552,10 @@ class RightWorkbench(ttk.Frame):
             self.visible = True
             self.calc_body.grid_remove()
         self._detach_blocked = False
+        self.selected_issue_id = selected_issue
+        self.directory_y = directory_y
+        self.refresh_directory()
+        self._display_issue_view()
         self.voucher_selection.checked = old_checks
         self.voucher_selection.refresh()
         def restore():
@@ -521,30 +567,34 @@ class RightWorkbench(ttk.Frame):
                     for key, width in layout['columns'].items():
                         self.voucher_view.column(key, width=width)
                     self.voucher_view.xview_moveto(layout['x'])
-                for i, position in enumerate(old_sashes):
-                    if i + 1 < len(self.split.panes()):
-                        self.split.sashpos(i, position)
+                self.tree.yview_moveto(directory_y)
+                self.canvas.yview_moveto(record_y)
         self.issue_body.after_idle(restore)
         self.app._resize_workspace()
         return True
 
     def detach(self):
-        return self.show() if self.detached else self._rehost(True)
+        return self.show(reset_directory=False) if self.detached else self._rehost(True)
 
     def dock(self):
-        if self.app.content.winfo_width() < self.width + 525:
+        if self.app.content.winfo_width() < self.width + self._main_minimum() + 8:
             self.feedback.set('主窗口空间不足，请加宽主窗口后停靠。')
             return False
         return self._rehost(False)
 
     def layout(self):
-        self.grid_remove()
-        self.grip.grid_remove()
+        if hasattr(self.app, 'table_fit'):
+            self.app.table_fit.schedule()
         if not self.visible:
+            self.grid_remove()
+            self.grip.grid_remove()
             self._nav_state()
             return
         available = self.app.content.winfo_width()
-        if self.mode == 'issues' and not self.detached and not self._detach_blocked and 1 < available < self.width + 525:
+        minimum = self._main_minimum()
+        if self.mode == 'issues' and not self.detached and not self._detach_blocked and 1 < available < 320 + minimum + 8:
+            self.grid_remove()
+            self.grip.grid_remove()
             if not getattr(self, '_detach_job', None):
                 def detach():
                     self._detach_job = None
@@ -554,14 +604,27 @@ class RightWorkbench(ttk.Frame):
                             self.layout()
                 self._detach_job = self.after_idle(detach)
             return
-        if available >= self.width + 525:
+        if available >= self.width + minimum + 8:
             self._detach_blocked = False
-        width = self.width if self.mode == 'issues' else min(360, max(260, available - 525))
+        desired = self.width if self.mode == 'issues' else self.calculator_width
+        width = min(desired, max(320 if self.mode == 'issues' else 260, available - minimum - 8))
         self.configure(width=width)
         self.grid_propagate(False)
         self.grip.grid(row=0, column=1, sticky='ns')
         self.grid(row=0, column=2, sticky='nsew')
+        if self.mode == 'calculator' and self.active_tools:
+            self.active_tools.set_compact_width(width - 8)
+            self.calc_source_label.configure(wraplength=width - 16)
         self._nav_state()
+
+    def _main_minimum(self):
+        return self.app.table_fit.minimum_width() if hasattr(self.app, 'table_fit') else 525
+
+    def _start_resize(self, event):
+        self._resize_start = (event.x_root, self.winfo_width())
+
+    def _finish_resize(self, _event):
+        self._resize_start = None
 
     def _nav_state(self):
         if hasattr(self.app, 'workbench_button'):
@@ -572,8 +635,15 @@ class RightWorkbench(ttk.Frame):
             self.app.calculator_button.state(['selected' if self.visible and self.mode == 'calculator' else '!selected'])
 
     def _resize(self, event):
-        maximum = max(420, self.app.content.winfo_width() - 525)
-        self.width = max(420, min(maximum, self.app.content.winfo_rootx() + self.app.content.winfo_width() - event.x_root))
+        minimum = 320 if self.mode == 'issues' else 260
+        maximum = max(minimum, self.app.content.winfo_width() - self._main_minimum() - 8)
+        start = getattr(self, '_resize_start', None)
+        desired = start[1] + start[0] - event.x_root if start else self.app.content.winfo_rootx() + self.app.content.winfo_width() - event.x_root
+        width = max(minimum, min(maximum, desired))
+        if self.mode == 'issues':
+            self.width = width
+        else:
+            self.calculator_width = width
         self.layout()
 
     def reset(self):
@@ -581,6 +651,11 @@ class RightWorkbench(ttk.Frame):
             self.draft.dispose()
         self.draft = None
         self.current = self.issue_id = None
+        self.selected_issue_id = None
+        self.view_mode = 'directory'
+        self.detail_tab = 'vouchers'
+        self.directory_y = 0
+        self.directory_query = ''
         self.limit = 100
         self._detach_blocked = False
         self.pinned.clear()
@@ -601,6 +676,7 @@ class RightWorkbench(ttk.Frame):
         self.voucher_selection.clear()
         self.empty_detail()
         self.refresh_directory()
+        self._display_issue_view()
 
     def flush(self):
         if self.draft and not self.draft.flush():
@@ -614,30 +690,38 @@ class RightWorkbench(ttk.Frame):
         items = data.list_issues(self.app.store)
         self.issue_rows = {item['id']: item for item in items}
         needle = self.search.get().strip().lower()
+        changed_query = needle != self.directory_query
+        self.directory_query = needle
+        position = 0 if changed_query else (self.tree.yview()[0] if self.view_mode == 'directory' else self.directory_y)
         desired = {f'i:{item["id"]}': item for item in items if not needle or needle in (item['title'] + item['status']).lower()}
         self.loading_selection = True
-        for node in self.tree.get_children():
-            if node not in desired:
-                self.tree.delete(node)
-        for node, item in desired.items():
-            values = (item['title'], item['status'], item['count'])
-            if self.tree.exists(node):
-                self.tree.item(node, values=values)
-            else:
-                self.tree.insert('', 'end', iid=node, values=values)
-        if self.issue_id and self.tree.exists(f'i:{self.issue_id}'):
-            self.tree.selection_set(f'i:{self.issue_id}')
-        self.loading_selection = False
+        try:
+            for node in self.tree.get_children():
+                if node not in desired:
+                    self.tree.delete(node)
+            for index, (node, item) in enumerate(desired.items()):
+                values = (item['title'], item['count'])
+                if self.tree.exists(node):
+                    self.tree.item(node, values=values)
+                else:
+                    self.tree.insert('', 'end', iid=node, values=values)
+                self.tree.move(node, '', index)
+            node = f'i:{self.selected_issue_id}'
+            if self.selected_issue_id is not None and self.tree.exists(node):
+                self.tree.selection_set(node)
+                self.tree.focus(node)
+            self.tree.yview_moveto(position)
+            self.directory_y = position
+        finally:
+            self.loading_selection = False
+        self._update_issue_caption()
 
     def _select(self, _event=None):
         if self.loading_selection:
             return
         selected = self.tree.selection()
         if selected:
-            issue_id = int(selected[0][2:])
-            if issue_id != self.issue_id:
-                if not self.edit_issue(issue_id) and self.issue_id and self.tree.exists(f'i:{self.issue_id}'):
-                    self.tree.selection_set(f'i:{self.issue_id}')
+            self.selected_issue_id = int(selected[0][2:])
 
     def load_issue(self, issue_id, more=False):
         from .voucher_summary import summaries_for_keys
@@ -679,29 +763,27 @@ class RightWorkbench(ttk.Frame):
         if title is not None:
             try:
                 issue_id = data.create_issue(self.app.store, title)
+                self.selected_issue_id = issue_id
+                self.search.set('')
                 self.show()
-                self.edit_issue(issue_id)
-                if not self.editor_expanded:
-                    self.toggle_editor()
+                self.refresh_directory()
+                self.tree.see(f'i:{issue_id}')
             except Exception as exc:
                 messagebox.showerror('无法创建问题', str(exc), parent=self.app)
 
-    def edit_issue(self, issue_id):
+    def edit_issue(self, issue_id, tab='vouchers', reveal=True):
         if not self.flush():
             return False
         item = data.get_issue(self.app.store, issue_id)
+        if reveal and self.view_mode == 'directory':
+            self.directory_y = self.tree.yview()[0]
+        if reveal:
+            self.selected_issue_id = issue_id
         if self.issue_id != issue_id:
             self.limit = 100
         self.issue_id = issue_id
         self._clear_detail()
         self.current = ("issue", issue_id)
-        node = f"i:{issue_id}"
-        if self.tree.exists(node):
-            self.selected_node = node
-            self.loading_selection = True
-            self.tree.selection_set(node)
-            self.loading_selection = False
-            self.tree.see(node)
         self.title_var = tk.StringVar(value=item["title"])
         self.status_var = tk.StringVar(value=item["status"])
         ttk.Label(self.detail, text="问题名称").pack(anchor="w")
@@ -730,9 +812,13 @@ class RightWorkbench(ttk.Frame):
         for widget in (title, status, self.description, self.notes):
             self.draft.watch(widget)
         self.feedback.set("已保存")
-        self.issue_title.set(item["title"])
         self.refresh_directory()
         self.load_issue(issue_id)
+        self.detail_tab = tab
+        self.detail_tabs.select(self.record_page if tab == 'record' else self.vouchers_page)
+        if reveal:
+            self.view_mode = 'detail'
+            self._display_issue_view()
         return True
 
     def reload_issue(self, issue_id):
@@ -741,7 +827,7 @@ class RightWorkbench(ttk.Frame):
             self.clipboard_clear()
             self.clipboard_append("\n\n".join(value))
             self.draft.baseline = value
-            self.edit_issue(issue_id)
+            self.edit_issue(issue_id, tab='record')
 
     def remove_issue(self, issue_id):
         if not self.flush():
@@ -750,11 +836,16 @@ class RightWorkbench(ttk.Frame):
         if messagebox.askyesno("删除问题", f'删除“{item["title"]}”及其 {item["count"]} 张凭证的关联？\n凭证关注及原始数据保留。', parent=self.app):
             data.delete_issue(self.app.store, issue_id)
             self.pinned.pop(issue_id, None)
-            self.current = self.issue_id = None
-            self.voucher_view.delete(*self.voucher_view.get_children())
-            self.rows.clear()
-            self.issue_title.set("请选择问题")
-            self.empty_detail()
+            if self.selected_issue_id == issue_id:
+                self.selected_issue_id = None
+            if self.issue_id == issue_id:
+                self.current = self.issue_id = None
+                self.voucher_view.delete(*self.voucher_view.get_children())
+                self.rows.clear()
+                self.empty_detail()
+                self.issue_title.set('请选择问题')
+                self.view_mode = 'directory'
+                self._display_issue_view()
             self.refresh_directory()
 
     def choose_issue(self, keys):
@@ -787,9 +878,10 @@ class RightWorkbench(ttk.Frame):
         ttk.Button(dialog, text='加入所选问题', command=add).pack(pady=6)
         ttk.Button(dialog, text='新建问题并加入…', command=create).pack(pady=(0, 8))
         choices.bind('<Double-1>', lambda _e: add())
-        if self.issue_id:
+        target_id = self.selected_issue_id if self.view_mode == 'directory' else self.issue_id
+        if target_id:
             for index, item in enumerate(items):
-                if item['id'] == self.issue_id:
+                if item['id'] == target_id:
                     choices.selection_set(index)
         dialog.grab_set()
 
@@ -806,15 +898,12 @@ class RightWorkbench(ttk.Frame):
             return False
 
     def _after_add(self, issue_id, keys, result):
-        self.show()
-        self.refresh_directory()
+        if not self.issues_visible:
+            self.show()
         self.pinned[issue_id] = tuple(keys)
-        self.edit_issue(issue_id)
-        for row, pair in self.rows.items():
-            if pair[1] in keys:
-                self.voucher_view.selection_set(row)
-                self.voucher_view.see(row)
-                break
+        self.refresh_directory()
+        if self.view_mode == 'detail' and self.issue_id == issue_id:
+            self.load_issue(issue_id)
         for key in keys:
             self.app.note_hub.broadcast(key)
             self.app.update_mark_indicators(key)
@@ -897,7 +986,7 @@ class RightWorkbench(ttk.Frame):
             return
         issue_id = int(node[2:])
         menu = tk.Menu(self.tree, tearoff=False)
-        menu.add_command(label='编辑问题', command=lambda: self.edit_issue(issue_id))
+        menu.add_command(label='编辑问题记录', command=lambda: self.edit_issue(issue_id, tab='record'))
         menu.add_command(label='删除问题…', command=lambda: self.remove_issue(issue_id))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -917,10 +1006,20 @@ class VoucherDrag:
         self.tip = None
         self.hover_job = self.hover_target = self.highlight = None
         self.restore_hidden = False
+        self.grab_owner = None
+        self.captured_widgets = set()
         for event, callback in (('<ButtonPress-1>', self.press), ('<B1-Motion>', self.motion), ('<ButtonRelease-1>', self.release), ('<Escape>', self.cancel)):
             app.bind_class(self.tag, event, callback)
         # Escape still cancels if focus moved into a different toplevel.
         app.bind_all('<Escape>', self.cancel, add='+')
+
+    def capture_widgets(self, widget):
+        """Capture before native widget handlers, including across hidden source views."""
+        if self.tag not in widget.bindtags():
+            widget.bindtags((self.tag, *widget.bindtags()))
+            self.captured_widgets.add(widget)
+        for child in widget.winfo_children():
+            self.capture_widgets(child)
 
     def attach(self, view, key_for_row, tree_handle=True):
         self.sources[view] = key_for_row
@@ -1001,14 +1100,18 @@ class VoucherDrag:
             self.tip.attributes('-topmost', True)
             self.tip_label = ttk.Label(self.tip, padding=6, relief='solid')
             self.tip_label.pack()
-            # A local Tk grab receives native motion/release across same-process windows.
-            view.grab_set()
+            # Keep the grab on a stable toplevel while the source table is hidden.
+            self.capture_widgets(self.app)
+            self.grab_owner = view.winfo_toplevel()
+            self.grab_owner.grab_set()
         target = self.target_at(event.x_root, event.y_root)
         label = '松开取消'
         if isinstance(target, int):
             label = '加入：' + panel.issue_rows[target]['title']
         elif target == 'choose':
             label = '松开选择问题'
+        elif target == 'back':
+            label = '停留返回问题列表，继续拖入其他问题'
         self.tip_label.configure(text=f'{len(keys)} 张凭证 · {label}')
         self.tip.geometry(f'{event.x_root + 16:+d}{event.y_root + 18:+d}')
         self._hover(target, event.x_root, event.y_root)
@@ -1022,13 +1125,17 @@ class VoucherDrag:
         panel = self.app.workbench
         if not panel.issues_visible:
             return None
-        if self.contains(panel.tree, x, y):
-            node = panel.tree.identify_row(y - panel.tree.winfo_rooty())
-            return int(node[2:]) if node.startswith('i:') else 'choose'
-        if self.contains(panel.voucher_view, x, y):
-            return panel.issue_id or 'choose'
-        if self.contains(panel.issue_body, x, y):
-            return 'choose'
+        if panel.view_mode == 'directory':
+            if self.contains(panel.tree, x, y):
+                node = panel.tree.identify_row(y - panel.tree.winfo_rooty())
+                return int(node[2:]) if node.startswith('i:') else 'choose'
+            if self.contains(panel.directory_body, x, y):
+                return 'choose'
+        else:
+            if self.contains(panel.back_button, x, y):
+                return 'back'
+            if self.contains(panel.voucher_view, x, y):
+                return panel.issue_id or 'choose'
         return None
 
     def _hover(self, target, x, y):
@@ -1047,6 +1154,8 @@ class VoucherDrag:
             self.hover_target = hover
             if hover == 'edge':
                 self.hover_job = self.app.after(450, self._open_edge)
+            elif hover == 'back':
+                self.hover_job = self.app.after(450, self._open_directory)
         for view in (panel.tree, panel.voucher_view):
             if self.contains(view, x, y):
                 local = y - view.winfo_rooty()
@@ -1059,6 +1168,11 @@ class VoucherDrag:
         self.hover_job = None
         if self.active:
             self.app.workbench.show()
+
+    def _open_directory(self):
+        self.hover_job = None
+        if self.active:
+            self.app.workbench.back_to_directory()
 
     def release(self, event):
         if not self.pending:
@@ -1098,11 +1212,19 @@ class VoucherDrag:
         if self.highlight and panel.tree.exists(self.highlight):
             panel.tree.item(self.highlight, tags=())
         self.highlight = self.hover_target = None
-        if self.pending:
+        if self.grab_owner is not None:
             try:
-                self.pending[0].grab_release()
+                self.grab_owner.grab_release()
             except tk.TclError:
                 pass
+            self.grab_owner = None
+        for widget in self.captured_widgets:
+            try:
+                if widget.winfo_exists():
+                    widget.bindtags(tuple(tag for tag in widget.bindtags() if tag != self.tag))
+            except tk.TclError:
+                pass
+        self.captured_widgets.clear()
         self.pending = None
         self.active = False
         if self.tip:

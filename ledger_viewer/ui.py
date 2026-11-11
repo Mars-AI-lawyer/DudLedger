@@ -34,7 +34,8 @@ from .navigation import NavigationTooltip, navigation_icon
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, PrecheckStats, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
 from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, build_party_index, indexed_party_match
-from .store import LedgerStore
+from .store import ENTRY_SORT_COLUMNS, LedgerStore
+from .table_layout import WorkspaceTableFit
 from .theme import configure_theme
 from .table_tools import TableTools
 from .voucher_selection import VoucherSelection, CellTooltip, selection_bar
@@ -100,7 +101,7 @@ VIEW_COLUMNS = {
 DEFAULT_COLUMNS = {
     "balance": ["code", "name", "pd", "pc", "cd", "cc", "n"],
     "detail": ["date", "voucher", "name", "summary", "counterparty", "debit", "credit", "marked"],
-    "voucher": ["code", "name", "summary", "debit", "credit", "source"],
+    "voucher": ["code", "name", "summary", "debit", "credit"],
 }
 
 DETAIL_FILTER_LABELS = {key: title for key, title, _ in VIEW_COLUMNS["detail"] if key in FILTER_COLUMNS}
@@ -111,7 +112,7 @@ MONEY_COLUMN_KEYS = {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc", "debit", "c
 
 def visible_columns(kind: str, saved: list[str] | None) -> list[str]:
     """Keep known columns in table order; use the default for stale preferences."""
-    available = [key for key, _, _ in VIEW_COLUMNS[kind]]
+    available = [key for key, _, _ in VIEW_COLUMNS[kind] if kind != "voucher" or key != "source"]
     if saved is None:
         return DEFAULT_COLUMNS[kind].copy()
     selected = set(saved)
@@ -185,13 +186,14 @@ class ColumnDialog(tk.Toplevel):
         self.transient(parent)
         self.resizable(False, False)
         self.on_change = on_change
-        self.vars = {key: tk.BooleanVar(value=key in selected) for key, _, _ in VIEW_COLUMNS[kind]}
+        columns = [item for item in VIEW_COLUMNS[kind] if kind != "voucher" or item[0] != "source"]
+        self.vars = {key: tk.BooleanVar(value=key in selected) for key, _, _ in columns}
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="勾选要显示的列，修改后立即生效。", foreground="#555").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        for index, (key, label, _) in enumerate(VIEW_COLUMNS[kind]):
+        for index, (key, label, _) in enumerate(columns):
             ttk.Checkbutton(body, text=label, variable=self.vars[key], command=self._apply).grid(row=1 + index // 2, column=index % 2, sticky="w", padx=(0, 26), pady=4)
-        row = 1 + (len(VIEW_COLUMNS[kind]) + 1) // 2
+        row = 1 + (len(columns) + 1) // 2
         ttk.Button(body, text="全部显示", command=self._show_all).grid(row=row, column=0, sticky="w", pady=(14, 0))
         ttk.Button(body, text="恢复默认", command=lambda: self._select(DEFAULT_COLUMNS[kind])).grid(row=row, column=1, sticky="w", pady=(14, 0))
         ttk.Button(body, text="完成", command=self.destroy).grid(row=row + 1, column=1, sticky="e", pady=(14, 0))
@@ -316,14 +318,28 @@ class SettingsDialog(tk.Toplevel):
         jev_actions.pack(fill="x", pady=6)
         from .jev_ui import launch_connection_test
         ttk.Button(jev_actions, text="测试 Jev（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
-        ttk.Button(jev_actions, text="AI 抽查提示词与专项审查设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
+        ttk.Button(jev_actions, text="AI审查设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
         ttk.Label(body, text="AI 建议列使用 DeepSeek Flash。" + PRIVACY_NOTICE
             + "保存密钥后可直接建议列；也可取消 AI 改用手动核对。完整账簿的解析、预检和疑点处理均在本机完成。",
             foreground="#555", wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
         ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
+        self.storage_toggle = ttk.Button(body, text="› 账套辅助文件说明", style="Quiet.TButton", command=self._toggle_storage_help)
+        self.storage_toggle.pack(anchor="w", pady=(12, 0))
+        self.storage_help = ttk.Label(body, text=(
+            "账套打开时，同目录可能出现 .sqlite-wal 和 .sqlite-shm 两个辅助文件。\n"
+            ".sqlite-wal：写入日志，暂存尚未合并到账套主文件的最新修改。\n"
+            ".sqlite-shm：共享内存索引，帮助多个读取任务协调访问写入日志。\n"
+            "它们由软件自动管理，正常关闭所有使用该账套的窗口后通常会自动清理。"
+            "使用中请勿手动删除；复制或移动账套前，请先在软件内关闭该账套，"
+            "避免遗漏仍保存在日志中的修改。"), style="Hint.TLabel", wraplength=550, justify="left")
         footer = ttk.Frame(self, padding=(16, 8))
         footer.pack(fill='x')
         ttk.Button(footer, text="保存并完成", command=self._finish).pack(side='right')
+
+    def _toggle_storage_help(self):
+        expanded = bool(self.storage_help.winfo_manager())
+        self.storage_help.pack_forget() if expanded else self.storage_help.pack(anchor="w", pady=(5, 0))
+        self.storage_toggle.configure(text=("›" if expanded else "⌄") + " 账套辅助文件说明")
 
     def _build_bailian_settings(self, host):
         ttk.Label(host, text='百炼 API Key（decision-model-preview）').pack(anchor='w')
@@ -2038,7 +2054,7 @@ class App(tk.Toplevel):
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
         self.detail_view.bind("<<TreeviewSelect>>", self._update_detail_mark, add="+")
-        for key in ("date", "voucher", "code", "name", "summary", "debit", "credit"):
+        for key in ENTRY_SORT_COLUMNS:
             self.detail_view.heading(key, command=lambda column=key: self.sort_details(column))
         self._update_detail_headings()
         self.report_views: dict[str, ttk.Treeview] = {}
@@ -2061,6 +2077,7 @@ class App(tk.Toplevel):
                 columns += [("right_item", "右侧项目", 230), ("right_a", "右侧金额 1", 125), ("right_b", "右侧金额 2", 125), ("right_c", "右侧金额 3", 125)]
             columns += [("source", "来源行", 260)]
             self.report_views[kind] = tree(frame, columns)
+            self.report_views[kind].configure(displaycolumns=[key for key, _, _ in columns if key != "source"])
             self.report_tools[kind] = TableTools(self.report_views[kind], {"left_a", "left_b", "left_c", "right_a", "right_b", "right_c"},
                 panel_parent=self.workbench.calculator_host(REPORT_LABELS[kind]),
                 on_toggle=lambda reveal, report_kind=kind: self.workbench.set_calculator(self.report_tools[report_kind], REPORT_LABELS[report_kind], reveal))
@@ -2125,6 +2142,9 @@ class App(tk.Toplevel):
         ttk.Button(self.mark_note_frame, text="重读已保存备注…", command=lambda: self.note_hub.reload(self.mark_note)).pack(anchor="e")
         from .jev_ui import ReviewPanel
         self.review_panel = ReviewPanel(frames[7], self)
+        self.table_fit = WorkspaceTableFit(self, [self.summary_view, self.detail_view, *self.report_views.values(), self.mark_view])
+        for view in (self.summary_view, self.detail_view, *self.report_views.values()):
+            CellTooltip(view)
         self.tabs.bind("<<NotebookTabChanged>>", self._page_changed)
         ttk.Label(self.workspace, textvariable=self.status, anchor="w", style="Status.TLabel").pack(fill="x")
         self.welcome = ttk.Frame(self.content)
@@ -2252,6 +2272,7 @@ class App(tk.Toplevel):
             image=self.sidebar_icons["collapse" if collapse else "expand"],
         )
         self.workbench.layout()
+        self.table_fit.schedule()
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self)
@@ -2280,7 +2301,7 @@ class App(tk.Toplevel):
         options = tk.Menu(menu, tearoff=False)
         options.add_command(label="偏好设置…", command=self.open_settings)
         options.add_command(label="新账套默认文件夹…", command=self.choose_book_folder)
-        options.add_command(label="Jev 审查…", command=self.open_settings)
+        options.add_command(label="AI审查设置", command=self.open_settings)
         menu.add_cascade(label="设置", menu=options)
         self.configure(menu=menu)
         for dialog in self.utility_windows.values():
@@ -2313,6 +2334,7 @@ class App(tk.Toplevel):
             view.dashed_grid.schedule()
             if hasattr(view, "cell_tools"):
                 view.cell_tools.schedule()
+        self.table_fit.schedule()
 
     def _open_columns(self, parent: tk.Widget, kind: str) -> None:
         if not self.store:
@@ -2886,8 +2908,10 @@ class App(tk.Toplevel):
         self.detail_descending = False
         self.refresh_details()
 
-    def sort_details(self, column: str) -> None:
-        self.detail_descending = not self.detail_descending if column == self.detail_sort else False
+    def sort_details(self, column: str, descending: bool | None = None) -> None:
+        if column not in ENTRY_SORT_COLUMNS:
+            return
+        self.detail_descending = descending if descending is not None else (not self.detail_descending if column == self.detail_sort else False)
         self.detail_sort = column
         self.refresh_details()
 
@@ -3105,7 +3129,6 @@ class App(tk.Toplevel):
                 display.append("right_b")
             if "right_amount_3" in mapping:
                 display.append("right_c")
-        display.append("source")
         view.configure(displaycolumns=display)
         self.report_info[kind].set(f'{source["filename"]} · {source["sheet"]} · {source["row_count"]} 行 · 框选金额可合计及复制')
         for row in self.store.report_rows(source_id):

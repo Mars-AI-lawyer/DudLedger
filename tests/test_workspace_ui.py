@@ -89,7 +89,7 @@ class WorkspaceUITest(unittest.TestCase):
         self.assertTrue(self.app.sidebar.winfo_ismapped())
         self.assertTrue(self.app.workbench_button.winfo_ismapped())
         self.assertGreaterEqual(view.winfo_width(), 520)
-        self.assertAlmostEqual(view.xview()[0], first)
+        self.assertEqual(view.xview(), (0.0, 1.0))
         self.app.select_page('accounts')
         self.root.update()
         self.assertIs(self.app.workbench.active_tools, self.app.balance_tools)
@@ -100,6 +100,7 @@ class WorkspaceUITest(unittest.TestCase):
         self.root.update()
         self.assertFalse(self.app.workbench.visible)
         self.assertTrue(self.app.sidebar.winfo_ismapped())
+        self.assertAlmostEqual(view.xview()[0], first)
 
 
 if __name__ == "__main__":

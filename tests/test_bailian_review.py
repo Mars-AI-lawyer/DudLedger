@@ -22,7 +22,7 @@ class BailianReviewTest(unittest.TestCase):
         if getattr(self, 'bailian_error', None):
             raise self.bailian_error
         return {'model': 'decision-model-preview', 'answers': {
-            key: {'type':'noul', 'noul': .9 if key in ('OP01', 'OR01', 'PIC01') else .01}
+            key: existing.decision_answer(key in ('OP01', 'OR01', 'PIC01'))
             for key in payload['questions']}, 'usage': {'input_tokens': 100}, 'latency_ms': 52.9}
 
     def run_case(self, scope=None, jev='jev-key', bailian='bailian-key', flash='flash-key'):
@@ -82,17 +82,18 @@ class BailianReviewTest(unittest.TestCase):
         data = json.loads(self.store.db.execute('SELECT response_json FROM jev_results WHERE batch_id=? LIMIT 1', (batch,)).fetchone()[0])
         self.assertIn('业务空间', data['fallback_reason'])
 
-    def test_each_model_uses_its_own_thresholds(self):
+    def test_old_threshold_settings_do_not_override_prompt_decisions(self):
         _, rules = load_rules(self.store)
-        rules['thresholds'] = {'谨慎':95, '中':97, '宽松':99}
-        rules['bailian_thresholds'] = {'谨慎':50, '中':65, '宽松':85}
+        rules['thresholds'] = {'谨慎': 95, '中': 97, '宽松': 99}
+        rules['bailian_thresholds'] = {'谨慎': 95, '中': 97, '宽松': 99}
         save_rules(self.store, rules)
         batch = self.run_case()
-        self.assertEqual(len(voucher_results(self.store, batch)), 1)
-        _, rules = load_rules(self.store)
-        rules['bailian_thresholds'] = {'谨慎':95, '中':97, '宽松':99}
-        save_rules(self.store, rules)
-        self.assertEqual(voucher_results(self.store, batch), [])
+        group = voucher_results(self.store, batch)[0]
+        self.assertIn('OP01', [item[0] for item in group['categories']])
+        self.assertIsNone(group['score'])
+        saved = load_rules(self.store)[1]
+        self.assertNotIn('thresholds', saved)
+        self.assertNotIn('bailian_thresholds', saved)
 
     def test_switching_preferred_model_does_not_reuse_other_model_cache(self):
         self.run_case()
@@ -100,25 +101,32 @@ class BailianReviewTest(unittest.TestCase):
         self.assertEqual(batch_counts(self.store, batch)['cached'], 0)
         self.assertEqual(voucher_results(self.store, batch)[0]['provider'], 'jev')
 
-    def test_older_specialist_rules_gain_bailian_settings_without_overwrite(self):
+    def test_older_rules_migrate_without_overwriting_custom_prompts_or_history(self):
         rules = default_rules()
-        rules.pop('bailian_thresholds')
+        rules.pop('decision_mode')
+        rules['thresholds'] = {'谨慎': 50, '中': 65, '宽松': 85}
+        rules['bailian_thresholds'] = {'谨慎': 40, '中': 60, '宽松': 80}
         rules['common'] += ' 用户原有提示词。'
+        rules['topics'][0]['question'] += ' 用户补充事项。'
         with self.store.db:
             old = self.store.db.execute('INSERT INTO jev_rules(body_json) VALUES(?)', (json.dumps(rules),)).lastrowid
         new, updated = load_rules(self.store)
         self.assertGreater(new, old)
         self.assertEqual(updated['common'], rules['common'])
-        self.assertIn('bailian_thresholds', updated)
-        self.assertNotIn('bailian_thresholds', json.loads(self.store.db.execute('SELECT body_json FROM jev_rules WHERE id=?', (old,)).fetchone()[0]))
+        self.assertEqual(updated['topics'], rules['topics'])
+        self.assertEqual(updated['decision_mode'], 'prompt')
+        self.assertNotIn('thresholds', updated)
+        self.assertNotIn('bailian_thresholds', updated)
+        self.assertEqual(json.loads(self.store.db.execute('SELECT body_json FROM jev_rules WHERE id=?', (old,)).fetchone()[0]), rules)
+        self.assertEqual(load_rules(self.store)[0], new)
 
 
 class BailianTransportTest(unittest.TestCase):
-    def test_31_native_noul_questions_split_at_16_and_usage_aggregates(self):
+    def test_31_native_choice_questions_split_at_16_and_usage_aggregates(self):
         calls = []
         def post(key, payload, endpoint):
             calls.append(payload)
-            return {'model':'decision-model-preview', 'answers':{key:{'type':'noul','noul':.8}
+            return {'model':'decision-model-preview', 'answers':{key:existing.decision_answer(True)
                 for key in payload['questions']}, 'usage':{'input_tokens':11}}
         questions = questions_for(default_rules())
         with bailian_review.DecisionClient(api_key='fake-key', post_fn=post) as client:
@@ -137,7 +145,7 @@ class BailianTransportTest(unittest.TestCase):
         calls = []
         def post(key, payload, endpoint):
             calls.append(payload)
-            return {'model': 'decision-model-preview', 'answers': {key: {'type': 'noul', 'noul': .01}
+            return {'model': 'decision-model-preview', 'answers': {key: existing.decision_answer()
                 for key in payload['questions']}, 'usage': {'input_tokens': 10}}
         rules = default_rules()
         rules['model'] = 'decision-model-preview'
@@ -153,7 +161,7 @@ class BailianTransportTest(unittest.TestCase):
         cancelled = threading.Event()
         def post(key, payload, endpoint):
             cancelled.set()
-            return {'model':'decision-model-preview', 'answers':{key:{'type':'noul','noul':.5}
+            return {'model':'decision-model-preview', 'answers':{key:existing.decision_answer()
                 for key in payload['questions']}, 'usage':{'input_tokens':1}}
         with bailian_review.DecisionClient(api_key='fake', post_fn=post, cancelled=cancelled.is_set) as client:
             with self.assertRaises(bailian_review.ReviewCancelled):
@@ -193,7 +201,7 @@ class BailianTransportTest(unittest.TestCase):
         calls = []
         def post(key, payload, endpoint):
             calls.append(payload)
-            return {'model': 'decision-model-preview', 'answers': {key: {'type': 'noul', 'noul': .01}
+            return {'model': 'decision-model-preview', 'answers': {key: existing.decision_answer()
                 for key in payload['questions']}, 'usage': {'input_tokens': 10}}
         result = bailian_review.test_connection('test-key', post_fn=post)
         self.assertEqual(result['status'], 'success')

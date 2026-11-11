@@ -81,6 +81,20 @@ class DetailFilterQueryTest(unittest.TestCase):
             self.assertEqual([row["凭证号"] for row in csv.DictReader(handle)],
                              [row["voucher_no"] for row in first + second])
 
+    def test_original_amount_sorts_exact_decimals_and_export_uses_same_order(self):
+        filters = dict(sort_by="original", descending=True)
+        reader = LedgerStore.connect_existing(self.store.path)
+        try:
+            rows = reader.entries(**filters)
+            numeric = [row["voucher_no"] for row in rows if row["voucher_no"] in ("1", "2", "4")]
+            self.assertEqual(numeric, ["2", "1", "4"])
+            output = self.path / "原币排序.csv"
+            reader.export_entries(output, **filters)
+        finally:
+            reader.close()
+        with output.open(encoding="utf-8-sig") as handle:
+            self.assertEqual([row["凭证号"] for row in csv.DictReader(handle)], [row["voucher_no"] for row in rows])
+
 
 class DetailFilterUITest(unittest.TestCase):
     def setUp(self):
@@ -163,6 +177,20 @@ class DetailFilterUITest(unittest.TestCase):
         self.assertEqual(self.app.detail_total, 5)
         self.app.clear_filter()
         self.assertEqual(self.app.detail_total, 6)
+
+    def test_filter_dialog_exposes_both_sort_directions_without_clearing_conditions(self):
+        self.app._set_detail_filter("summary", make_condition("summary", "contains", "借款"))
+        self.app._open_detail_filter("debit")
+        self.dialog()._sort(True)
+        self.root.update()
+        self.assertEqual((self.app.detail_sort, self.app.detail_descending), ("debit", True))
+        self.assertEqual(self.app.detail_total, 5)
+        amounts = [self.view.set(row, "debit") for row in self.view.get_children()]
+        self.assertEqual(amounts[:3], ["500.00", "101.00", "100.02"])
+        self.app._open_detail_filter("original")
+        self.dialog()._sort(False)
+        self.assertEqual((self.app.detail_sort, self.app.detail_descending), ("original", False))
+        self.assertIn("summary", self.app.detail_conditions)
 
 
 if __name__ == "__main__":

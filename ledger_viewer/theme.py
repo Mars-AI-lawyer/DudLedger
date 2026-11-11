@@ -1,5 +1,6 @@
 """Warm, quiet desktop styling shared by the ledger workspace and dialogs."""
 
+import tkinter as tk
 from tkinter import font as tkfont, ttk
 
 
@@ -31,6 +32,8 @@ def configure_theme(root):
                     borderwidth=0, relief="flat", focusthickness=1, focuscolor=BORDER)
     style.map("TButton", background=[("disabled", "#F2F0EB"), ("pressed", "#DEDAD1"), ("active", "#E6E3DA")],
               foreground=[("disabled", "#9C9A92")])
+    style.configure('Quiet.TButton', background=CANVAS, foreground=MUTED, padding=(0, 3))
+    style.configure('Resize.TFrame', background=BORDER)
     style.configure("Accent.TButton", background=ACCENT, foreground="#FFFFFF", padding=(12, 7), focuscolor="#E6BCAB")
     style.map("Accent.TButton", background=[("disabled", "#DDD5CB"), ("pressed", "#82412D"), ("active", "#92482F")],
               foreground=[("disabled", "#77766F"), ("!disabled", "#FFFFFF")])
@@ -42,6 +45,25 @@ def configure_theme(root):
     for name in ("TCheckbutton", "TRadiobutton"):
         style.configure(name, background=CANVAS, padding=3)
         style.map(name, background=[("active", CANVAS)])
+    # Clam's native selected indicator is a cross. Use an explicit tick while
+    # retaining Checkbutton keyboard behavior and BooleanVar semantics.
+    root.sampling_check_images = []
+    for selected in (False, True):
+        icon = tk.PhotoImage(master=root, width=22, height=20)
+        icon.put('#FFFFFF', to=(2, 2, 18, 18))
+        border = '#58816B' if selected else '#A8A69E'
+        for box in ((2, 2, 18, 3), (2, 17, 18, 18), (2, 2, 3, 18), (17, 2, 18, 18)):
+            icon.put(border, to=box)
+        if selected:
+            for x, y in ((5, 10), (6, 11), (7, 12), (8, 13), (9, 12), (10, 11), (11, 10), (12, 9), (13, 8), (14, 7)):
+                icon.put('#356348', to=(x, y - 1, x + 2, y + 1))
+        root.sampling_check_images.append(icon)
+    style.element_create('Sampling.check', 'image', root.sampling_check_images[0],
+                         ('selected', root.sampling_check_images[1]))
+    style.layout('Sampling.TCheckbutton', [('Checkbutton.padding', {'sticky': 'nswe', 'children': [
+        ('Sampling.check', {'side': 'left', 'sticky': ''}),
+        ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
+            ('Checkbutton.label', {'sticky': 'nswe'})]})]})])
     style.configure('Segment.TRadiobutton', padding=(12, 7), background=SIDEBAR)
     style.map('Segment.TRadiobutton', background=[('selected', '#E2DED3'), ('active', '#E8E4DB')], foreground=[('selected', '#873F2C')])
     style.configure("TSeparator", background=BORDER, lightcolor=BORDER, darkcolor=BORDER)

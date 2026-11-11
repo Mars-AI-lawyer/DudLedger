@@ -18,6 +18,11 @@ from ledger_viewer.specialist_rules import (ACCOUNTS, account_for, default_rules
 from ledger_viewer.store import LedgerStore
 
 
+def decision_answer(hit=False):
+    return {'type': 'choice', 'choice': 'hit' if hit else 'no_hit',
+            'confidence': 0, 'probabilities': {'hit': .5, 'no_hit': .5}}
+
+
 class JevClient:
     calls = []
     error = None
@@ -37,7 +42,8 @@ class JevClient:
         if self.error:
             raise self.error
         return SimpleNamespace(model_dump=lambda **kw: {'model': self.model,
-            'answers': {key: {'type': 'noul', 'noul': .9 if key in self.hits else .01} for key in questions},
+            'answers': {key: decision_answer(key in self.hits) if question.type == 'choice' else
+                        {'type': 'noul', 'noul': .9 if key in self.hits else .01} for key, question in questions.items()},
             'usage': {'input_tokens': 100, 'output_tokens': 20}})
 
 

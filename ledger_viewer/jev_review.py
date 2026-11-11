@@ -13,7 +13,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from queue import Queue
 
-from typesafe_sdk import Noul, NoulCriteria, TypeSafeClient, RetryPolicy
+from typesafe_sdk import Choice, Noul, NoulCriteria, TypeSafeClient, RetryPolicy
 
 from .analysis_api import iter_entries
 from .background import check_cancelled, cooperate
@@ -318,6 +318,17 @@ def refresh_staleness(store, batch_id):
 
 def questions_for(rules):
     common = rules['common'] + '\n\n'
+    if rules.get('decision_mode') == 'prompt':
+        questions = {}
+        for topic in rules['topics']:
+            criteria = topic.get('bailian_criteria', {}) if rules['model'] == 'decision-model-preview' else {}
+            questions[topic['id']] = Choice(instructions=common + topic['question'], criteria={
+                'hit': criteria.get('true', '输入有当前问题要求的具体依据，符合本问题的命中条件。'),
+                'no_hit': criteria.get('false', '输入不符合本问题的命中条件，缺少具体依据，或属于本问题明确排除的情形。')})
+        questions['insufficient'] = Choice(instructions=common + rules['insufficient'], criteria={
+            'hit': '具体交易文字相互矛盾或严重含糊，无法按本次审查问题分类，需要人工复核。',
+            'no_hit': '凭证足以识别交易，或仅缺少外部附件、账龄、银行流水等补充资料；或者没有具体待核线索。'})
+        return questions
     criteria = NoulCriteria(
         true='输入提供了当前问题要求的具体主体、交易或记录，并满足该问题的命中条件。',
         false='输入没有当前问题要求的具体依据，或只符合其排除情形。不能借用其他审查问题的命中理由。') if rules.get('profile') else None
@@ -361,7 +372,12 @@ def validate_response(data, rules):
         return value
     answers = data['answers']
     keys = response_keys(rules)
+    prompt = rules.get('decision_mode') == 'prompt'
     for key in keys:
+        if prompt:
+            if answers[key].get('type') != 'choice' or answers[key].get('choice') not in ('hit', 'no_hit'):
+                raise ValueError('响应须直接返回命中或不命中')
+            continue
         if answers[key]['type'] != 'noul':
             raise ValueError('响应类型无效')
         number(answers[key]['noul'], 1)
@@ -370,9 +386,18 @@ def validate_response(data, rules):
         raise ValueError('响应用量无效')
     # Persist only documented structured fields, never arbitrary headers/error bodies.
     clean = {'model': data['model'], 'answers': {
-        key: {'type': 'noul', 'noul': answers[key]['noul']} for key in keys},
+        key: ({'type': 'choice', 'choice': answers[key]['choice']} if prompt else
+              {'type': 'noul', 'noul': answers[key]['noul']}) for key in keys},
         'usage': {k: usage[k] for k in ('input_tokens', 'output_tokens')}}
+    if prompt:
+        clean['decision_mode'] = 'prompt'
     return clean
+
+
+def merge_answer(answers):
+    if answers[0]['type'] == 'choice':
+        return {'type': 'choice', 'choice': 'hit' if any(answer['choice'] == 'hit' for answer in answers) else 'no_hit'}
+    return {'type': 'noul', 'noul': max(answer['noul'] for answer in answers)}
 
 
 def error_kind(exc):
@@ -454,7 +479,7 @@ def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClien
             results.append(result['items'][0])
         merged = copy.deepcopy(results[0])
         merged['answers'] = {key: value for data in results for key, value in data['answers'].items() if key != 'insufficient'}
-        merged['answers']['insufficient'] = {'type': 'noul', 'noul': max(data['answers']['insufficient']['noul'] for data in results)}
+        merged['answers']['insufficient'] = merge_answer([data['answers']['insufficient'] for data in results])
         merged['usage'] = {key: sum(data['usage'][key] for data in results) for key in ('input_tokens', 'output_tokens')}
         merged.update(question_batches=len(results), chunks=max(data['chunks'] for data in results),
             needs_manual_review=any(data['needs_manual_review'] for data in results), question_results=results,
@@ -500,7 +525,7 @@ def request_review(payload, rules, api_key, cancel, client_factory=TypeSafeClien
     # Keep each topic's maximum across chunks; never average away a hit.
     merged = copy.deepcopy(results[0])
     for key in response_keys(rules):
-        merged['answers'][key]['noul'] = max(r['answers'][key]['noul'] for r in results)
+        merged['answers'][key] = merge_answer([r['answers'][key] for r in results])
     merged['usage'] = {k: sum(r['usage'][k] for r in results) for k in ('input_tokens', 'output_tokens')}
     merged.update(review_unit='voucher', shared_entries=len(payload), chunks=len(results),
                   needs_manual_review=len(results) > 1,
@@ -603,8 +628,10 @@ class ReviewJob:
                 # A voucher's headline probability is its strongest hit (any category or
                 # the overall review judgment), never an average.
                 deepseek = data.get('provider') == 'deepseek'
-                score = None if deepseek else max(value['noul'] for key, value in data['answers'].items() if key != 'insufficient') * 100
-                insufficient = int(data['insufficient']) if deepseek else data['answers']['insufficient']['noul']
+                prompt = data.get('decision_mode') == 'prompt'
+                score = None if deepseek or prompt else max(value['noul'] for key, value in data['answers'].items() if key != 'insufficient') * 100
+                insufficient = (int(data['insufficient']) if deepseek else
+                    int(data['answers']['insufficient']['choice'] == 'hit') if prompt else data['answers']['insufficient']['noul'])
                 store.db.execute('''UPDATE jev_results SET status='success',response_json=?,score=?,confidence=NULL,
                     insufficient=?,cached=?,attempts=?,error='',updated_at=CURRENT_TIMESTAMP WHERE id=?''',
                     (encode(data), score, insufficient,
@@ -798,8 +825,28 @@ def clear_category_override(store, key, category):
 CATEGORY_SOURCE_LABELS = {'rule': '规则', 'jev': 'Jev', 'bailian': '百炼', 'deepseek': 'DeepSeek Flash', 'user': '用户'}
 
 
+def prompt_hit_ids(data):
+    if data.get('provider') == 'deepseek':
+        return {hit['id'] for hit in data.get('hits', [])}
+    return {key for key, answer in data.get('answers', {}).items()
+            if key != 'insufficient' and answer.get('type') == 'choice' and answer.get('choice') == 'hit'}
+
+
 def effective_categories(successful, rules, features, overrides, *, minimum=None):
     """一张凭证可同时进入多个尽调分类：Jev 命中 ∪ 规则命中 ± 律师调整。"""
+    if rules.get('decision_mode') == 'prompt':
+        sources = {}
+        for row in successful:
+            data = json.loads(row['response_json']) if row['response_json'] else {}
+            for identifier in prompt_hit_ids(data):
+                sources.setdefault(identifier, set()).add(data.get('provider', 'jev'))
+        for identifier, action in overrides.items():
+            if action == 'add':
+                sources.setdefault(identifier, set()).add('user')
+            elif action == 'remove':
+                sources.pop(identifier, None)
+        return [(topic['id'], topic['label'], sources[topic['id']], None)
+                for topic in rules['topics'] if topic['id'] in sources]
     probabilities: dict[str, float] = {}
     sources = {}
     for row in successful:
@@ -851,6 +898,9 @@ def topic_labels(result, rules):
     if not result['response_json']:
         return []
     data = json.loads(result['response_json'])
+    if rules.get('decision_mode') == 'prompt':
+        identifiers = prompt_hit_ids(data)
+        return [(topic['id'], topic['label']) for topic in rules['topics'] if topic['id'] in identifiers]
     if data.get('provider') == 'deepseek':
         identifiers = {hit['id'] for hit in data['hits']}
         return [(topic['id'], topic['label']) for topic in rules['topics'] if topic['id'] in identifiers]
@@ -869,11 +919,13 @@ def topic_probabilities(row) -> dict:
             if key != 'insufficient' and isinstance(value, dict) and 'noul' in value}
 
 
-def has_topic_hit(row, threshold) -> bool:
+def has_topic_hit(row, threshold=None) -> bool:
     """Any single topic reaching the tier threshold makes the voucher a problem voucher."""
     data = json.loads(row['response_json']) if row['response_json'] else {}
     if data.get('provider') == 'deepseek':
         return bool(data.get('hits'))
+    if data.get('decision_mode') == 'prompt':
+        return bool(prompt_hit_ids(data))
     return any(probability * 100 >= threshold for probability in topic_probabilities(row).values())
 
 
@@ -923,8 +975,9 @@ def voucher_result_context(store, batch_id, totals=None):
         row['local'] = json.loads(row['local_json'])
         row['themes'] = topic_labels(row, rules)
         groups.setdefault(row['voucher_key'], []).append(row)
-    return dict(info=dict(info), rules=rules, thresholds=display_rules['thresholds'],
-        bailian_thresholds=display_rules.get('bailian_thresholds', display_rules['thresholds']),
+    historical_thresholds = display_rules.get('thresholds', rules.get('thresholds', {}))
+    return dict(info=dict(info), rules=rules, thresholds=historical_thresholds,
+        bailian_thresholds=display_rules.get('bailian_thresholds', rules.get('bailian_thresholds', historical_thresholds)),
         notes={r['voucher_key']: dict(r) for r in store.db.execute('SELECT * FROM jev_reviews')},
         overrides=category_overrides(store), totals=voucher_totals(store) if totals is None else totals, groups=groups)
 
@@ -934,14 +987,15 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', c
     if context is None:
         return []
     rules = context['rules']
+    prompt = rules.get('decision_mode') == 'prompt'
     notes, overrides, totals, groups = (context[key] for key in ('notes', 'overrides', 'totals', 'groups'))
     result = []
     for key, lines in groups.items():
         successful = [r for r in lines if r['status'] == 'success' and not r['stale']]
         provider = json.loads(successful[0]['response_json']).get('provider', 'jev') if successful else ''
         thresholds = context.get('bailian_thresholds', context['thresholds']) if provider == 'bailian' else context['thresholds']
-        threshold = thresholds[tier]
-        max_score = max((r['score'] for r in successful if r['score'] is not None), default=None)
+        threshold = None if prompt else thresholds[tier or '谨慎']
+        max_score = None if prompt else max((r['score'] for r in successful if r['score'] is not None), default=None)
         if lane == 'completed':
             hits = lines if all(r['status'] in ('success', 'failed', 'skipped') for r in lines) else []
         elif lane == 'candidates':
@@ -971,8 +1025,8 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', c
                 features = json.loads(line['features_json'])
                 break
         categories = effective_categories(successful, rules, features or {}, overrides.get(key, {}),
-            minimum=threshold / 100 if rules.get('profile') else None)
-        if rules.get('profile'):
+            minimum=threshold / 100 if rules.get('profile') and not prompt else None)
+        if rules.get('profile') and not prompt:
             # Display and filter the exact questions which met the selected Jev threshold.
             accepted = {identifier for row in successful for identifier, probability in topic_probabilities(row).items()
                         if probability * 100 >= threshold}
@@ -1010,4 +1064,4 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', c
             'review': notes.get(key, {'status': '待核', 'note': '', 'feedback': ''}),
             'feedback': feedback})
     # Group currency before amounts; no numeric comparison across different currencies.
-    return sorted(result, key=lambda g: (-(g['score'] if g['score'] is not None else -1), g['sort_currency'], -g['sort_amount'], g['key']))
+    return result if prompt else sorted(result, key=lambda g: (-(g['score'] if g['score'] is not None else -1), g['sort_currency'], -g['sort_amount'], g['key']))

@@ -6,6 +6,7 @@ from tkinter import ttk
 from unittest.mock import patch
 
 import test_jev_ui as legacy_ui
+from test_specialist_review import decision_answer
 from ledger_viewer.jev_review import ReviewJob, prepare_batch, batch_counts, batch_info
 from ledger_viewer.jev_ui import ConsentDialog, ReviewDetail, ReviewRulesDialog
 from ledger_viewer.specialist_rules import ACCOUNTS, load_rules
@@ -98,11 +99,10 @@ class SpecialistUITest(unittest.TestCase):
         choose.assert_called_once_with([group['key']])
         detail.destroy()
 
-    def test_bailian_default_result_displays_actual_model_and_probability(self):
+    def test_bailian_result_shows_prompt_decisions_without_probability(self):
         batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款']})
         def post(key, payload, endpoint):
-            return {'model': 'decision-model-preview', 'answers': {key: {'type': 'noul',
-                'noul': .9 if key == 'OP01' else .01} for key in payload['questions']},
+            return {'model': 'decision-model-preview', 'answers': {key: decision_answer(key == 'OP01') for key in payload['questions']},
                 'usage': {'input_tokens': 100}}
         job = ReviewJob(self.app.store.path, batch, '', bailian_key='fictional-key', bailian_post=post)
         job.start(self.app.store)
@@ -112,10 +112,13 @@ class SpecialistUITest(unittest.TestCase):
         self.root.update()
         group = next(iter(self.panel.rows.values()))
         self.assertEqual(group['provider'], 'bailian')
-        self.assertAlmostEqual(group['score'], 90)
+        self.assertIsNone(group['score'])
         detail = ReviewDetail(self.panel, group)
         self.assertIn('decision-model-preview', detail._json_content())
         self.assertIn('百炼', detail._json_content())
+        self.assertIn('OP01 股东及关联方借款：命中', detail._json_content())
+        self.assertNotIn('概率', detail._json_content())
+        self.assertNotIn('相关度', detail._json_content())
         detail.destroy()
 
     def test_ai_settings_save_bailian_key_and_jev_optional_priority(self):
@@ -168,6 +171,23 @@ class SpecialistUITest(unittest.TestCase):
         self.assertTrue(dialog.confirm.winfo_ismapped())
         self.assertGreater(dialog.preview.winfo_height(), 50)
         dialog._cancel()
+
+    def test_ai_settings_have_no_tiers_or_numeric_filters_and_menu_is_renamed(self):
+        editor = ReviewRulesDialog(self.app)
+        self.root.update()
+        self.assertEqual(editor.title(), 'AI审查设置 · 当前账套')
+        for name in ('thresholds', 'bailian_thresholds', 'filter_vars', 'basis_vars', 'percentile'):
+            self.assertFalse(hasattr(editor, name))
+        editor.destroy()
+        self.assertFalse(hasattr(self.panel, 'tier'))
+        self.assertNotIn('priority', self.panel.view.cget('columns'))
+        self.assertNotIn('score', self.panel.view.cget('columns'))
+        menu = self.app.nametowidget(self.app.cget('menu'))
+        settings = self.app.nametowidget(menu.entrycget(menu.index('end'), 'menu'))
+        labels = [settings.entrycget(index, 'label') for index in range(settings.index('end') + 1)
+                  if settings.type(index) != 'separator']
+        self.assertIn('AI审查设置', labels)
+        self.assertNotIn('Jev 审查…', labels)
 
 
 if __name__ == '__main__':
