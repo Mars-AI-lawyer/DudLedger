@@ -30,19 +30,38 @@ ICONS = {
                ((10, 7), (13, 10), (10, 13))),
     "collapse": (((2, 4), (17, 4), (17, 15), (2, 15), (2, 4)), ((6, 4), (6, 15)),
                  ((13, 7), (10, 10), (13, 13))),
+    "filter": (((3, 4), (17, 4), (12, 11), (12, 16), (8, 14), (8, 11), (3, 4)),),
+    "search": (((9, 3), (14, 8), (12, 14), (7, 15), (4, 10), (9, 3)), ((13, 13), (17, 17))),
+    "close": (((5, 5), (15, 15)), ((15, 5), (5, 15))),
+    "chevron-left": (((13, 4), (6, 10), (13, 16)),),
+    "chevron-right": (((7, 4), (14, 10), (7, 16)),),
+    "expand-all": (((10, 3), (10, 17)), ((5, 8), (10, 13), (15, 8)), ((5, 13), (10, 18), (15, 13))),
+    "collapse-all": (((10, 3), (10, 17)), ((5, 7), (10, 2), (15, 7)), ((5, 12), (10, 7), (15, 12))),
+    "plus": (((10, 4), (10, 16)), ((4, 10), (16, 10))),
+    "dot": (((10, 7), (13, 10), (10, 13), (7, 10), (10, 7)),),
 }
 
+INK_SOFT = "#53524C"
 
-def navigation_icon(master, name):
-    image = tk.PhotoImage(master=master, width=20, height=20)
+
+def navigation_icon(master, name, color=INK_SOFT, *, scale=1):
+    """Draw a line icon on the 20×20 grid.
+
+    Rendered at 2× resolution and subsampled so it stays crisp on Retina
+    displays; the returned image is logically 20×20 (scaled by `scale`).
+    """
+    size = 20 * scale
+    image = tk.PhotoImage(master=master, width=size * 2, height=size * 2)
     for path in ICONS[name]:
         for (x1, y1), (x2, y2) in zip(path, path[1:]):
+            x1, y1, x2, y2 = x1 * scale * 2, y1 * scale * 2, x2 * scale * 2, y2 * scale * 2
             steps = max(abs(x2 - x1), abs(y2 - y1))
             for step in range(steps + 1):
                 x = round(x1 + (x2 - x1) * step / steps)
                 y = round(y1 + (y2 - y1) * step / steps)
-                image.put("#53524C", (x, y))
-    return image
+                # 2×2 block keeps line weight proportional after subsampling
+                image.put(color, to=(x, y, x + 2, y + 2))
+    return image.subsample(2, 2)
 
 
 class NavigationTooltip:

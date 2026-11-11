@@ -116,7 +116,7 @@ class ReviewDetailLayoutTest(unittest.TestCase):
             self.assertTrue(divider.winfo_ismapped())
             self.assertGreaterEqual(divider.winfo_rooty(), reports.winfo_rooty() + reports.winfo_height())
             self.assertLessEqual(divider.winfo_rooty() + divider.winfo_height(), marks.winfo_rooty())
-        self.assertEqual([heading.cget('text') for heading, button in self.app.sidebar_groups], ['查看账簿', '功能'])
+        self.assertEqual([heading.cget('text') for heading, button in self.app.sidebar_groups], ['账簿', '核查'])
 
 
 if __name__ == '__main__':

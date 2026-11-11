@@ -7,6 +7,8 @@ from decimal import Decimal, InvalidOperation, localcontext
 import tkinter as tk
 from tkinter import ttk
 
+from . import theme
+
 
 def cell_number(value: str) -> Decimal:
     raw = value.strip().replace(",", "").replace("￥", "").replace("¥", "")
@@ -135,7 +137,7 @@ class TableTools:
         top = ttk.Frame(self.panel)
         top.grid(row=0, column=0, sticky="ew")
         ttk.Label(top, text="计算器", font=("", 12, "bold")).pack(side="left")
-        ttk.Button(top, text="收起", width=4, command=self.toggle).pack(side="right")
+        ttk.Button(top, text="收起", width=4, style="Ghost.TButton", command=self.toggle).pack(side="right")
         selection = ttk.Frame(self.panel)
         selection.grid(row=1, column=0, sticky="ew", pady=(8, 6))
         ttk.Label(selection, text="当前选区", font=("", 11, "bold")).pack(anchor="w")
@@ -183,11 +185,11 @@ class TableTools:
             self.result_entry.bind(event, self._copy_result_selection)
         actions = ttk.Frame(self.panel)
         actions.grid(row=8, column=0, sticky="ew")
-        self.undo_button = ttk.Button(actions, text="撤销上一步", width=10, command=self.undo, state="disabled")
+        self.undo_button = ttk.Button(actions, text="撤销上一步", width=10, style="Ghost.TButton", command=self.undo, state="disabled")
         self.undo_button.pack(side="left")
-        self.clear_button = ttk.Button(actions, text="清空", width=6, command=self.clear, state="disabled")
+        self.clear_button = ttk.Button(actions, text="清空", width=6, style="Ghost.TButton", command=self.clear, state="disabled")
         self.clear_button.pack(side="right")
-        self.hint = ttk.Label(self.panel, text="换选区只更新预览，点击加减后累计。", foreground="#666", wraplength=245)
+        self.hint = ttk.Label(self.panel, text="换选区只更新预览，点击加减后累计。", foreground=theme.MUTED, wraplength=245)
         self.hint.grid(row=9, column=0, sticky="w", pady=(8, 0))
         if panel_parent is not None:
             # Keep the result and every calculation action above the scrollable history.
@@ -196,7 +198,7 @@ class TableTools:
             for widget, row in ((result_title, 3), (self.result_entry, 4), (actions, 5),
                                 (history_title, 6), (history_holder, 7), (self.history_detail, 8)):
                 widget.grid_configure(row=row)
-        self.borders = [tk.Frame(view, background="#587A67", borderwidth=0) for _ in range(4)]
+        self.borders = [tk.Frame(view, background=theme.ACCENT, borderwidth=0) for _ in range(4)]
         for border in self.borders:
             border.bind("<Button-1>", self._click)
             border.bind("<B1-Motion>", self._drag)

@@ -272,9 +272,9 @@ class ReviewPanel(ttk.Frame):
         self.start_button.pack(side='left')
         self.cancel_button = ttk.Button(actions, text='停止', command=self.cancel, state='disabled')
         self.cancel_button.pack(side='left', padx=5)
-        self.more_button = ttk.Button(actions, text='更多选项', command=self._toggle_options)
+        self.more_button = ttk.Button(actions, text='更多选项', style="Ghost.TButton", command=self._toggle_options)
         self.more_button.pack(side='right')
-        selection = ttk.LabelFrame(self, text='选择抽查科目（可多选；未选时默认以下六类）', padding=(6, 2))
+        selection = ttk.LabelFrame(self, text='抽查范围（可多选；未选时默认以下六类）', padding=(6, 2))
         selection.pack(fill='x', padx=6)
         self.review_accounts = {name: tk.BooleanVar(value=False) for name in ACCOUNTS}
         for index, (name, var) in enumerate(self.review_accounts.items()):
@@ -487,6 +487,12 @@ class ReviewPanel(ttk.Frame):
         if not info:
             return
         running = active_job(self.app.store.path) is not None
+        if running != getattr(self, "_app_busy", False):
+            self._app_busy = running
+            if running:
+                self.app.busy_start("AI 抽查进行中…")
+            else:
+                self.app.busy_stop()
         self.start_button.configure(state='disabled' if running or self.preparing else 'normal')
         self.cancel_button.configure(state='normal' if running else 'disabled')
         total = counts['vouchers']
@@ -672,6 +678,7 @@ class ReviewDetail(tk.Toplevel):
         self.entry_id = group['lines'][0]['entry_id']
         lines = self.store.voucher_lines(self.entry_id)
         self.voucher_view = tree(self.voucher_page, VIEW_COLUMNS['voucher'])
+        self.voucher_view.configure(style="Compact.Treeview")
         self._voucher_rows = min(6, max(2, len(lines)))
         self.voucher_view.configure(height=self._voucher_rows)
         self.app._register_column_view('voucher', self.voucher_view)

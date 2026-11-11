@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 from . import issue_store as data
+from . import theme
 from .importer import format_money
 from .voucher_notes import voucher_key
 
@@ -171,8 +172,8 @@ class RightWorkbench(ttk.Frame):
         self.app = app
         self.visible = False
         self.mode = 'issues'
-        self.width = 440
-        self.calculator_width = 320
+        self.width = 400
+        self.calculator_width = 300
         self.active_tools = self.last_tools = None
         self.current = self.draft = None
         self.issue_rows, self.rows, self.offsets = {}, {}, {}
@@ -199,10 +200,10 @@ class RightWorkbench(ttk.Frame):
         top = ttk.Frame(self, padding=(8, 4))
         top.grid(row=0, column=0, sticky='ew')
         self.heading = tk.StringVar(value='问题工作台')
-        ttk.Label(top, textvariable=self.heading).pack(side='left')
-        self.detach_button = ttk.Button(top, text='独立窗口', command=self.detach)
+        ttk.Label(top, textvariable=self.heading, style="Title.TLabel").pack(side='left')
+        self.detach_button = ttk.Button(top, text='独立窗口', style="Ghost.TButton", command=self.detach)
         self.detach_button.pack(side='right', padx=4)
-        ttk.Button(top, text='收起', command=self.hide).pack(side='right')
+        ttk.Button(top, text='×', width=2, style="Ghost.TButton", command=self.hide).pack(side='right')
         self.calc_body = ttk.Frame(self)
         self.calc_body.columnconfigure(0, weight=1)
         self.calc_body.rowconfigure(1, weight=1)
@@ -245,10 +246,11 @@ class RightWorkbench(ttk.Frame):
         self.directory_body.grid(row=0, column=0, sticky='nsew')
         header = ttk.Frame(self.directory_body)
         header.pack(fill='x')
-        ttk.Label(header, text='尽调问题').pack(side='left')
-        ttk.Button(header, text='新建问题', command=self.new_issue).pack(side='right')
+        ttk.Label(header, text='尽调问题', style="Title.TLabel").pack(side='left')
         search = ttk.Entry(self.directory_body, textvariable=self.search)
         search.pack(fill='x', pady=4)
+        self.new_button = ttk.Button(self.directory_body, text='新建问题', style="Accent.TButton", command=self.new_issue)
+        self.new_button.pack(side='bottom', fill='x', pady=(4, 0))
         self.tree = self._table(self.directory_body, [('title', '问题名称', 300), ('count', '凭证数', 72)], height=14, horizontal=False)
         self.tree.column('title', stretch=True)
         self.tree.column('count', anchor='e', minwidth=65)
@@ -258,13 +260,13 @@ class RightWorkbench(ttk.Frame):
         self.tree.bind('<Return>', self._open_selected_issue)
         self.tree.bind('<Button-3>', self._issue_menu)
         self.tree.bind('<Button-2>', self._issue_menu)
-        self.tree.tag_configure('drop', background='#DDEBDD')
+        self.tree.tag_configure('drop', background=theme.ACCENT_SOFT)
 
         self.details_body = ttk.Frame(self.pages, padding=6)
         self.details_body.grid(row=0, column=0, sticky='nsew')
         controls = ttk.Frame(self.details_body)
         controls.pack(fill='x')
-        self.back_button = ttk.Button(controls, text='‹ 返回问题列表', command=self.back_to_directory)
+        self.back_button = ttk.Button(controls, text='‹ 返回问题列表', style="Ghost.TButton", command=self.back_to_directory)
         self.back_button.pack(side='left')
         more = ttk.Menubutton(controls, text='更多')
         more.pack(side='right')
@@ -278,7 +280,7 @@ class RightWorkbench(ttk.Frame):
         menu.add_command(label='删除当前问题…', command=lambda: self.remove_issue(self.issue_id) if self.issue_id else None)
         more.configure(menu=menu)
         self.issue_title = tk.StringVar(value='请选择问题')
-        self.caption = ttk.Label(self.details_body, textvariable=self.issue_title, wraplength=440, padding=(0, 5))
+        self.caption = ttk.Label(self.details_body, textvariable=self.issue_title, wraplength=380, padding=(0, 5))
         self.caption.pack(fill='x')
         self.details_body.bind('<Configure>', lambda e: self.caption.configure(wraplength=max(150, e.width - 12)))
         self.detail_tabs = ttk.Notebook(self.details_body)
@@ -301,7 +303,7 @@ class RightWorkbench(ttk.Frame):
         self.voucher_tools.menu.add_command(label='移除所选关联', command=self.remove_selected_links)
         self.more_button = ttk.Button(vouchers, text='加载更多凭证', command=lambda: self.load_issue(self.issue_id, more=True))
 
-        self.canvas = tk.Canvas(self.record_page, highlightthickness=0, width=1, height=1, background='#FAF9F5')
+        self.canvas = tk.Canvas(self.record_page, highlightthickness=0, width=1, height=1, background=theme.CANVAS)
         scroll = ttk.Scrollbar(self.record_page, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=scroll.set)
         self.canvas.pack(side='left', fill='both', expand=True)
@@ -311,7 +313,7 @@ class RightWorkbench(ttk.Frame):
         self.detail.bind('<Configure>', lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
         self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfigure(self.detail_window, width=e.width))
         self.canvas.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
-        ttk.Label(self.issue_body, textvariable=self.feedback, style='Hint.TLabel', wraplength=440, padding=6).grid(row=2, column=0, sticky='ew')
+        ttk.Label(self.issue_body, textvariable=self.feedback, style='Hint.TLabel', wraplength=380, padding=6).grid(row=2, column=0, sticky='ew')
         self.empty_detail()
         if hasattr(self.app, 'drag'):
             self.app.drag.attach(self.voucher_view, lambda row: self.rows[row][1])
@@ -404,7 +406,7 @@ class RightWorkbench(ttk.Frame):
 
     def calculator_host(self, name):
         holder = ttk.Frame(self.calc_body)
-        canvas = tk.Canvas(holder, highlightthickness=0, width=1, height=1, background='#FAF9F5')
+        canvas = tk.Canvas(holder, highlightthickness=0, width=1, height=1, background=theme.CANVAS)
         bar = ttk.Scrollbar(holder, command=canvas.yview)
         canvas.configure(yscrollcommand=bar.set)
         canvas.pack(side='left', fill='both', expand=True)
@@ -689,6 +691,7 @@ class RightWorkbench(ttk.Frame):
             return
         items = data.list_issues(self.app.store)
         self.issue_rows = {item['id']: item for item in items}
+        self.app.refresh_workbench_badge(len(items))
         needle = self.search.get().strip().lower()
         changed_query = needle != self.directory_query
         self.directory_query = needle

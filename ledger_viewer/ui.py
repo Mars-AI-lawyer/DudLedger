@@ -14,6 +14,7 @@ from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
+from . import theme
 from .agent_import import handoff_text
 from .import_cascade import redact_error
 from .import_preview import PRIVACY_NOTICE
@@ -31,6 +32,8 @@ from .grid_lines import DashedGrid
 from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_sheet, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
 from .jev_mapping import delete_api_key, get_api_key, key_memory_only, save_api_key
 from .navigation import NavigationTooltip, navigation_icon
+from .empty_state import EmptyState
+from .widgets import RoundedButton, RoundedFrame
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, PrecheckStats, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
 from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, build_party_index, indexed_party_match
@@ -180,7 +183,7 @@ class ColumnDialog(tk.Toplevel):
         self.vars = {key: tk.BooleanVar(value=key in selected) for key, _, _ in columns}
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="勾选要显示的列，修改后立即生效。", foreground="#555").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(body, text="勾选要显示的列，修改后立即生效。", foreground=theme.MUTED).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         for index, (key, label, _) in enumerate(columns):
             ttk.Checkbutton(body, text=label, variable=self.vars[key], command=self._apply).grid(row=1 + index // 2, column=index % 2, sticky="w", padx=(0, 26), pady=4)
         row = 1 + (len(columns) + 1) // 2
@@ -210,11 +213,15 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent: "App"):
         super().__init__(parent)
         self.parent = parent
-        self.title("偏好设置")
+        self.title("设置")
         self.resizable(False, False)
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._finish)
-        viewport = ttk.Frame(self)
+        tabs = ttk.Notebook(self)
+        tabs.pack(fill='both', expand=True)
+        pref_host = ttk.Frame(tabs)
+        tabs.add(pref_host, text='偏好')
+        viewport = ttk.Frame(pref_host)
         viewport.pack(fill='both', expand=True)
         canvas = tk.Canvas(viewport, width=610, height=min(640, max(420, self.winfo_screenheight() - 180)), highlightthickness=0)
         scrollbar = ttk.Scrollbar(viewport, orient='vertical', command=canvas.yview)
@@ -258,15 +265,16 @@ class SettingsDialog(tk.Toplevel):
         self.grid_lines = tk.BooleanVar(value=parent.controller.show_grid)
         ttk.Checkbutton(body, text="显示表格虚线（关闭后大表滚动更轻快）", variable=self.grid_lines,
                         command=lambda: parent.controller.set_grid_lines(self.grid_lines.get())).pack(anchor="w", pady=(7, 0))
-        ttk.Separator(body).pack(fill="x", pady=12)
-        ttk.Label(body, text="导入识别：仅 DeepSeek Flash（低思考）").pack(anchor="w")
+        ai_tab = ttk.Frame(tabs, padding=16)
+        tabs.add(ai_tab, text='AI 服务')
+        ttk.Label(ai_tab, text="导入识别：仅 DeepSeek Flash（低思考）").pack(anchor="w")
         self.provider = tk.StringVar(value=PROVIDER_LABELS["deepseek"])
-        preference = ttk.Frame(body)
+        preference = ttk.Frame(ai_tab)
         preference.pack(fill='x', pady=(8, 5))
         ttk.Label(preference, text='凭证抽查优先模型').pack(side='left')
         self.review_preferred = tk.StringVar(value='Jev 优先' if parent.controller.preferences.get('review_preferred_provider') == 'jev' else '百炼优先（默认）')
         ttk.Combobox(preference, textvariable=self.review_preferred, values=('百炼优先（默认）', 'Jev 优先'), state='readonly', width=18).pack(side='left', padx=8)
-        provider_tabs = ttk.Notebook(body)
+        provider_tabs = ttk.Notebook(ai_tab)
         provider_tabs.pack(fill='x', pady=5)
         jev_host, bailian_host, deepseek_host = (ttk.Frame(provider_tabs, padding=8) for _ in range(3))
         provider_tabs.add(bailian_host, text='阿里百炼决策模型')
@@ -285,7 +293,7 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(key_row, text="保存密钥", command=self._save_api_key).pack(side="left", padx=5)
         ttk.Button(key_row, text="删除密钥", command=self._delete_api_key).pack(side="left")
         self.key_status = tk.StringVar()
-        ttk.Label(jev_host, textvariable=self.key_status, foreground="#555").pack(anchor="w", pady=(4, 0))
+        ttk.Label(jev_host, textvariable=self.key_status, foreground=theme.MUTED).pack(anchor="w", pady=(4, 0))
         self._refresh_key_status()
         self._build_bailian_settings(bailian_host)
         ttk.Label(deepseek_host, text="DeepSeek API Key").pack(anchor="w", pady=(7, 0))
@@ -300,19 +308,23 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(deepseek_row, text="保存密钥", command=self._save_deepseek_key).pack(side="left", padx=5)
         ttk.Button(deepseek_row, text="删除密钥", command=self._delete_deepseek_key).pack(side="left")
         self.deepseek_status = tk.StringVar()
-        ttk.Label(deepseek_host, textvariable=self.deepseek_status, foreground="#555").pack(anchor="w", pady=(4, 0))
+        ttk.Label(deepseek_host, textvariable=self.deepseek_status, foreground=theme.MUTED).pack(anchor="w", pady=(4, 0))
         self._refresh_deepseek_status()
         self.show_key = tk.BooleanVar(value=False)
-        ttk.Checkbutton(body, text="显示明文（三个密钥）", variable=self.show_key, command=self._toggle_key_visible).pack(anchor="w", pady=(2, 0))
-        jev_actions = ttk.Frame(body)
+        ttk.Checkbutton(ai_tab, text="显示明文（三个密钥）", variable=self.show_key, command=self._toggle_key_visible).pack(anchor="w", pady=(2, 0))
+        jev_actions = ttk.Frame(ai_tab)
         jev_actions.pack(fill="x", pady=6)
         from .jev_ui import launch_connection_test
         ttk.Button(jev_actions, text="测试 Jev（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
         ttk.Button(jev_actions, text="AI审查设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
-        ttk.Label(body, text="AI 建议列使用 DeepSeek Flash。" + PRIVACY_NOTICE
+        ttk.Label(ai_tab, text="AI 建议列使用 DeepSeek Flash。" + PRIVACY_NOTICE
             + "保存密钥后可直接建议列；也可取消 AI 改用手动核对。完整账簿的解析、预检和疑点处理均在本机完成。",
-            foreground="#555", wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
-        ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground="#555").pack(anchor="w", pady=(14, 0))
+            foreground=theme.MUTED, wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
+        parties_tab = ttk.Frame(tabs)
+        tabs.add(parties_tab, text='尽调主体')
+        self.parties_panel = RelatedPartiesPanel(parties_tab, parent)
+        self.parties_panel.pack(fill='both', expand=True)
+        ttk.Label(body, text="字体、滚动和表格线适用于所有窗口；凭证与首页偏好只适用于当前账套。", foreground=theme.MUTED).pack(anchor="w", pady=(14, 0))
         self.storage_toggle = ttk.Button(body, text="› 账套辅助文件说明", style="Quiet.TButton", command=self._toggle_storage_help)
         self.storage_toggle.pack(anchor="w", pady=(12, 0))
         self.storage_help = ttk.Label(body, text=(
@@ -459,23 +471,23 @@ class SettingsDialog(tk.Toplevel):
 class RelatedPartyImportDialog(tk.Toplevel):
     """Paste names or load a spreadsheet; each first non-empty cell becomes one party."""
 
-    def __init__(self, parent: "RelatedPartiesDialog"):
+    def __init__(self, parent: "RelatedPartiesPanel"):
         super().__init__(parent)
         self.dialog = parent
         self.title("批量导入尽调主体")
         self.geometry("600x500")
         self.minsize(500, 400)
-        self.transient(parent)
+        self.transient(parent.winfo_toplevel())
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, foreground="#555", wraplength=540, text="每行一个主体，可用“｜”补充身份，例如“张三｜股东,董事”；空白行与重复项自动忽略。"
+        ttk.Label(body, foreground=theme.MUTED, wraplength=540, text="每行一个主体，可用“｜”补充身份，例如“张三｜股东,董事”；空白行与重复项自动忽略。"
             "也可从 Excel/CSV/TXT 导入：第一列名称，第二列身份（如“股东、董事”，识别不了的自动留空），首行表头自动跳过。"
             "与现有名单重复或无效的条目导入时跳过。").pack(anchor="w")
-        ttk.Label(body, foreground="#555", wraplength=540, text=f"可选身份：{'、'.join(PARTY_ROLES)}").pack(anchor="w", pady=(4, 0))
+        ttk.Label(body, foreground=theme.MUTED, wraplength=540, text=f"可选身份：{'、'.join(PARTY_ROLES)}").pack(anchor="w", pady=(4, 0))
         self.editor = tk.Text(body, height=11, wrap="word", undo=True)
         self.editor.pack(fill="both", expand=True, pady=(8, 6))
         self.status = tk.StringVar()
-        ttk.Label(body, textvariable=self.status, foreground="#555").pack(anchor="w")
+        ttk.Label(body, textvariable=self.status, foreground=theme.MUTED).pack(anchor="w")
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(8, 0))
         ttk.Button(actions, text="从文件导入…", command=self._load_file).pack(side="left")
@@ -525,27 +537,24 @@ class RelatedPartyImportDialog(tk.Toplevel):
         self.destroy()
 
 
-class RelatedPartiesDialog(tk.Toplevel):
-    """手动维护尽调主体：输入只保留名称与关系；身份／别名经批量导入设置。"""
+class RelatedPartiesPanel(ttk.Frame):
+    """手动维护尽调主体：输入只保留名称与关系；身份／别名经批量导入设置。
 
-    def __init__(self, parent: "App"):
-        super().__init__(parent)
+    Frame 形态以便同时用于独立对话框与设置对话框标签页。"""
+
+    def __init__(self, master, parent: "App"):
+        super().__init__(master, padding=12)
         self.parent = parent
-        self.title("当前项目 · 尽调主体名单")
-        self.geometry("680x520")
-        self.transient(parent)
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="手动输入只需名称与关系：“与目标公司关系”仅保存在本地账套，不发送给 AI。"
+        ttk.Label(self, text="手动输入只需名称与关系：“与目标公司关系”仅保存在本地账套，不发送给 AI。"
             "本地对往来单位、辅助核算作精确匹配，命中作为程序特征随凭证发送；AI 审查时名称、别名与身份（不含备注、关系）会随凭证发送到 Jev，用于识别关联资金往来，不构成法律关系认定。",
-            foreground="#555", wraplength=620, justify="left").pack(anchor="w")
-        self.view = ttk.Treeview(body, columns=("name", "relation", "roles"), show="headings", height=9)
+            foreground=theme.MUTED, wraplength=620, justify="left").pack(anchor="w")
+        self.view = ttk.Treeview(self, columns=("name", "relation", "roles"), show="headings", height=9)
         for key, title, width in (("name", "名称", 220), ("relation", "与目标公司关系", 220), ("roles", "身份", 150)):
             self.view.heading(key, text=title)
             self.view.column(key, width=width)
         self.view.pack(fill="both", expand=True, pady=(8, 10))
         self.view.bind("<<TreeviewSelect>>", self._select)
-        form = ttk.Frame(body)
+        form = ttk.Frame(self)
         form.pack(fill="x")
         ttk.Label(form, text="名称").grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar()
@@ -554,18 +563,18 @@ class RelatedPartiesDialog(tk.Toplevel):
         self.relation_var = tk.StringVar()
         ttk.Entry(form, textvariable=self.relation_var).grid(row=1, column=1, sticky="ew", pady=3)
         form.columnconfigure(1, weight=1)
-        buttons = ttk.Frame(body)
+        buttons = ttk.Frame(self)
         buttons.pack(fill="x", pady=(10, 0))
         ttk.Button(buttons, text="新增", command=self._clear).pack(side="left")
         ttk.Button(buttons, text="批量导入", command=lambda: RelatedPartyImportDialog(self)).pack(side="left", padx=6)
-        ttk.Button(buttons, text="删除所选", command=self._delete).pack(side="left")
-        ttk.Button(buttons, text="完成", command=self.destroy).pack(side="right")
-        ttk.Button(buttons, text="保存", command=self._save).pack(side="right", padx=6)
+        ttk.Button(buttons, text="删除所选", command=self._delete, style="Danger.TButton").pack(side="left")
+        ttk.Button(buttons, text="保存", command=self._save, style="Accent.TButton").pack(side="right")
         self._refresh()
-        self.grab_set()
 
     def _refresh(self) -> None:
         self.view.delete(*self.view.get_children())
+        if not self.parent.store:
+            return
         for row in self.parent.store.related_parties():
             roles = "、".join(json.loads(row["roles_json"])) if "roles_json" in row.keys() else ""
             relation = row["relation"].replace("\n", " ")[:60] if "relation" in row.keys() else ""
@@ -619,6 +628,21 @@ class RelatedPartiesDialog(tk.Toplevel):
             self._refresh()
 
 
+class RelatedPartiesDialog(tk.Toplevel):
+    """独立窗口形态的尽调主体名单（侧栏入口保留）。"""
+
+    def __init__(self, parent: "App"):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("当前项目 · 尽调主体名单")
+        self.geometry("680x520")
+        self.transient(parent)
+        self.panel = RelatedPartiesPanel(self, parent)
+        self.panel.pack(fill="both", expand=True)
+        ttk.Button(self.panel, text="完成", command=self.destroy).pack(side="right", pady=(8, 0))
+        self.grab_set()
+
+
 class ReconciliationDialog(tk.Toplevel):
     """Confirm source scope and explicit statement-item/account mappings."""
 
@@ -670,14 +694,14 @@ class ReconciliationDialog(tk.Toplevel):
     def _layout(self) -> None:
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="仅比较您确认的同一期间和来源；差异不会修改或阻止查看账簿。", foreground="#555").pack(anchor="w")
+        ttk.Label(body, text="仅比较您确认的同一期间和来源；差异不会修改或阻止查看账簿。", foreground=theme.MUTED).pack(anchor="w")
         period_row = ttk.Frame(body)
         period_row.pack(fill="x", pady=(10, 5))
         ttk.Label(period_row, text="会计年度").pack(side="left")
         ttk.Entry(period_row, textvariable=self.year_var, width=8).pack(side="left", padx=(5, 18))
         ttk.Label(period_row, text="会计期间").pack(side="left")
         ttk.Entry(period_row, textvariable=self.period_var, width=5).pack(side="left", padx=5)
-        ttk.Label(period_row, text="利润表金额列也按此期间比较；累计列请先确认对应口径。", foreground="#555").pack(side="left", padx=16)
+        ttk.Label(period_row, text="利润表金额列也按此期间比较；累计列请先确认对应口径。", foreground=theme.MUTED).pack(side="left", padx=16)
         ttk.Label(body, text="参与核对的明细来源（可多选）").pack(anchor="w")
         self.entry_list = tk.Listbox(body, selectmode="multiple", exportselection=False, height=4)
         self.entry_list.pack(fill="x", pady=(3, 8))
@@ -850,7 +874,7 @@ class PrecheckDetailWindow(tk.Toplevel):
         body.pack(fill="both", expand=True)
         if record is None:
             ttk.Label(body, text="这条导入记录来自旧版导入，没有保存预检报告；它保持原样，不追认已通过新校验。",
-                foreground="#555", wraplength=760).pack(anchor="w")
+                foreground=theme.MUTED, wraplength=760).pack(anchor="w")
             ttk.Button(body, text="关闭", command=self.destroy).pack(anchor="e", pady=10)
             self.grab_set()
             return
@@ -872,7 +896,7 @@ class PrecheckDetailWindow(tk.Toplevel):
                 issue.get("row_no") or "", issue.get("reason", ""), issue.get("interpretation", ""), issue.get("action", "")))
         footer = ttk.Frame(body)
         footer.pack(fill="x", pady=(10, 0))
-        ttk.Label(footer, text="预检报告在导入时保存；此处只读，修改列设置需重新导入该表。", foreground="#555").pack(side="left")
+        ttk.Label(footer, text="预检报告在导入时保存；此处只读，修改列设置需重新导入该表。", foreground=theme.MUTED).pack(side="left")
         ttk.Button(footer, text="关闭", command=self.destroy).pack(side="right")
         self.grab_set()
 
@@ -969,7 +993,7 @@ class ImportDialog(tk.Toplevel):
         self.ai_button = ttk.Button(header_actions, text="AI 建议列（可选）", command=self._offer_ai)
         self.ai_button.pack(side="right")
         ttk.Button(header_actions, text="复制给我的 Agent", command=lambda: copy_agent_task(self, [(self.path, self.sheet.get())])).pack(side="right", padx=5)
-        ttk.Label(top, text="先看原表，再确认每个字段对应的列。〔空〕与原表的 0 分开显示。", foreground="#555").pack(anchor="w", pady=(8, 0))
+        ttk.Label(top, text="先看原表，再确认每个字段对应的列。〔空〕与原表的 0 分开显示。", foreground=theme.MUTED).pack(anchor="w", pady=(8, 0))
         self.preview = tk.Text(self, height=5, wrap="none", state="disabled", font="TkFixedFont")
         self.preview.pack(fill="x", padx=12, pady=8)
         bottom = ttk.Frame(self, padding=12)
@@ -1127,9 +1151,11 @@ class ImportDialog(tk.Toplevel):
             self.stop_requested.clear()
             self.parent.import_busy = True
             self.parent.import_owner = self
+            self.parent.busy_start("正在导入，请稍候…")
         elif getattr(self.parent, 'import_owner', None) is self:
             self.parent.import_busy = False
             self.parent.import_owner = None
+            self.parent.busy_stop()
 
     def _import_failed(self, exc):
         stopped = self.stop_requested.is_set() or isinstance(exc, Cancelled)
@@ -1302,7 +1328,7 @@ class BatchImportDialog(tk.Toplevel):
         self.ai_hint.pack(fill="x", pady=(4, 8))
         self.ai_progress = ttk.Progressbar(body, mode="determinate")
         self.ai_status = tk.StringVar(value="正在准备自动审查…")
-        status_label = ttk.Label(body, textvariable=self.ai_status, foreground="#555", wraplength=650)
+        status_label = ttk.Label(body, textvariable=self.ai_status, foreground=theme.MUTED, wraplength=650)
         status_label.pack(fill="x", pady=(0, 6))
         status_label.bind("<Configure>", lambda event: status_label.configure(wraplength=max(200, event.width - 8)))
         footer = ttk.Frame(body)
@@ -1901,18 +1927,19 @@ class App(tk.Toplevel):
                 ttk.Separator(self.sidebar_section_divider).pack(fill='x', pady=(10, 0))
             button = self._sidebar_button(self.sidebar_pages, title, icon, lambda page=self.page_ids[index]: self.select_page(page))
             if index in (0, 3):
-                heading = ttk.Label(self.sidebar_pages, text="查看账簿" if index == 0 else "功能",
+                heading = ttk.Label(self.sidebar_pages, text="账簿" if index == 0 else "核查",
                                     style="SidebarHint.TLabel")
                 self.sidebar_groups.append((heading, button))
             self.nav_buttons.append(button)
             if index == 3:
                 self.workbench_button = self._sidebar_button(self.sidebar_pages, "问题工作台", "workbench", lambda: self.workbench.toggle())
         self.calculator_button = self._sidebar_button(self.sidebar_pages, "计算器", "calculator", lambda: self.workbench.show_calculator(toggle=True))
+        self._sidebar_button(self.sidebar_pages, "尽调主体名单", "parties", self.open_related_parties)
         footer = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
         footer.pack(side="bottom", fill="x", padx=9, pady=(5, 8))
-        self._sidebar_button(footer, "尽调主体名单", "parties", self.open_related_parties, padx=0)
-        self._sidebar_button(footer, "偏好设置", "settings", self.open_settings, padx=0)
-        self._sidebar_button(footer, "账套", "folder", self.open_book_menu, padx=0)
+        self._sidebar_button(footer, "设置", "settings", self.open_settings, padx=0, side="left")
+        self.book_name = tk.StringVar(value="未打开账套")
+        self.book_button = self._sidebar_button(footer, "账套", "folder", self.open_book_menu, padx=(4, 0), side="left", expand=True)
         self.sidebar_footer_label = ttk.Label(footer, text="本地工作区", style="SidebarHint.TLabel")
         self.workspace = ttk.Frame(self.shell)
         self.workspace.grid(row=0, column=1, sticky="nsew")
@@ -1926,9 +1953,10 @@ class App(tk.Toplevel):
         self.page_title = tk.StringVar(value="开始核查")
         self.page_menu = ttk.Label(toolbar, textvariable=self.page_title, style="Intro.TLabel")
         self.page_menu.pack(side="left")
-        ttk.Button(toolbar, text="导入表格", command=self.import_file, style="Accent.TButton").pack(side="right")
-        self.book_name = tk.StringVar(value="未打开账套")
-        ttk.Label(toolbar, textvariable=self.book_name, style="Hint.TLabel").pack(side="right", padx=16)
+        self.import_cta = RoundedButton(toolbar, text="导入表格", command=self.import_file, variant="primary")
+        self.import_cta.pack(side="right")
+        self.book_name.trace_add("write", lambda *_: self.book_button.configure(text=f"账套：{self.book_name.get()}"))
+        self.book_button.configure(text=f"账套：{self.book_name.get()}")
         ttk.Separator(self.workspace).pack(fill="x", padx=18)
         self.content = ttk.Frame(self.workspace)
         self.content.pack(fill="both", expand=True, padx=18, pady=(12, 0))
@@ -1994,16 +2022,16 @@ class App(tk.Toplevel):
         balance_actions.grid(row=0, column=1, sticky="e")
         balance_top.columnconfigure(0, weight=1)
         balance_top.bind("<Configure>", lambda event: self._flow_bar(balance_top, balance_hint, balance_actions))
-        ttk.Label(balance_hint, text="双击科目查看明细；点击“展开／收起”打开子科目。", style="Hint.TLabel",
-                  wraplength=250, justify="left").pack(side="left")
-        ttk.Button(balance_actions, text="全部展开", command=lambda: self.set_expansion(True)).pack(side="left", padx=(12, 4))
-        ttk.Button(balance_actions, text="全部收起", command=lambda: self.set_expansion(False)).pack(side="left")
+        self.sidebar_icons["expand-all"] = navigation_icon(self, "expand-all")
+        self.sidebar_icons["collapse-all"] = navigation_icon(self, "collapse-all")
+        ttk.Button(balance_actions, text="展开", image=self.sidebar_icons["expand-all"], compound="left",
+                   style="Ghost.TButton", command=lambda: self.set_expansion(True)).pack(side="left", padx=(12, 2))
+        ttk.Button(balance_actions, text="收起", image=self.sidebar_icons["collapse-all"], compound="left",
+                   style="Ghost.TButton", command=lambda: self.set_expansion(False)).pack(side="left")
         summary_more = ttk.Menubutton(balance_actions, text="更多 ▾")
         summary_more.pack(side="right")
         summary_menu = tk.Menu(summary_more, tearoff=False)
         summary_menu.add_command(label="选择显示列…", command=lambda: self._open_columns(self, "balance"))
-        summary_menu.add_command(label="全部展开", command=lambda: self.set_expansion(True))
-        summary_menu.add_command(label="全部收起", command=lambda: self.set_expansion(False))
         summary_menu.add_command(label="记住当前展开", command=self.remember_expansion)
         summary_more.configure(menu=summary_menu)
         self.summary_view = tree(frames[0], VIEW_COLUMNS["balance"])
@@ -2022,11 +2050,18 @@ class App(tk.Toplevel):
         self.detail_controls = ttk.Frame(frames[1], padding=5)
         self.detail_controls.pack(fill="x")
         self.detail_controls.columnconfigure(1, weight=1)
-        self.detail_scope = ttk.Label(self.detail_controls, textvariable=self.account_label, wraplength=300, justify="left")
-        self.detail_scope.grid(row=0, column=0, sticky="w")
+        self.detail_scope_wrap = ttk.Frame(self.detail_controls)
+        self.detail_scope_wrap.grid(row=0, column=0, sticky="w")
+        self.detail_scope = ttk.Label(self.detail_scope_wrap, textvariable=self.account_label, wraplength=300, justify="left")
+        self.detail_scope.pack(side="left")
+        self.detail_scope_clear = ttk.Button(self.detail_scope_wrap, text="×", width=2, style="Ghost.TButton",
+                                             command=self.show_all_entries)
+        self.detail_scope_clear.pack(side="left", padx=(2, 0))
+        self.account_label.trace_add("write", lambda *_: self._refresh_scope_clear())
+        self._refresh_scope_clear()
         self.detail_lookup = ttk.Frame(self.detail_controls)
         self.detail_lookup.grid(row=0, column=1, sticky="ew", padx=10)
-        ttk.Label(self.detail_lookup, text="查找（回车）").pack(side="left", padx=(0, 6))
+        ttk.Label(self.detail_lookup, text="搜索").pack(side="left", padx=(0, 6))
         self.detail_entry = ttk.Entry(self.detail_lookup, textvariable=self.search, width=16)
         self.detail_entry.pack(side="left", fill="x", expand=True)
         self.detail_entry.bind("<Return>", lambda _event: self.submit_detail_search())
@@ -2045,18 +2080,20 @@ class App(tk.Toplevel):
         self.detail_more.configure(menu=detail_menu)
         self.detail_mark = ttk.Button(self.detail_actions, text="关注所选（0）", width=0,
                                       command=self.mark_selected_entry, state="disabled")
+        self.detail_filter = ttk.Button(self.detail_actions, text="筛选 ▽", width=0,
+                                        command=self._open_detail_filter)
         self.detail_controls.bind("<Configure>", self._resize_detail_controls)
         self.detail_scope.bind("<Configure>", self._resize_detail_controls)
         self.detail_actions.bind("<Configure>", self._resize_detail_controls)
         paging = ttk.Frame(frames[1], padding=(6, 2))
         paging.pack(side="bottom", fill="x")
         self.detail_paging = ttk.Frame(paging)
-        self.detail_prev = ttk.Button(self.detail_paging, text="上一页", width=0,
+        self.detail_prev = ttk.Button(self.detail_paging, text="‹ 上一页", width=0, style="Ghost.TButton",
                                       command=lambda: self.change_detail_page(-1), state="disabled")
         self.detail_prev.pack(side="left")
         self.detail_page_label = tk.StringVar(value="第 1 / 1 页")
         ttk.Label(self.detail_paging, textvariable=self.detail_page_label).pack(side="left", padx=5)
-        self.detail_next = ttk.Button(self.detail_paging, text="下一页", width=0,
+        self.detail_next = ttk.Button(self.detail_paging, text="下一页 ›", width=0, style="Ghost.TButton",
                                       command=lambda: self.change_detail_page(1), state="disabled")
         self.detail_next.pack(side="left")
         self.detail_status = ttk.Label(paging, textvariable=self.detail_info, style="Hint.TLabel", wraplength=440)
@@ -2074,6 +2111,7 @@ class App(tk.Toplevel):
         self.detail_join = ttk.Button(self.detail_actions, text="加入问题…（0）", command=lambda: self.drag.choose_from_view(self.detail_view), state='disabled')
         self.detail_join.pack(side="right", padx=4)
         self.detail_mark.pack(side="right")
+        self.detail_filter.pack(side="right", padx=(0, 6))
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
         self.detail_view.bind("<<TreeviewSelect>>", self._update_detail_mark, add="+")
@@ -2087,14 +2125,14 @@ class App(tk.Toplevel):
         for kind, frame in (("balance_sheet", frames[2]), ("income_statement", frames[3])):
             top = ttk.Frame(frame, padding=5)
             top.pack(fill="x")
-            ttk.Label(top, text="报表来源").pack(side="left")
+            ttk.Label(top, text="报表来源", style="Hint.TLabel").pack(side="left")
             combo = ttk.Combobox(top, textvariable=self.report_source[kind], values=("无报表",), state="readonly", width=40)
             combo.pack(side="left", fill="x", expand=True, padx=8)
             self.report_combos[kind] = combo
             combo.bind("<<ComboboxSelected>>", lambda _e, report_kind=kind: self.refresh_report(report_kind))
             info = tk.StringVar(value="尚未导入报表。")
             self.report_info[kind] = info
-            ttk.Label(frame, textvariable=info, padding=(8, 3), foreground="#555", wraplength=760, justify="left").pack(fill="x")
+            ttk.Label(frame, textvariable=info, padding=(8, 3), foreground=theme.MUTED, wraplength=760, justify="left").pack(fill="x")
             columns = [("left_item", "项目", 230), ("left_a", "金额 1", 125), ("left_b", "金额 2", 125), ("left_c", "金额 3", 125)]
             if kind == "balance_sheet":
                 columns += [("right_item", "右侧项目", 230), ("right_a", "右侧金额 1", 125), ("right_b", "右侧金额 2", 125), ("right_c", "右侧金额 3", 125)]
@@ -2112,7 +2150,7 @@ class App(tk.Toplevel):
         source_top = ttk.Frame(frames[5], padding=5)
         source_top.pack(fill="x")
         ttk.Button(source_top, text="添加表格", command=self.import_file, style="Accent.TButton").pack(side="left")
-        ttk.Button(source_top, text="移除所选导入", command=self.delete_selected_source).pack(side="left")
+        ttk.Button(source_top, text="移除所选导入", command=self.delete_selected_source, style="Danger.TButton").pack(side="left", padx=(6, 0))
         ttk.Button(source_top, text="查看预检详情", command=self.show_precheck_detail).pack(side="left", padx=6)
         ttk.Button(source_top, text="导出导入质量报告…", command=self.export_import_report).pack(side="right")
         source_choice = ttk.Frame(frames[5], padding=(5, 2, 5, 6))
@@ -2132,12 +2170,12 @@ class App(tk.Toplevel):
         mark_entry = ttk.Entry(mark_search_row, textvariable=self.mark_search)
         mark_entry.pack(side="left", fill="x", expand=True, padx=5)
         mark_entry.bind("<Return>", lambda _event: self.refresh_marks())
-        ttk.Button(mark_search_row, text="筛选", command=self.refresh_marks).pack(side="left")
-        mark_actions = ttk.Frame(mark_top)
-        mark_actions.pack(fill="x", pady=(5, 0))
-        self.mark_join = ttk.Button(mark_actions, text="加入问题…（0）", command=lambda: self.drag.choose_from_view(self.mark_view), state='disabled')
+        ttk.Button(mark_search_row, text="筛选", style="Ghost.TButton", command=self.refresh_marks).pack(side="left")
+        self.mark_note_toggle = ttk.Button(mark_search_row, text='编辑备注 ▸', style="Ghost.TButton", command=self.toggle_mark_note)
+        self.mark_note_toggle.pack(side='left', padx=(8, 0))
+        self.mark_join = ttk.Button(mark_search_row, text="加入问题…（0）", command=lambda: self.drag.choose_from_view(self.mark_view), state='disabled')
         self.mark_join.pack(side='right', padx=4)
-        mark_more = ttk.Menubutton(mark_actions, text='更多')
+        mark_more = ttk.Menubutton(mark_search_row, text='更多 ▾')
         mark_more.pack(side='right')
         mark_menu = tk.Menu(mark_more, tearoff=False)
         mark_menu.add_command(label='取消所选关注…', command=self.remove_selected_mark)
@@ -2146,8 +2184,6 @@ class App(tk.Toplevel):
         mark_menu.add_command(label='更新关注凭证 MD', command=self.export_marks)
         mark_menu.add_command(label='另存为 MD…', command=lambda: self.export_marks(as_new=True))
         mark_more.configure(menu=mark_menu)
-        self.mark_note_toggle = ttk.Button(mark_actions, text='编辑备注 ▸', command=self.toggle_mark_note)
-        self.mark_note_toggle.pack(side='left')
         self.mark_view = tree(frames[6], [("date", "日期", 100), ("voucher", "凭证号", 105), ("summary", "摘要", 250), ("amount", "金额", 150), ("accounts", "涉及科目", 210), ("note", "备注摘要", 220), ("status", "复核状态", 150)])
         self.mark_tools = TableTools(self.mark_view, set(), show_stats=False)
         self.mark_selection = VoucherSelection(self.mark_view, lambda row: self.mark_keys.get(row), self._update_mark_actions)
@@ -2158,7 +2194,8 @@ class App(tk.Toplevel):
         self.mark_view.bind("<<TreeviewSelect>>", self._load_selected_mark, add='+')
         self.mark_view.bind("<Double-1>", self.open_selected_mark_voucher)
         self.mark_note_frame = ttk.Frame(frames[6], padding=(6, 6))
-        self.mark_note = tk.Text(self.mark_note_frame, height=4, wrap="word", undo=True, background="#FFFDFB", relief="solid", borderwidth=1)
+        self.mark_note = tk.Text(self.mark_note_frame, height=4, wrap="word", undo=True, background=theme.SURFACE, relief="solid", borderwidth=1,
+                                 highlightthickness=1, highlightcolor=theme.ACCENT, highlightbackground=theme.BORDER_STRONG)
         self.mark_note.pack(fill="x", pady=(4, 5))
         self.mark_note_status = tk.StringVar()
         ttk.Label(self.mark_note_frame, textvariable=self.mark_note_status, style="Hint.TLabel").pack(anchor="w")
@@ -2169,7 +2206,11 @@ class App(tk.Toplevel):
         for view in (self.summary_view, self.detail_view, *self.report_views.values()):
             CellTooltip(view)
         self.tabs.bind("<<NotebookTabChanged>>", self._page_changed)
-        ttk.Label(self.workspace, textvariable=self.status, anchor="w", style="Status.TLabel").pack(fill="x")
+        status_bar = ttk.Frame(self.workspace)
+        status_bar.pack(fill="x")
+        self.busy_bar = ttk.Progressbar(status_bar, mode="indeterminate", style="Thin.Horizontal.TProgressbar", length=120)
+        self.status_label = ttk.Label(status_bar, textvariable=self.status, anchor="w", style="Status.TLabel")
+        self.status_label.pack(fill="x")
         self.welcome = ttk.Frame(self.content)
         self.welcome.place(relx=0, rely=0, relwidth=1, relheight=1)
         welcome_body = ttk.Frame(self.welcome)
@@ -2178,8 +2219,8 @@ class App(tk.Toplevel):
         ttk.Label(welcome_body, text="报表、科目、明细与凭证，在一个工作区核查。", style="Hint.TLabel").pack(pady=(0, 28))
         actions = ttk.Frame(welcome_body)
         actions.pack()
-        ttk.Button(actions, text="导入 Excel / CSV", style="Accent.TButton", command=self.import_file).pack(side="left", padx=5)
-        ttk.Button(actions, text="打开已有账套", command=self.open_book).pack(side="left", padx=5)
+        RoundedButton(actions, text="导入 Excel / CSV", variant="primary", command=self.import_file).pack(side="left", padx=5)
+        RoundedButton(actions, text="打开已有账套", variant="secondary", command=self.open_book).pack(side="left", padx=5)
         ttk.Label(welcome_body, text="原表保持不变  ·  AI 辅助需确认后启用", style="Hint.TLabel").pack(pady=(22, 0))
         self.bind("<Configure>", self._resize_workspace, add="+")
         self.after_idle(self._resize_workspace)
@@ -2241,10 +2282,39 @@ class App(tk.Toplevel):
         self._sidebar_expanded = not self._sidebar_expanded
         self._resize_workspace()
 
-    def _sidebar_button(self, parent, title, icon, command, *, padx=9):
+    def busy_start(self, label: str | None = None) -> None:
+        """Show indeterminate progress in the status bar (and mark the main CTA)."""
+        self._busy_count = getattr(self, "_busy_count", 0) + 1
+        if self._busy_count == 1:
+            if not self.busy_bar.winfo_manager():
+                self.busy_bar.pack(side="left", padx=(18, 6), before=self.status_label)
+            self.busy_bar.start(80)
+            if label:
+                self._busy_prev_status = self.status.get()
+                self.status.set(label)
+            self.import_cta.configure(state="disabled")
+
+    def busy_stop(self) -> None:
+        self._busy_count = max(0, getattr(self, "_busy_count", 0) - 1)
+        if self._busy_count == 0:
+            self.busy_bar.stop()
+            self.busy_bar.pack_forget()
+            if hasattr(self, "_busy_prev_status"):
+                self.status.set(self._busy_prev_status)
+                del self._busy_prev_status
+            self.import_cta.configure(state="normal")
+
+    def refresh_workbench_badge(self, count: int) -> None:
+        text = f"问题工作台（{count}）" if count else "问题工作台"
+        self.workbench_button.configure(text=text)
+
+    def _sidebar_button(self, parent, title, icon, command, *, padx=9, side=None, expand=False):
         image = self.sidebar_icons[icon] = navigation_icon(self, icon)
         button = ttk.Button(parent, text=title, image=image, width=0, command=command)
-        button.pack(fill="x", padx=padx, pady=1)
+        if side:
+            button.pack(side=side, fill="x" if expand else "none", expand=expand, padx=padx, pady=1)
+        else:
+            button.pack(fill="x", padx=padx, pady=1)
         self.sidebar_buttons.append(button)
         self.navigation_tooltip.attach(button, lambda: str(button.cget("text")) if self._sidebar_mode == "icons" else "")
         return button
@@ -2468,6 +2538,7 @@ class App(tk.Toplevel):
         for choice in self.report_source.values():
             choice.set("无报表")
         self.book_name.set("未打开账套")
+        self.refresh_workbench_badge(0)
         self.title(f"账簿核查 · v{__version__}")
         self.refresh_all()
         self.review_panel.batch_id = None
@@ -2725,6 +2796,7 @@ class App(tk.Toplevel):
                 self.mark_view.see(iid)
         self.mark_selection.refresh()
         self._load_selected_mark()
+        self._sync_empty_states()
 
     def open_selected_mark_voucher(self, _event: object = None) -> None:
         if _event is not None and self.mark_view.identify_column(_event.x) == "#0":
@@ -2919,10 +2991,14 @@ class App(tk.Toplevel):
             self.detail_conditions[column] = condition
         self.refresh_details()
 
+    def _refresh_scope_clear(self) -> None:
+        self.detail_scope_clear.configure(state="normal" if getattr(self, "account", None) else "disabled")
+
     def _update_detail_mark(self, _event=None) -> None:
         selection = getattr(self, 'detail_selection', None)
         count = len(selection.action_keys()) if selection else 0
-        self.detail_mark.configure(text=f'关注所选（{count}）', state='normal' if count else 'disabled')
+        self.detail_mark.configure(text=f'关注所选（{count}）', state='normal' if count else 'disabled',
+                                   style='Accent.TButton' if count else 'TButton')
         if hasattr(self, 'detail_join'):
             self.detail_join.configure(text=f'加入问题…（{count}）', state='normal' if count else 'disabled')
 
@@ -2979,6 +3055,47 @@ class App(tk.Toplevel):
         self.period_from.set("不限")
         self.period_to.set("不限")
 
+    def _sync_empty_states(self) -> None:
+        if not hasattr(self, "_empty_states"):
+            self._empty_states = {
+                "accounts": EmptyState(self.summary_view.master, "accounts",
+                                       "还没有科目总览", "导入科目余额表或序时账后自动出现。",
+                                       "导入表格", self.import_file),
+                "entries_plain": EmptyState(self.detail_view.master, "entries",
+                                            "暂无分录", "导入序时账后在此查看全部明细。",
+                                            "导入表格", self.import_file),
+                "entries_filtered": EmptyState(self.detail_view.master, "filter",
+                                               "没有符合筛选条件的分录", "调整或清除筛选条件后再看。",
+                                               "清除筛选", self.clear_filter),
+                "marks": EmptyState(self.mark_view.master, "marks",
+                                    "暂无关注凭证", "在明细账勾选凭证后点『关注所选』。",
+                                    "去明细账", lambda: self.select_page("entries")),
+            }
+            for kind in REPORT_KINDS:
+                self._empty_states[f"report_{kind}"] = EmptyState(
+                    self.report_views[kind].master, "balance",
+                    "尚未导入报表", "导入后在此查看；可在上方切换报表类型。",
+                    "导入表格", self.import_file)
+        states = self._empty_states
+        if self.summary_view.get_children():
+            states["accounts"].hide()
+        else:
+            states["accounts"].show()
+        if self.detail_view.get_children():
+            states["entries_plain"].hide()
+            states["entries_filtered"].hide()
+        else:
+            filter_count = len(self.detail_conditions) + bool(self.detail_search) + self._has_detail_filter("period")
+            (states["entries_filtered"] if filter_count and self.store else states["entries_plain"]).show()
+            (states["entries_plain"] if filter_count and self.store else states["entries_filtered"]).hide()
+        for kind in REPORT_KINDS:
+            state = states[f"report_{kind}"]
+            (state.hide() if self.report_views[kind].get_children() else state.show())
+        if self.mark_view.get_children():
+            states["marks"].hide()
+        else:
+            states["marks"].show()
+
     def refresh_all(self) -> None:
         if not self.workbench.flush():
             return
@@ -2993,6 +3110,7 @@ class App(tk.Toplevel):
             self.detail_tools.reset_selection()
             self.balance_tools.reset_selection()
             self.balance_calc_sources.clear()
+            self._sync_empty_states()
             return
         self.period_options = {f"{year}年{period}期": (year, period) for year, period in self.store.periods()}
         for variable in (self.period_from, self.period_to):
@@ -3019,6 +3137,7 @@ class App(tk.Toplevel):
             precheck_label = record["verdict"] if record is not None else "无历史预检报告（旧版导入）"
             self.source_view.insert("", "end", iid=str(row["id"]), values=(row["filename"], row["sheet"], kind_label, row["row_count"], precheck_label, row["sha256"], row["original_path"]))
         self.refresh_marks()
+        self._sync_empty_states()
         self.status.set(f"当前项目：{self.store.path.name}  ·  已导入 {len(self.store.sources())} 张表  ·  双击科目看明细，双击明细看凭证")
 
     def _read_task(self, key, operation, done):
@@ -3183,7 +3302,7 @@ class App(tk.Toplevel):
         if int(self.detail_scope.cget('wraplength')) != wrap:
             self.detail_scope.configure(wraplength=wrap)
         # Fixed row order avoids controls disappearing during live sidebar resizing.
-        self.detail_scope.grid(row=0, column=0, sticky='w')
+        self.detail_scope_wrap.grid(row=0, column=0, sticky='w')
         self.detail_lookup.grid(row=0, column=1, columnspan=2, sticky='ew', padx=(10, 0))
         self.detail_actions.grid(row=1, column=0, columnspan=3, sticky='e', pady=(4, 0))
 
@@ -3265,6 +3384,10 @@ class App(tk.Toplevel):
         filter_count = len(self.detail_conditions) + bool(self.detail_search) + self._has_detail_filter("period")
         filter_info = f" · 已筛选 {filter_count} 项" if filter_count else ""
         self.detail_info.set(f"共 {total:,} 条 · {shown}{filter_info} · {self._period_label()}")
+        self.detail_filter.configure(
+            text=f"筛选 ▽（{filter_count}）" if filter_count else "筛选 ▽",
+            style="Accent.TButton" if filter_count else "TButton")
+        self._sync_empty_states()
 
     def _update_detail_headings(self) -> None:
         for key, title, _ in VIEW_COLUMNS["detail"]:

@@ -9,7 +9,10 @@ from tkinter import ttk
 class DashedGrid:
     """Draw one-pixel dashed separators over visible rows and columns only."""
 
-    def __init__(self, view: ttk.Treeview, color: str = "#E4DFD7", background: str = "#FFFFFF"):
+    def __init__(self, view: ttk.Treeview, color: str = None, background: str = None):
+        from . import theme
+        color = color or theme.BORDER
+        background = background or theme.SURFACE
         self.view = view
         self.color = color
         self.background = background
