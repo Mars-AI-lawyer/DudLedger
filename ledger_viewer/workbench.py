@@ -1,4 +1,4 @@
-"""Issue workbench, local autosave, and handle-only Tk voucher dragging."""
+"""Issue workbench, local autosave, and explicit voucher actions."""
 
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
@@ -194,7 +194,7 @@ class RightWorkbench(ttk.Frame):
         self.detail_tab = 'vouchers'
         self.search = tk.StringVar()
         self.search.trace_add('write', lambda *_: self.refresh_directory())
-        self.feedback = tk.StringVar(value='新建问题后，勾选或拖入凭证。')
+        self.feedback = tk.StringVar(value='勾选凭证或框选单元格，再点击“加入问题…”。')
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
         top = ttk.Frame(self, padding=(8, 4))
@@ -260,7 +260,6 @@ class RightWorkbench(ttk.Frame):
         self.tree.bind('<Return>', self._open_selected_issue)
         self.tree.bind('<Button-3>', self._issue_menu)
         self.tree.bind('<Button-2>', self._issue_menu)
-        self.tree.tag_configure('drop', background=theme.ACCENT_SOFT)
 
         self.details_body = ttk.Frame(self.pages, padding=6)
         self.details_body.grid(row=0, column=0, sticky='nsew')
@@ -315,10 +314,8 @@ class RightWorkbench(ttk.Frame):
         self.canvas.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
         ttk.Label(self.issue_body, textvariable=self.feedback, style='Hint.TLabel', wraplength=380, padding=6).grid(row=2, column=0, sticky='ew')
         self.empty_detail()
-        if hasattr(self.app, 'drag'):
-            self.app.drag.attach(self.voucher_view, lambda row: self.rows[row][1])
-            if self.app.drag.active:
-                self.app.drag.capture_widgets(host.winfo_toplevel())
+        if hasattr(self.app, 'voucher_actions'):
+            self.app.voucher_actions.attach(self.voucher_view, lambda row: self.rows[row][1])
         self.refresh_directory()
         if self.issue_id and self.app.store and self.view_mode == 'detail':
             self.edit_issue(self.issue_id, tab=self.detail_tab, reveal=False)
@@ -997,49 +994,17 @@ class RightWorkbench(ttk.Frame):
             menu.grab_release()
 
 
-class VoucherDrag:
-    """Handle-only, multi-voucher dragging across the owning application's windows."""
+class VoucherActions:
+    """Share explicit batch actions between ledger, marks and voucher windows."""
 
     def __init__(self, app):
         self.app = app
-        self.tag = f'VoucherDrag:{id(self)}'
         self.sources = {}
-        self.pending = None
-        self.active = False
-        self.tip = None
-        self.hover_job = self.hover_target = self.highlight = None
-        self.restore_hidden = False
-        self.grab_owner = None
-        self.captured_widgets = set()
-        for event, callback in (('<ButtonPress-1>', self.press), ('<B1-Motion>', self.motion), ('<ButtonRelease-1>', self.release), ('<Escape>', self.cancel)):
-            app.bind_class(self.tag, event, callback)
-        # Escape still cancels if focus moved into a different toplevel.
-        app.bind_all('<Escape>', self.cancel, add='+')
 
-    def capture_widgets(self, widget):
-        """Capture before native widget handlers, including across hidden source views."""
-        if self.tag not in widget.bindtags():
-            widget.bindtags((self.tag, *widget.bindtags()))
-            self.captured_widgets.add(widget)
-        for child in widget.winfo_children():
-            self.capture_widgets(child)
-
-    def attach(self, view, key_for_row, tree_handle=True):
+    def attach(self, view, key_for_row):
         self.sources[view] = key_for_row
-        tags = list(view.bindtags())
-        if self.tag not in tags:
-            # Checkbox interception must precede dragging.
-            position = 1 if tags and str(tags[0]).startswith('VoucherSelection:') else 0
-            tags.insert(position, self.tag)
-            view.bindtags(tuple(tags))
-        if tree_handle and not hasattr(view, 'voucher_selection'):
-            view.configure(show='tree headings')
-            view.column('#0', width=30, minwidth=30, stretch=False)
-            view.heading('#0', text='⋮⋮')
         def clean(event):
             if event.widget is view:
-                if self.pending and self.pending[0] is view:
-                    self.cancel()
                 self.sources.pop(view, None)
         view.bind('<Destroy>', clean, add='+')
         if hasattr(view, 'cell_tools'):
@@ -1050,8 +1015,7 @@ class VoucherDrag:
             if view is getattr(self.app, 'detail_view', None):
                 menu.add_command(label='关注所选', command=lambda: self.app.mark_selected_entry())
             def labels():
-                selection = getattr(view, 'voucher_selection', None)
-                count = len(selection.action_keys()) if selection else len(view.selection())
+                count = len(self.keys_from_view(view))
                 menu.entryconfigure(index, label=f'加入问题…（{count} 张）', state='normal' if count else 'disabled')
             menu.configure(postcommand=labels)
 
@@ -1059,177 +1023,10 @@ class VoucherDrag:
         selection = getattr(view, 'voucher_selection', None)
         if selection:
             return selection.action_keys()
-        return tuple(dict.fromkeys(self.sources[view](row) for row in view.selection()))
+        tools = getattr(view, 'cell_tools', None)
+        rows = tools.selection_range()[0] if tools else ()
+        return tuple(dict.fromkeys(key for row in (rows or view.selection())
+                                   if (key := self.sources[view](row))))
 
     def choose_from_view(self, view):
         self.app.workbench.choose_issue(self.keys_from_view(view))
-
-    def press(self, event):
-        view = event.widget
-        if not self.app.store or view not in self.sources:
-            return
-        row = view.identify_row(event.y)
-        if not row or view.identify_column(event.x) != '#0' or view.identify_region(event.x, event.y) == 'separator':
-            return
-        selection = getattr(view, 'voucher_selection', None)
-        if selection and event.x <= 28:
-            return
-        try:
-            keys = selection.drag_keys(row) if selection else (self.sources[view](row),)
-        except (ValueError, KeyError, TypeError):
-            return 'break'
-        if keys:
-            self.restore_hidden = False
-            self.original_calculator = None
-            self.pending = (view, keys, event.x_root, event.y_root)
-            view.focus_set()
-            if not selection or keys == (self.sources[view](row),):
-                view.selection_set(row)
-        return 'break'
-
-    def motion(self, event):
-        if not self.pending:
-            return
-        view, keys, start_x, start_y = self.pending
-        if not self.active and abs(event.x_root - start_x) + abs(event.y_root - start_y) < 6:
-            return 'break'
-        panel = self.app.workbench
-        if not self.active:
-            self.active = True
-            self.restore_hidden = not panel.issues_visible
-            self.original_calculator = panel.last_tools if panel.visible and panel.mode == 'calculator' else None
-            self.tip = tk.Toplevel(self.app)
-            self.tip.overrideredirect(True)
-            self.tip.attributes('-topmost', True)
-            self.tip_label = ttk.Label(self.tip, padding=6, relief='solid')
-            self.tip_label.pack()
-            # Keep the grab on a stable toplevel while the source table is hidden.
-            self.capture_widgets(self.app)
-            self.grab_owner = view.winfo_toplevel()
-            self.grab_owner.grab_set()
-        target = self.target_at(event.x_root, event.y_root)
-        label = '松开取消'
-        if isinstance(target, int):
-            label = '加入：' + panel.issue_rows[target]['title']
-        elif target == 'choose':
-            label = '松开选择问题'
-        elif target == 'back':
-            label = '停留返回问题列表，继续拖入其他问题'
-        self.tip_label.configure(text=f'{len(keys)} 张凭证 · {label}')
-        self.tip.geometry(f'{event.x_root + 16:+d}{event.y_root + 18:+d}')
-        self._hover(target, event.x_root, event.y_root)
-        return 'break'
-
-    @staticmethod
-    def contains(widget, x, y):
-        return widget.winfo_ismapped() and widget.winfo_rootx() <= x < widget.winfo_rootx() + widget.winfo_width() and widget.winfo_rooty() <= y < widget.winfo_rooty() + widget.winfo_height()
-
-    def target_at(self, x, y):
-        panel = self.app.workbench
-        if not panel.issues_visible:
-            return None
-        if panel.view_mode == 'directory':
-            if self.contains(panel.tree, x, y):
-                node = panel.tree.identify_row(y - panel.tree.winfo_rooty())
-                return int(node[2:]) if node.startswith('i:') else 'choose'
-            if self.contains(panel.directory_body, x, y):
-                return 'choose'
-        else:
-            if self.contains(panel.back_button, x, y):
-                return 'back'
-            if self.contains(panel.voucher_view, x, y):
-                return panel.issue_id or 'choose'
-        return None
-
-    def _hover(self, target, x, y):
-        panel = self.app.workbench
-        edge = self.app.winfo_rootx() + self.app.winfo_width() - 24 <= x <= self.app.winfo_rootx() + self.app.winfo_width() and self.app.winfo_rooty() <= y <= self.app.winfo_rooty() + self.app.winfo_height()
-        hover = 'edge' if edge and not panel.issues_visible else target
-        if hover != self.hover_target:
-            if self.hover_job:
-                self.app.after_cancel(self.hover_job)
-                self.hover_job = None
-            if self.highlight and panel.tree.exists(self.highlight):
-                panel.tree.item(self.highlight, tags=())
-            self.highlight = f'i:{target}' if isinstance(target, int) else None
-            if self.highlight and panel.tree.exists(self.highlight):
-                panel.tree.item(self.highlight, tags=('drop',))
-            self.hover_target = hover
-            if hover == 'edge':
-                self.hover_job = self.app.after(450, self._open_edge)
-            elif hover == 'back':
-                self.hover_job = self.app.after(450, self._open_directory)
-        for view in (panel.tree, panel.voucher_view):
-            if self.contains(view, x, y):
-                local = y - view.winfo_rooty()
-                if local < 30:
-                    view.yview_scroll(-1, 'units')
-                elif local > view.winfo_height() - 20:
-                    view.yview_scroll(1, 'units')
-
-    def _open_edge(self):
-        self.hover_job = None
-        if self.active:
-            self.app.workbench.show()
-
-    def _open_directory(self):
-        self.hover_job = None
-        if self.active:
-            self.app.workbench.back_to_directory()
-
-    def release(self, event):
-        if not self.pending:
-            return
-        keys = self.pending[1]
-        target = self.target_at(event.x_root, event.y_root) if self.active else None
-        was_active = self.active
-        self._cleanup()
-        success = False
-        if was_active and isinstance(target, int):
-            success = self.app.workbench.add_to_issue(target, keys)
-        elif was_active and target == 'choose':
-            self.app.workbench.choose_issue(keys)
-            success = True
-        if not success:
-            self._restore_panel()
-        return 'break'
-
-    def cancel(self, _event=None):
-        if self.pending:
-            self._cleanup()
-            self._restore_panel()
-            return 'break'
-
-    def _restore_panel(self):
-        if self.restore_hidden:
-            self.app.workbench.hide_issues()
-        if self.original_calculator:
-            tools, name = self.original_calculator
-            self.app.workbench.set_calculator(tools, name, reveal=True)
-
-    def _cleanup(self):
-        if self.hover_job:
-            self.app.after_cancel(self.hover_job)
-            self.hover_job = None
-        panel = self.app.workbench
-        if self.highlight and panel.tree.exists(self.highlight):
-            panel.tree.item(self.highlight, tags=())
-        self.highlight = self.hover_target = None
-        if self.grab_owner is not None:
-            try:
-                self.grab_owner.grab_release()
-            except tk.TclError:
-                pass
-            self.grab_owner = None
-        for widget in self.captured_widgets:
-            try:
-                if widget.winfo_exists():
-                    widget.bindtags(tuple(tag for tag in widget.bindtags() if tag != self.tag))
-            except tk.TclError:
-                pass
-        self.captured_widgets.clear()
-        self.pending = None
-        self.active = False
-        if self.tip:
-            self.tip.destroy()
-            self.tip = None

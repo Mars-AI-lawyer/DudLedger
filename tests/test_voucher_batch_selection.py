@@ -46,7 +46,7 @@ class VoucherBatchSelectionTest(unittest.TestCase):
         box = view.bbox(self.rows[5], '#0')
         self.selection.press(SimpleNamespace(x=box[0] + 20, y=box[1] + 10, state=1))
         self.assertEqual(len(self.selection.checked), 3)
-        self.assertFalse(self.app.drag.pending)
+        self.assertFalse(hasattr(self.app, 'drag'))
 
     def test_checks_survive_pages_and_reset_on_scope_changes(self):
         self.selection.checked.add(self.key)
@@ -79,6 +79,23 @@ class VoucherBatchSelectionTest(unittest.TestCase):
         self.selection.clear()
         self.app.mark_selected_entry()
         self.assertEqual(len(list_marks(self.app.store)), 3)
+
+    def test_disjoint_rectangles_mark_and_link_only_the_selected_vouchers(self):
+        tools = self.app.detail_tools
+        tools.select(self.rows[0], 'debit')
+        tools.select(self.rows[4], 'credit', additive=True)
+        tools.select(self.rows[5], 'debit', additive=True)
+        expected = {self.key, self.app.detail_voucher_keys[self.rows[4]]}
+        self.assertEqual(set(self.selection.action_keys()), expected)
+        self.assertIn('（2）', self.app.detail_mark.cget('text'))
+        self.app.mark_selected_entry()
+        self.assertEqual({row['key'] for row in list_marks(self.app.store)}, expected)
+        issue = issue_store.create_issue(self.app.store, '多区域问题')
+        with patch.object(self.app.workbench, 'choose_issue') as choose:
+            self.app.detail_join.invoke()
+        self.assertEqual(set(choose.call_args.args[0]), expected)
+        self.app.workbench.add_to_issue(issue, choose.call_args.args[0])
+        self.assertEqual({row['voucher_key'] for row in issue_store.issue_vouchers(self.app.store, issue)}, expected)
 
     def test_mark_and_link_batches_roll_back_all_writes_on_late_failure(self):
         issue = issue_store.create_issue(self.app.store, '问题')

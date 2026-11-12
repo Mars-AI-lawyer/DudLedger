@@ -301,6 +301,8 @@ class ResponsivenessTest(unittest.TestCase):
                 widget = pending.pop()
                 if widget in (self.app.detail_tools.panel, self.app.detail_paging):
                     continue
+                if widget is self.app.detail_accounts and not widget.winfo_ismapped():
+                    continue
                 pending.extend(widget.winfo_children())
                 if isinstance(widget, (ttk.Button, ttk.Menubutton)):
                     buttons.append(widget)

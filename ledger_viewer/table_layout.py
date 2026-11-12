@@ -23,7 +23,11 @@ class WorkspaceTableFit:
         view = next((view for view in self.views if view.winfo_ismapped()), None)
         if view is None:
             return 525
-        return max(525, sum(view.column(key, 'minwidth') for key in self.columns(view)) + 24)
+        minimum = max(525, sum(view.column(key, 'minwidth') for key in self.columns(view)) + 24)
+        navigation = getattr(self.app, 'detail_accounts', None)
+        if view is self.app.detail_view and navigation and navigation.winfo_ismapped():
+            minimum += navigation.winfo_width() + 6
+        return minimum
 
     def schedule(self, _event=None):
         if self.job is None:

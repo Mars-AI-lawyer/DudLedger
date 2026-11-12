@@ -60,6 +60,72 @@ class TableToolsUiTest(unittest.TestCase):
         self.window._close()
         self.temp.cleanup()
 
+    def test_ctrl_click_adds_disjoint_cells_without_filling_holes(self):
+        self.view.configure(displaycolumns=("debit", "credit"))
+        self.root.update()
+        first, second = self.view.get_children()
+        self.view.set(first, "credit", "99.00")
+        self.view.set(second, "debit", "88.00")
+        for row, column, state in ((first, "debit", 0), (second, "credit", 4)):
+            x, y, w, h = self.view.bbox(row, column)
+            self.view.event_generate("<ButtonPress-1>", x=x + w // 2, y=y + h // 2, state=state)
+            self.view.event_generate("<ButtonRelease-1>", x=x + w // 2, y=y + h // 2, state=state)
+        self.root.update()
+        self.assertEqual(self.tools.summary.total, Decimal("0.30"))
+        self.assertEqual(self.tools.summary.cells, 2)
+        self.assertEqual(len(self.tools.selection_ranges()), 2)
+        self.assertTrue(all(border.winfo_ismapped() for border in self.tools.borders))
+        self.tools.calculate(1)
+        self.assertEqual(self.tools.result.get(), "0.30")
+        self.assertEqual([(cell.row, cell.column) for cell in self.tools.calculation.items[0].snapshot.cells],
+                         [(first, "debit"), (second, "credit")])
+        with patch.object(self.view, "clipboard_clear"), patch.object(self.view, "clipboard_append") as copy:
+            self.tools.copy_cell()
+        self.assertEqual(copy.call_args.args[0], "0.10\t\n\t0.20")
+        self.tools.select(first, "debit")
+        self.assertEqual(len(self.tools.selection_ranges()), 1)
+
+    def test_overlapping_rectangles_deduplicate_and_context_respects_actual_cells(self):
+        first, second = self.view.get_children()
+        self.tools.select(first, "debit")
+        self.tools.select(second, "credit", extend=True)
+        self.tools.select(second, "credit", additive=True)
+        self.assertEqual(self.tools.summary.cells, 4)
+        self.assertEqual(self.tools.summary.numbers, 2)
+        self.assertEqual(self.tools.summary.total, Decimal("0.30"))
+        self.tools.calculate(1)
+        self.assertEqual(len(self.tools.calculation.items[0].snapshot.cells), 2)
+        self.tools.undo()
+        self.assertEqual(self.tools.result.get(), "0.00")
+        self.view.configure(displaycolumns=("debit", "credit"))
+        self.root.update()
+        self.tools.select(first, "debit")
+        self.tools.select(second, "credit", additive=True)
+        x, y, w, h = self.view.bbox(first, "debit")
+        with patch.object(self.tools.menu, "tk_popup"), patch.object(self.tools.menu, "grab_release"):
+            self.tools._context(SimpleNamespace(x=x + 10, y=y + 10, x_root=0, y_root=0))
+        self.assertEqual(self.tools.summary.cells, 2)
+        x, y, w, h = self.view.bbox(first, "credit")
+        with patch.object(self.tools.menu, "tk_popup"), patch.object(self.tools.menu, "grab_release"):
+            self.tools._context(SimpleNamespace(x=x + 10, y=y + 10, x_root=0, y_root=0))
+        self.assertEqual(self.tools.selected_cells(), {(first, "credit")})
+
+    def test_ctrl_drag_adds_rectangle_and_sort_clears_all_ranges(self):
+        self.view.configure(displaycolumns=("summary", "debit", "credit"))
+        self.root.update()
+        first, second = self.view.get_children()
+        self.tools.select(first, "summary")
+        start, end = self.view.bbox(first, "debit"), self.view.bbox(second, "credit")
+        self.view.event_generate("<ButtonPress-1>", x=start[0] + 10, y=start[1] + 10, state=4)
+        self.view.event_generate("<B1-Motion>", x=end[0] + 10, y=end[1] + 10, state=260)
+        self.view.event_generate("<ButtonRelease-1>", x=end[0] + 10, y=end[1] + 10, state=4)
+        self.assertEqual(len(self.tools.selection_ranges()), 2)
+        self.assertEqual(self.tools.summary.cells, 5)
+        self.assertEqual(self.tools.summary.total, Decimal("0.30"))
+        self.window.sort_details("credit")
+        self.assertFalse(self.tools.selection_ranges())
+        self.assertFalse(self.tools.saved_ranges)
+
     def test_selected_cell_copies_full_text_and_blank_with_hidden_reordered_columns(self):
         self.view.configure(displaycolumns=("summary", "credit", "debit"))
         self.root.update()

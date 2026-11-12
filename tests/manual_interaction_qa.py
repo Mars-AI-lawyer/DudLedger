@@ -25,7 +25,7 @@ def main():
         app._use_book(base / '交互验收.sqlite')
         source = base / '合成分录.csv'
         source.write_text('日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n' + ''.join(
-            f'2026-01-02,{number},1002,银行存款,验收凭证{number}到账,{number * 100},0\n'
+            f'2026-01-02,{number},{"100201" if number % 2 == 0 else "1002"},{"银行存款人民币" if number % 2 == 0 else "银行存款"},验收凭证{number}到账,{number * 100},0\n'
             f'2026-01-02,{number},4001,实收资本,验收凭证{number}确认资本,0,{number * 100}\n'
             for number in range(1, 258)), encoding='utf-8')
         app.store.import_sheet(classify_sheet(source, 'CSV'))
@@ -51,7 +51,7 @@ def main():
         app.geometry('1160x690')
         app.title('DudLedger 交互验收（临时合成数据）')
         app.workbench.show()
-        app.status.set('全部为临时合成数据；关闭程序后删除。可验证框选、多选、跨页与原生拖曳。')
+        app.status.set('临时合成数据；关闭后删除。按 Ctrl／⌘ 追加选区，再关注或加入问题；左上可展开科目树。')
         try:
             root.mainloop()
         except KeyboardInterrupt:

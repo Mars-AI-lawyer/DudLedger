@@ -100,19 +100,20 @@ class SelectionSummary:
 
 
 class TableTools:
-    """Track a rectangular range in displayed order, independently of row focus."""
+    """Track disjoint rectangles in displayed order, independently of row focus."""
 
     def __init__(self, view: ttk.Treeview, money_columns: set[str], *, source_for_row=None,
                  on_visibility_changed=None, panel_parent=None, on_toggle=None, show_stats=True):
         self.view = view
         view.cell_tools = self
         self.money_columns = money_columns
-        self.selection_hint = "拖动框选，自动合计与计数；Ctrl+C / ⌘C 复制选区" if money_columns else "拖动框选；Ctrl+C / ⌘C 复制选区"
+        self.selection_hint = "拖动框选；Ctrl / ⌘ 追加选区；Esc 清空；Ctrl+C / ⌘C 复制"
         self.source_for_row = source_for_row
         self.on_visibility_changed = on_visibility_changed
         self.on_toggle = on_toggle
         self.active: tuple[str, str] | None = None
         self.anchor: tuple[str, str] | None = None
+        self.saved_ranges = []
         self.column_order = ()
         self.summary = SelectionSummary()
         self.summary_dirty = False
@@ -198,11 +199,8 @@ class TableTools:
             for widget, row in ((result_title, 3), (self.result_entry, 4), (actions, 5),
                                 (history_title, 6), (history_holder, 7), (self.history_detail, 8)):
                 widget.grid_configure(row=row)
-        self.borders = [tk.Frame(view, background=theme.ACCENT, borderwidth=0) for _ in range(4)]
-        for border in self.borders:
-            border.bind("<Button-1>", self._click)
-            border.bind("<B1-Motion>", self._drag)
-            border.bind("<ButtonRelease-1>", self._release)
+        self.borders = []
+        self._ensure_borders(4)
         self.menu = tk.Menu(view, tearoff=False)
         self.menu.add_command(label="复制选区", command=self.copy_cell)
         if money_columns:
@@ -212,8 +210,9 @@ class TableTools:
         view.bind("<Button-1>", self._click, add="+")
         view.bind("<B1-Motion>", self._drag)
         view.bind("<ButtonRelease-1>", self._release, add="+")
-        for event in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+        for event in ("<Button-3>", "<Button-2>"):
             view.bind(event, self._context, add="+")
+        view.bind("<Escape>", lambda _event: self.reset_selection())
         for event in ("<Command-c>", "<Control-c>", "<<Copy>>"):
             view.bind(event, self.copy_cell)
         for event in ("<Configure>", "<Map>", "<ButtonRelease-1>"):
@@ -254,10 +253,10 @@ class TableTools:
             return row, columns[index]
         return None
 
-    def _hit(self, event, extend=False):
+    def _hit(self, event, extend=False, additive=False):
         cell = self._locate(*self._coordinates(event))
         if cell:
-            self.select(*cell, extend=extend)
+            self.select(*cell, extend=extend, additive=additive)
             return True
         self.reset_selection()
         return False
@@ -268,7 +267,9 @@ class TableTools:
             self.dragging = False
             return None
         self.row_cache.clear()
-        self.dragging = self._hit(event, extend=bool(getattr(event, "state", 0) & 1))
+        state = getattr(event, "state", 0)
+        additive = bool(state & 4 or (self.view.tk.call("tk", "windowingsystem") == "aqua" and state & 8))
+        self.dragging = self._hit(event, extend=bool(state & 1), additive=additive)
         if self.dragging:
             self.view.selection_set(self.active[0])
             self.view.focus(self.active[0])
@@ -324,8 +325,7 @@ class TableTools:
 
     def _context(self, event):
         cell = self._locate(*self._coordinates(event))
-        selected_rows, selected_columns = self.selection_range()
-        inside = cell and cell[0] in selected_rows and cell[1] in selected_columns
+        inside = cell in self.selected_cells()
         if inside or self._hit(event):
             self.view.selection_set(self.active[0])
             self.view.focus(self.active[0])
@@ -336,8 +336,15 @@ class TableTools:
                 self.menu.grab_release()
         return "break"
 
-    def select(self, row: str, column: str, *, extend=False, refresh=True):
-        if not extend or self.anchor is None:
+    def select(self, row: str, column: str, *, extend=False, additive=False, refresh=True):
+        if self.column_order != self.columns():
+            self.saved_ranges.clear()
+            self.anchor = self.active = None
+        if additive and self.anchor and self.active:
+            self.saved_ranges.append((self.anchor, self.active))
+        elif not extend:
+            self.saved_ranges.clear()
+        if additive or not extend or self.anchor is None:
             self.anchor = (row, column)
             self.column_order = self.columns()
         self.active = (row, column)
@@ -347,16 +354,41 @@ class TableTools:
             self._update_summary()
         self.schedule()
 
-    def selection_range(self):
+    def selection_ranges(self):
         columns = self.columns()
         if not self.anchor or not self.active or columns != self.column_order:
-            return (), ()
+            return ()
         rows = self.visible_rows()
-        if any(cell[0] not in rows or cell[1] not in columns for cell in (self.anchor, self.active)):
-            return (), ()
-        start, end = sorted((rows.index(self.anchor[0]), rows.index(self.active[0])))
-        left, right = sorted((columns.index(self.anchor[1]), columns.index(self.active[1])))
-        return rows[start:end + 1], columns[left:right + 1]
+        row_indices = {row: index for index, row in enumerate(rows)}
+        result = []
+        for anchor, active in (*self.saved_ranges, (self.anchor, self.active)):
+            if any(cell[0] not in row_indices or cell[1] not in columns for cell in (anchor, active)):
+                continue
+            start, end = sorted((row_indices[anchor[0]], row_indices[active[0]]))
+            left, right = sorted((columns.index(anchor[1]), columns.index(active[1])))
+            rectangle = (rows[start:end + 1], columns[left:right + 1])
+            if rectangle not in result:
+                result.append(rectangle)
+        return tuple(result)
+
+    def selected_cells(self):
+        return {(row, column) for rows, columns in self.selection_ranges() for row in rows for column in columns}
+
+    def selection_range(self):
+        """Return the selected row/column unions; holes are excluded by selected_cells."""
+        cells = self.selected_cells()
+        rows = {row for row, _ in cells}
+        columns = {column for _, column in cells}
+        return (tuple(row for row in self.visible_rows() if row in rows),
+                tuple(column for column in self.columns() if column in columns))
+
+    def _selected_values(self):
+        cells = self.selected_cells()
+        rows, columns = self.selection_range()
+        for row, values in zip(rows, self._values(rows, columns)):
+            for column, value in zip(columns, values):
+                if (row, column) in cells:
+                    yield row, column, value
 
     def visible_rows(self):
         """Use screen order, including expanded children and excluding closed ones."""
@@ -385,24 +417,26 @@ class TableTools:
         if not rows:
             self.reset_selection()
             return
-        summary = SelectionSummary(cells=len(rows) * len(columns))
+        summary = SelectionSummary(cells=len(self.selected_cells()))
         numbers = Calculation()
-        for values in self._values(rows, columns):
-            for column, value in zip(columns, values):
-                if value.strip():
-                    summary.count += 1
-                if column in self.money_columns:
-                    try:
-                        numbers.add(1, value, "")
-                    except ValueError:
-                        continue
-                    summary.numbers += 1
+        for _row, column, value in self._selected_values():
+            if value.strip():
+                summary.count += 1
+            if column in self.money_columns:
+                try:
+                    numbers.add(1, value, "")
+                except ValueError:
+                    continue
+                summary.numbers += 1
         summary.total = numbers.total
         self.summary = summary
         self.summary_dirty = False
         stats = f"合计 {display_number(summary.total)}   计数 {summary.count}   金额 {summary.numbers} 项"
         self.stats.set(stats if self.money_columns else f"已选 {summary.cells} 格 · 可复制")
-        self.selected.set(f"已选 {summary.numbers} 项金额 · 计数 {summary.count}")
+        ranges = len(self.selection_ranges())
+        self.selected.set(f"{ranges} 个选区 · {summary.numbers} 项金额 · 计数 {summary.count}")
+        if ranges > 1:
+            self.stats.set(f"{ranges} 个选区 · " + self.stats.get())
         self.selection_total.set(display_number(summary.total) if summary.numbers else "—")
         if hasattr(self.view, "voucher_selection"):
             self.view.voucher_selection.changed()
@@ -421,7 +455,9 @@ class TableTools:
         rows, columns = self.selection_range()
         if rows:
             self.row_cache.clear()
-            values = list(self._values(rows, columns))
+            cells = self.selected_cells()
+            values = [[value if (row, column) in cells else "" for column, value in zip(columns, values)]
+                      for row, values in zip(rows, self._values(rows, columns))]
             if len(rows) == len(columns) == 1:
                 self._copy(values[0][0])
             else:
@@ -450,19 +486,21 @@ class TableTools:
         if not rows or not self.summary.numbers:
             return
         cells = []
-        for row, values in zip(rows, self._values(rows, columns)):
+        sources = {}
+        for row, column, value in self._selected_values():
+            if column not in self.money_columns:
+                continue
+            try:
+                number = cell_number(value)
+            except ValueError:
+                continue
             if self.source_for_row is not None:
-                source = self.source_for_row(row)
+                if row not in sources:
+                    sources[row] = self.source_for_row(row)
+                source = sources[row]
             else:
                 source = self.view.set(row, "source") if "source" in self.view.cget("columns") else row
-            for column, value in zip(columns, values):
-                if column not in self.money_columns:
-                    continue
-                try:
-                    number = cell_number(value)
-                except ValueError:
-                    continue
-                cells.append(AmountSnapshot(row, column, self.view.heading(column, "text"), value, number, source))
+            cells.append(AmountSnapshot(row, column, self.view.heading(column, "text"), value, number, source))
         snapshot = SelectionSnapshot(tuple(rows), tuple(columns), tuple(cells))
         self.calculation.add(sign, str(self.summary.total), selection_name(len(self.calculation.items) + 1), snapshot)
         if reveal and self.on_toggle is not None:
@@ -587,6 +625,7 @@ class TableTools:
         self.dragging = False
         self.active = None
         self.anchor = None
+        self.saved_ranges.clear()
         self.row_cache.clear()
         self.summary = SelectionSummary()
         self.summary_dirty = False
@@ -618,11 +657,26 @@ class TableTools:
             border.place_forget()
         if self.summary_dirty:
             self._update_summary()
-        rows, columns = self.selection_range()
-        if not rows:
+        ranges = self.selection_ranges()
+        if not ranges:
             if self.anchor is not None:
                 self.reset_selection()
             return
+        self._ensure_borders(4 * len(ranges))
+        for index, (rows, columns) in enumerate(ranges):
+            self._draw_range(rows, columns, self.borders[index * 4:index * 4 + 4])
+
+    def _ensure_borders(self, count):
+        while len(self.borders) < count:
+            border = tk.Frame(self.view, background=theme.ACCENT, borderwidth=0)
+            self.borders.append(border)
+            border.bind("<Button-1>", self._click)
+            border.bind("<B1-Motion>", self._drag)
+            border.bind("<ButtonRelease-1>", self._release)
+            for event in ("<Button-2>", "<Button-3>"):
+                border.bind(event, self._context)
+
+    def _draw_range(self, rows, columns, borders):
         selected_rows = set(rows)
         visible = []
         for point in range(1, self.view.winfo_height(), 4):
@@ -645,7 +699,7 @@ class TableTools:
         width = right - x
         if width <= 0:
             return
-        for border, geometry in zip(self.borders, (
+        for border, geometry in zip(borders, (
             dict(x=x, y=y, width=width, height=2),
             dict(x=x, y=y + height - 2, width=width, height=2),
             dict(x=x, y=y, width=2, height=height),

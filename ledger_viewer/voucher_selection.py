@@ -1,4 +1,4 @@
-"""Voucher-level checks coexist with rectangular cell selection and drag handles."""
+"""Voucher-level checks coexist with disjoint cell selection."""
 
 import tkinter as tk
 from tkinter import ttk
@@ -15,8 +15,8 @@ class VoucherSelection:
         view.bindtags((self.tag, *view.bindtags()))
         view.bind_class(self.tag, '<ButtonPress-1>', self.press)
         view.configure(show='tree headings')
-        view.column('#0', width=58, minwidth=58, stretch=False)
-        view.heading('#0', text='☐  ⋮⋮', command=self.toggle_all)
+        view.column('#0', width=36, minwidth=36, stretch=False)
+        view.heading('#0', text='☐', command=self.toggle_all)
         view.bind('<<TreeviewSelect>>', lambda _e: self.changed(), add='+')
         self.info = tk.StringVar(value='')
 
@@ -38,11 +38,6 @@ class VoucherSelection:
         rows = tools.selection_range()[0] if tools else ()
         return self.row_keys(rows or self.view.selection())
 
-    def drag_keys(self, row):
-        key = self.key_for_row(row)
-        selected = self.action_keys()
-        return selected if key in selected else (key,)
-
     def set_scope(self, scope):
         if scope != self.scope:
             self.scope = scope
@@ -57,8 +52,8 @@ class VoucherSelection:
     def refresh(self):
         visible = set(self.row_keys(self.view.get_children()))
         for row in self.view.get_children():
-            self.view.item(row, text=('☑' if self.key_for_row(row) in self.checked else '☐') + '  ⋮⋮')
-        self.view.heading('#0', text=('☑' if visible and visible <= self.checked else '☐') + '  ⋮⋮')
+            self.view.item(row, text=('☑' if self.key_for_row(row) in self.checked else '☐'))
+        self.view.heading('#0', text=('☑' if visible and visible <= self.checked else '☐'))
         self.changed()
 
     def changed(self):
@@ -81,7 +76,7 @@ class VoucherSelection:
 
     def press(self, event):
         view = self.view
-        if view.identify_column(event.x) != '#0' or event.x > 28:
+        if view.identify_column(event.x) != '#0' or view.identify_region(event.x, event.y) == 'separator':
             return
         row = view.identify_row(event.y)
         if not row:
@@ -106,9 +101,18 @@ class VoucherSelection:
 def selection_bar(parent, selection):
     frame = ttk.Frame(parent, padding=(6, 2))
     frame.pack(side='bottom', fill='x', before=selection.view.master)
-    ttk.Label(frame, textvariable=selection.info, style='Hint.TLabel').pack(side='left')
-    ttk.Button(frame, text='清空勾选', command=selection.clear).pack(side='right')
-    ttk.Button(frame, text='本页全选', command=selection.toggle_all).pack(side='right', padx=4)
+    label = ttk.Label(frame, textvariable=selection.info, style='Hint.TLabel', wraplength=300)
+    label.grid(row=0, column=0, sticky='w')
+    actions = ttk.Frame(frame)
+    actions.grid(row=0, column=1, sticky='e')
+    frame.columnconfigure(0, weight=1)
+    ttk.Button(actions, text='清空勾选', command=selection.clear).pack(side='right')
+    ttk.Button(actions, text='本页全选', command=selection.toggle_all).pack(side='right', padx=4)
+    def layout(_event=None):
+        compact = frame.winfo_width() < label.winfo_reqwidth() + actions.winfo_reqwidth() + 20
+        actions.grid_configure(row=1 if compact else 0, column=0 if compact else 1)
+    frame.bind('<Configure>', layout)
+    label.bind('<Configure>', layout)
     return frame
 
 

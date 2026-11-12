@@ -3,7 +3,6 @@ import tempfile
 import tkinter as tk
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from tkinter import ttk
 from unittest.mock import patch
 
@@ -56,26 +55,76 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.root.update()
         return next(item for item in self.app.note_hub.items.values() if item['editor'] is self.app.mark_note)
 
-    def issue_target(self, issue_id):
-        if self.panel.view_mode != 'directory':
-            self.assertTrue(self.panel.back_to_directory())
-        self.panel.tree.see(f'i:{issue_id}')
-        self.root.update()
-        x, y, w, h = self.panel.tree.bbox(f'i:{issue_id}', 'title')
-        return self.panel.tree.winfo_rootx() + x + 45, self.panel.tree.winfo_rooty() + y + h // 2
+    def test_explicit_join_button_uses_checked_group(self):
+        self.app.detail_selection.checked.update((self.key, self.second_key))
+        self.app.detail_selection.refresh()
+        with patch.object(self.panel, 'choose_issue', side_effect=lambda keys: self.panel.add_to_issue(self.issue, keys)):
+            self.app.detail_join.invoke()
+        self.assertEqual(issues.list_issues(self.app.store)[0]['count'], 2)
+        self.assertEqual(len(self.app.detail_selection.checked), 2)
 
-    def drag_to(self, view, row, target):
-        view.xview_moveto(0)
+    def test_join_actions_from_marks_and_voucher_context(self):
+        self.panel.add_to_issue(self.issue, [self.key, self.second_key])
+        self.app.refresh_marks()
+        self.app.select_page('marks')
         self.root.update()
-        box = view.bbox(row, '#0')
-        self.assertTrue(box)
-        x = box[0] + (45 if hasattr(view, 'voucher_selection') else 10)
-        view.event_generate('<ButtonPress-1>', x=x, y=box[1] + box[3] // 2)
-        self.assertIsNotNone(self.app.drag.pending)
-        event = SimpleNamespace(widget=view, x_root=target[0], y_root=target[1])
-        self.app.drag.motion(event)
-        self.app.drag.release(event)
+        self.app.mark_selection.checked.update((self.key, self.second_key))
+        self.app.mark_selection.refresh()
+        with patch.object(self.panel, 'choose_issue', side_effect=lambda keys: self.panel.add_to_issue(self.other, keys)):
+            self.app.mark_join.invoke()
+        self.assertEqual(issues.list_issues(self.app.store)[1]['count'], 2)
+        self.app.open_voucher(None, entry_id=self.entry['id'])
+        dialog = next(iter(self.app.voucher_windows))
         self.root.update()
+        tools = dialog.cell_tools
+        tools.select(tools.view.get_children()[0], 'debit')
+        self.assertEqual(tuple(map(str, tools.view.cget('show'))), ('headings',))
+        with patch.object(self.panel, 'choose_issue') as choose:
+            self.app.voucher_actions.choose_from_view(tools.view)
+        self.assertEqual(choose.call_args.args[0], (self.key,))
+
+    def test_cancelled_issue_chooser_does_not_write(self):
+        self.app.detail_selection.checked.add(self.key)
+        self.app.detail_selection.refresh()
+        self.app.detail_join.invoke()
+        self.root.update()
+        chooser = next(child for child in self.app.winfo_children()
+                       if isinstance(child, tk.Toplevel) and child.title() == '加入尽调问题')
+        chooser.destroy()
+        self.assertEqual(list_marks(self.app.store), [])
+        self.assertEqual(issues.issue_vouchers(self.app.store, self.issue), [])
+        self.assertIsNone(self.app.grab_current())
+
+    def test_no_drag_handles_or_mouse_capture_remain(self):
+        self.assertFalse(hasattr(self.app, 'drag'))
+        for view in (self.app.detail_view, self.app.mark_view, self.panel.voucher_view):
+            self.assertNotIn('⋮⋮', view.heading('#0', 'text'))
+            self.assertFalse(any(str(tag).startswith('VoucherDrag:') for tag in view.bindtags()))
+        view = self.app.detail_view
+        box = view.bbox(str(self.entry['id']), '#0')
+        view.event_generate('<ButtonPress-1>', x=box[0] + 20, y=box[1] + 10)
+        view.event_generate('<B1-Motion>', x=400, y=300)
+        view.event_generate('<ButtonRelease-1>', x=400, y=300)
+        self.assertIsNone(self.app.grab_current())
+        self.assertEqual(issues.issue_vouchers(self.app.store, self.issue), [])
+
+    def test_workbench_vouchers_join_other_issue_without_losing_original_link(self):
+        self.panel.add_to_issue(self.issue, self.key)
+        self.panel.voucher_selection.checked.add(self.key)
+        self.panel.voucher_selection.refresh()
+        with patch.object(self.panel, 'choose_issue', side_effect=lambda keys: self.panel.add_to_issue(self.other, keys)):
+            self.app.voucher_actions.choose_from_view(self.panel.voucher_view)
+        self.assertEqual([item['count'] for item in issues.list_issues(self.app.store)], [1, 1])
+        self.assertEqual(self.panel.issue_id, self.issue)
+
+    def test_back_button_save_failure_keeps_editor_in_detail(self):
+        self.panel.notes.insert('end', '保存失败不能离开')
+        with patch('ledger_viewer.issue_store.save_issue', side_effect=OSError('保存失败')):
+            self.panel.back_button.invoke()
+            self.assertEqual(self.panel.view_mode, 'detail')
+            self.assertIn('保存失败不能离开', self.panel.notes.get('1.0', 'end-1c'))
+        self.assertTrue(self.panel.flush())
+
 
     def test_single_selection_does_not_load_vouchers_or_create_draft(self):
         self.panel.reset()
@@ -210,24 +259,6 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.assertEqual(self.panel.tree.selection(), (f'i:{self.other}',))
         self.assertEqual(self.panel.issue_id, self.issue)
 
-    def test_hover_back_save_failure_keeps_drag_and_editor_in_detail(self):
-        self.panel.add_to_issue(self.issue, self.key)
-        self.panel.notes.insert('end', '保存失败不能离开')
-        view = self.panel.voucher_view
-        self.root.update()
-        box = view.bbox(next(iter(self.panel.rows)), '#0')
-        view.event_generate('<ButtonPress-1>', x=box[0] + 45, y=box[1] + 10)
-        back = self.panel.back_button
-        event = SimpleNamespace(widget=view, x_root=back.winfo_rootx() + 20, y_root=back.winfo_rooty() + 10)
-        with patch('ledger_viewer.issue_store.save_issue', side_effect=OSError('保存失败')):
-            self.app.drag.motion(event)
-            self.app.drag._open_directory()
-            self.assertEqual(self.panel.view_mode, 'detail')
-            self.assertTrue(self.app.drag.active)
-            self.app.drag.cancel()
-            self.assertFalse(self.app.drag.active)
-            self.assertIsNone(self.app.grab_current())
-        self.assertTrue(self.panel.flush())
 
     def test_issue_autosave_and_page_switch_preserve_current_problem(self):
         self.panel.notes.insert('end', '核对银行流水')
@@ -270,48 +301,6 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.panel.remove_link(self.issue, self.key)
         self.assertEqual([item['count'] for item in issues.list_issues(self.app.store)], [1, 1])
 
-    def test_handle_drag_from_detail_uses_checked_group(self):
-        self.app.detail_selection.checked.update((self.key, self.second_key))
-        self.app.detail_selection.refresh()
-        self.drag_to(self.app.detail_view, str(self.entry['id']), self.issue_target(self.issue))
-        self.assertEqual(issues.list_issues(self.app.store)[0]['count'], 2)
-        self.assertEqual(len(self.app.detail_selection.checked), 2)
-        self.assertEqual(self.app.detail_tools.selection_range(), ((), ()))
-
-    def test_drag_unselected_handle_only_uses_that_voucher(self):
-        self.app.detail_selection.checked.add(self.key)
-        self.app.detail_selection.refresh()
-        row = str(self.app.store.entries()[-1]['id'])
-        self.drag_to(self.app.detail_view, row, self.issue_target(self.issue))
-        self.assertEqual([r['voucher_key'] for r in issues.issue_vouchers(self.app.store, self.issue)], [self.second_key])
-
-    def test_drop_from_marks_and_voucher_window(self):
-        self.panel.add_to_issue(self.issue, [self.key, self.second_key])
-        self.app.refresh_marks()
-        self.app.select_page('marks')
-        self.root.update()
-        self.app.mark_selection.checked.update((self.key, self.second_key))
-        self.app.mark_selection.refresh()
-        self.drag_to(self.app.mark_view, self.app.mark_view.get_children()[0], self.issue_target(self.other))
-        self.assertEqual(issues.list_issues(self.app.store)[1]['count'], 2)
-        self.app.open_voucher(None, entry_id=self.entry['id'])
-        dialog = next(iter(self.app.voucher_windows))
-        dialog.geometry('650x350+10+40')
-        self.root.update()
-        view = dialog.cell_tools.view
-        self.drag_to(view, view.get_children()[0], self.issue_target(self.other))
-        self.assertEqual(issues.list_issues(self.app.store)[1]['count'], 2)
-
-    def test_cancel_and_invalid_drop_do_not_write(self):
-        view = self.app.detail_view
-        box = view.bbox(str(self.entry['id']), '#0')
-        view.event_generate('<ButtonPress-1>', x=box[0] + 45, y=box[1] + 10)
-        self.app.drag.motion(SimpleNamespace(widget=view, x_root=10, y_root=10))
-        self.app.drag.cancel()
-        self.assertEqual(list_marks(self.app.store), [])
-        self.drag_to(view, str(self.entry['id']), (10, 10))
-        self.assertEqual(issues.issue_vouchers(self.app.store, self.issue), [])
-        self.assertFalse(self.app.drag.active)
 
     def test_notes_sync_without_overwriting_dirty_other_editor(self):
         self.panel.add_to_issue(self.issue, self.key)
@@ -367,47 +356,6 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.assertIn('当前草稿', self.root.clipboard_get())
         self.assertEqual(self.panel.notes.get('1.0', 'end-1c'), '另一份笔记')
 
-    def test_drag_between_issues_survives_hover_return_to_directory(self):
-        self.panel.add_to_issue(self.issue, self.key)
-        self.root.update()
-        view = self.panel.voucher_view
-        row = next(iter(self.panel.rows))
-        box = view.bbox(row, '#0')
-        view.event_generate('<ButtonPress-1>', x=box[0] + 45, y=box[1] + 10)
-        back = self.panel.back_button
-        x, y = back.winfo_rootx() + 30, back.winfo_rooty() + 10
-        view.event_generate('<B1-Motion>', x=x-view.winfo_rootx(), y=y-view.winfo_rooty(), rootx=x, rooty=y, state=256)
-        self.assertTrue(self.app.drag.active)
-        self.assertIs(self.app.grab_current(), self.app)
-        done = tk.BooleanVar(value=False)
-        self.root.after(550, lambda: done.set(True))
-        self.root.wait_variable(done)
-        self.assertEqual(self.panel.view_mode, 'directory')
-        self.assertFalse(view.winfo_ismapped())
-        x, y = self.issue_target(self.other)
-        self.app.event_generate('<B1-Motion>', x=x-self.app.winfo_rootx(), y=y-self.app.winfo_rooty(), rootx=x, rooty=y, state=256)
-        self.app.event_generate('<ButtonRelease-1>', x=x-self.app.winfo_rootx(), y=y-self.app.winfo_rooty(), rootx=x, rooty=y)
-        self.root.update()
-        self.assertFalse(self.app.drag.active)
-        self.assertIsNone(self.app.grab_current())
-        self.assertEqual([item['count'] for item in issues.list_issues(self.app.store)], [1, 1])
-        self.assertEqual(self.panel.view_mode, 'directory')
-
-    def test_edge_hover_opens_panel_and_cancel_restores_closed_state(self):
-        self.panel.hide()
-        self.root.update()
-        view = self.app.detail_view
-        box = view.bbox(str(self.entry['id']), '#0')
-        view.event_generate('<ButtonPress-1>', x=box[0] + 45, y=box[1] + 10)
-        self.app.drag.motion(SimpleNamespace(widget=view, x_root=self.app.winfo_rootx() + self.app.winfo_width() - 5, y_root=self.app.winfo_rooty() + 200))
-        done = tk.BooleanVar(value=False)
-        self.root.after(550, lambda: done.set(True))
-        self.root.wait_variable(done)
-        self.assertTrue(self.panel.issues_visible)
-        self.app.drag.cancel()
-        self.root.update()
-        self.assertFalse(self.panel.issues_visible)
-        self.assertEqual(list_marks(self.app.store), [])
 
     def test_detach_dock_and_close_restore_issue_and_saved_notes(self):
         self.panel.notes.insert('end', '保存后展开')

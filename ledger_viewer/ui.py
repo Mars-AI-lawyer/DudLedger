@@ -43,7 +43,8 @@ from .theme import configure_theme
 from .table_tools import TableTools
 from .voucher_selection import VoucherSelection, CellTooltip, selection_bar
 from .voucher_summary import read_marks, summaries_for_keys
-from .workbench import NoteHub, RightWorkbench, VoucherDrag
+from .workbench import NoteHub, RightWorkbench, VoucherActions
+from .account_navigation import AccountNavigation
 from . import issue_store
 from .voucher_notes import export_marks_md, list_marks, mark_for_entry, remove_mark, save_mark_by_key, source_account, voucher_key
 
@@ -1965,8 +1966,8 @@ class App(tk.Toplevel):
         self.content.rowconfigure(0, weight=1)
         self.tabs.grid(row=0, column=0, sticky="nsew")
         self.workbench = RightWorkbench(self)
-        self.drag = VoucherDrag(self)
-        self.drag.attach(self.workbench.voucher_view, lambda row: self.workbench.rows[row][1])
+        self.voucher_actions = VoucherActions(self)
+        self.voucher_actions.attach(self.workbench.voucher_view, lambda row: self.workbench.rows[row][1])
         self.content.bind("<Configure>", lambda _e: self.workbench.layout())
         self.utility_windows = {}
         frames = []
@@ -2052,6 +2053,9 @@ class App(tk.Toplevel):
         self.detail_controls.columnconfigure(1, weight=1)
         self.detail_scope_wrap = ttk.Frame(self.detail_controls)
         self.detail_scope_wrap.grid(row=0, column=0, sticky="w")
+        self.detail_accounts_toggle = ttk.Button(self.detail_scope_wrap, text="科目树 ▸", width=0,
+                                                style="Ghost.TButton", command=self.toggle_detail_accounts)
+        self.detail_accounts_toggle.pack(side="left", padx=(0, 6))
         self.detail_scope = ttk.Label(self.detail_scope_wrap, textvariable=self.account_label, wraplength=300, justify="left")
         self.detail_scope.pack(side="left")
         self.detail_scope_clear = ttk.Button(self.detail_scope_wrap, text="×", width=2, style="Ghost.TButton",
@@ -2099,16 +2103,21 @@ class App(tk.Toplevel):
         self.detail_status = ttk.Label(paging, textvariable=self.detail_info, style="Hint.TLabel", wraplength=440)
         self.detail_status.pack(side="left", fill="x", expand=True)
         self.detail_status.bind("<Configure>", self._resize_detail_status)
-        self.detail_view = tree(frames[1], VIEW_COLUMNS["detail"])
+        self.detail_body = ttk.Panedwindow(frames[1], orient="horizontal")
+        self.detail_body.pack(fill="both", expand=True)
+        self.detail_accounts = AccountNavigation(self.detail_body, self._choose_detail_account)
+        self.detail_table = ttk.Frame(self.detail_body)
+        self.detail_body.add(self.detail_table, weight=1)
+        self.detail_view = tree(self.detail_table, VIEW_COLUMNS["detail"])
         self.detail_filter_images = (filter_arrow(self.detail_view), filter_arrow(self.detail_view, active=True))
         self.detail_view.bind("<ButtonPress-1>", self._detail_filter_click)
         self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"},
                                        panel_parent=self.workbench.calculator_host("明细账"),
                                        on_toggle=lambda reveal: self.workbench.set_calculator(self.detail_tools, "明细账", reveal))
         self.detail_selection = VoucherSelection(self.detail_view, lambda row: self.detail_voucher_keys.get(row), self._update_detail_mark)
-        self.drag.attach(self.detail_view, lambda row: self.detail_voucher_keys.get(row))
-        selection_bar(frames[1], self.detail_selection)
-        self.detail_join = ttk.Button(self.detail_actions, text="加入问题…（0）", command=lambda: self.drag.choose_from_view(self.detail_view), state='disabled')
+        self.voucher_actions.attach(self.detail_view, lambda row: self.detail_voucher_keys.get(row))
+        selection_bar(self.detail_table, self.detail_selection)
+        self.detail_join = ttk.Button(self.detail_actions, text="加入问题…（0）", command=lambda: self.voucher_actions.choose_from_view(self.detail_view), state='disabled')
         self.detail_join.pack(side="right", padx=4)
         self.detail_mark.pack(side="right")
         self.detail_filter.pack(side="right", padx=(0, 6))
@@ -2173,7 +2182,7 @@ class App(tk.Toplevel):
         ttk.Button(mark_search_row, text="筛选", style="Ghost.TButton", command=self.refresh_marks).pack(side="left")
         self.mark_note_toggle = ttk.Button(mark_search_row, text='编辑备注 ▸', style="Ghost.TButton", command=self.toggle_mark_note)
         self.mark_note_toggle.pack(side='left', padx=(8, 0))
-        self.mark_join = ttk.Button(mark_search_row, text="加入问题…（0）", command=lambda: self.drag.choose_from_view(self.mark_view), state='disabled')
+        self.mark_join = ttk.Button(mark_search_row, text="加入问题…（0）", command=lambda: self.voucher_actions.choose_from_view(self.mark_view), state='disabled')
         self.mark_join.pack(side='right', padx=4)
         mark_more = ttk.Menubutton(mark_search_row, text='更多 ▾')
         mark_more.pack(side='right')
@@ -2187,7 +2196,7 @@ class App(tk.Toplevel):
         self.mark_view = tree(frames[6], [("date", "日期", 100), ("voucher", "凭证号", 105), ("summary", "摘要", 250), ("amount", "金额", 150), ("accounts", "涉及科目", 210), ("note", "备注摘要", 220), ("status", "复核状态", 150)])
         self.mark_tools = TableTools(self.mark_view, set(), show_stats=False)
         self.mark_selection = VoucherSelection(self.mark_view, lambda row: self.mark_keys.get(row), self._update_mark_actions)
-        self.drag.attach(self.mark_view, lambda row: self.mark_keys.get(row))
+        self.voucher_actions.attach(self.mark_view, lambda row: self.mark_keys.get(row))
         self.mark_tools.menu.add_command(label='取消所选关注…', command=self.remove_selected_mark)
         CellTooltip(self.mark_view)
         selection_bar(frames[6], self.mark_selection)
@@ -2466,7 +2475,6 @@ class App(tk.Toplevel):
         RelatedPartiesDialog(self)
 
     def _close(self) -> None:
-        self.drag.cancel()
         if not self.workbench.flush():
             return
         for dialog in list(self.voucher_windows | self.review_windows):
@@ -2500,7 +2508,6 @@ class App(tk.Toplevel):
         if not self.store:
             self.status.set("当前没有打开的账套。")
             return
-        self.drag.cancel()
         if not self.workbench.flush():
             return
         for dialog in list(self.voucher_windows | self.review_windows):
@@ -2520,6 +2527,7 @@ class App(tk.Toplevel):
         self.controller.book_windows.pop(self.store.path.resolve(), None)
         self.store.close()
         self.store = None
+        self.detail_accounts.reset()
         self.note_hub.unbind(self.mark_note)
         self.workbench.reset()
         self.workbench.hide()
@@ -2558,6 +2566,8 @@ class App(tk.Toplevel):
             messagebox.showerror("打开失败", str(exc), parent=self)
             return
         self.store = new_store
+        self.detail_accounts.reset()
+        self.toggle_detail_accounts(self.store.setting("detail_account_tree", "hide") == "show", persist=False)
         self.detail_selection.set_scope(None)
         self.mark_selection.set_scope(None)
         self.workbench.reset()
@@ -3122,6 +3132,7 @@ class App(tk.Toplevel):
         if self.balance_source.get() not in self.balance_options:
             self.balance_source.set(next(reversed(self.balance_options)) if self.balance_options else "无余额表")
         self.refresh_summary()
+        self._refresh_detail_accounts()
         self.refresh_details()
         for kind in REPORT_KINDS:
             report_sources = [source for source in self.store.sources() if source["kind"] == kind]
@@ -3323,6 +3334,7 @@ class App(tk.Toplevel):
         self.refresh_details()
 
     def refresh_details(self) -> None:
+        self.detail_accounts.sync(self.account)
         self.tasks.cancel("details")
         self.detail_tools.reset_selection()
         self.detail_view.delete(*self.detail_view.get_children())
@@ -3365,7 +3377,7 @@ class App(tk.Toplevel):
             side_tag = "debit_row" if row["debit_cents"] and not row["credit_cents"] else "credit_row" if row["credit_cents"] and not row["debit_cents"] else ""
             self.detail_voucher_keys[str(row["id"])] = voucher_key(row)
             marked = voucher_key(row) in marked_keys
-            self.detail_view.insert("", "end", iid=str(row["id"]), text="⋮⋮", values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
+            self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
         self.detail_selection.refresh()
         if locate_id is not None and self.detail_view.exists(str(locate_id)):
             self.detail_view.selection_set(str(locate_id))
@@ -3408,6 +3420,37 @@ class App(tk.Toplevel):
         self.account_label.set(f"{values[0]} {values[1]}".strip() + (" · 含子科目" if self.include_descendants else ""))
         self.refresh_details()
         self.select_page("entries")
+
+    def toggle_detail_accounts(self, visible=None, *, persist=True):
+        shown = str(self.detail_accounts) in self.detail_body.panes()
+        visible = not shown if visible is None else visible
+        if visible and not shown:
+            self.detail_body.insert(0, self.detail_accounts, weight=0)
+        elif not visible and shown:
+            self.detail_body.forget(self.detail_accounts)
+        self.detail_accounts_toggle.configure(text="科目树 ▾" if visible else "科目树 ▸")
+        if persist and self.store:
+            self.store.save_setting("detail_account_tree", "show" if visible else "hide")
+        self.after_idle(self._resize_workspace)
+
+    def _refresh_detail_accounts(self):
+        if not self.store:
+            self.detail_accounts.reset()
+            return
+        def read(store):
+            return store.db.execute("SELECT key,code,name FROM accounts ORDER BY code,name").fetchall()
+        if self.store.large_book():
+            self._read_task("detail_accounts", read, self.detail_accounts.set_accounts)
+        else:
+            self.detail_accounts.set_accounts(read(self.store))
+
+    def _choose_detail_account(self, account):
+        self.account = account["key"] if account else None
+        self.include_descendants = bool(self.account and self.account.startswith("C:"))
+        label = f'{account["code"]} {account["name"]}'.strip() if account else "全部科目"
+        self.account_label.set(label + (" · 含子科目" if self.include_descendants else ""))
+        self.detail_offset = 0
+        self.refresh_details()
 
     def toggle_account(self, event):
         view = self.summary_view
@@ -3502,7 +3545,7 @@ class App(tk.Toplevel):
         more.configure(menu=display_menu)
         view = tree(dialog, VIEW_COLUMNS["voucher"])
         dialog.cell_tools = TableTools(view, {"debit", "credit", "original"})
-        self.drag.attach(view, lambda _row: voucher_key(target))
+        self.voucher_actions.attach(view, lambda _row: voucher_key(target))
         ttk.Button(voucher_top, text="加入问题…", command=lambda: self.workbench.choose_issue(voucher_key(target))).pack(side="right", padx=4)
         ttk.Button(voucher_top, text="计算器", command=dialog.cell_tools.toggle).pack(side="right", padx=4)
         view.configure(height=min(8, max(2, len(lines))))
@@ -3513,7 +3556,7 @@ class App(tk.Toplevel):
         view.bind("<ButtonRelease-1>", lambda _e, widget=view: self._save_voucher_widths(widget), add="+")
         for line in lines:
             side_tag = "debit_row" if line["debit_cents"] and not line["credit_cents"] else "credit_row" if line["credit_cents"] and not line["debit_cents"] else ""
-            view.insert("", "end", text="⋮⋮", values=(line["code"], line["name"], line["summary"], line["auxiliary"], line["currency"], line["original_amount"], amount(line["debit_cents"]), amount(line["credit_cents"]), f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'), tags=("marked",) if existing_mark else ((side_tag,) if side_tag else ()))
+            view.insert("", "end", values=(line["code"], line["name"], line["summary"], line["auxiliary"], line["currency"], line["original_amount"], amount(line["debit_cents"]), amount(line["credit_cents"]), f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'), tags=("marked",) if existing_mark else ((side_tag,) if side_tag else ()))
         debit = sum(line["debit_cents"] for line in lines)
         credit = sum(line["credit_cents"] for line in lines)
         ttk.Label(dialog, text=f"{len(lines)} 行分录   借方 {amount(debit) or '0.00'}   贷方 {amount(credit) or '0.00'}   差额 {amount(debit-credit) or '0.00'}", padding=(12, 7)).pack(anchor="w")
