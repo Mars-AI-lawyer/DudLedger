@@ -16,9 +16,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
     version, rules = load_rules(store)
     from .bailian_review import DEFAULT_ENDPOINT, validate_endpoint
     endpoint = validate_endpoint(scope.get('bailian_endpoint', DEFAULT_ENDPOINT))
-    preferred = scope.get('preferred_provider', 'bailian')
-    if preferred not in ('bailian', 'jev'):
-        raise ValueError('优先模型须为百炼或 Jev')
+    preferred = 'bailian'
     accounts = selected_accounts(scope.get('review_accounts'))
     prefixes = account_prefixes(store)
     filters = {k: v for k, v in scope.items() if k in ('account', 'search', 'fiscal_year', 'period', 'include_descendants', 'source_ids')}
@@ -46,6 +44,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
             history_index.setdefault(party, []).append(row)
     saved_scope = {**filters, 'review_accounts': accounts, 'profile': rules['profile'],
                    'preferred_provider': preferred, 'bailian_endpoint': endpoint,
+                   'bailian_free_confirmed': scope.get('bailian_free_confirmed') is True,
                    'data_revision': store.setting('data_revision', '0'),
                    'party_hash': digest(parties)}
     hashes = []

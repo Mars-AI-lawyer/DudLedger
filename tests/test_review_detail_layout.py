@@ -14,7 +14,7 @@ class ReviewDetailLayoutTest(unittest.TestCase):
     tearDown = fixtures.ReviewUITest.tearDown
 
     def detail(self, geometry='840x560'):
-        batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款']})
+        batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款'], 'bailian_free_confirmed': True})
         def post(key, payload, endpoint):
             return {'model': 'decision-model-preview', 'answers': {key: decision_answer(key == 'OP01') for key in payload['questions']},
                 'usage': {'input_tokens': 10}}
@@ -39,6 +39,10 @@ class ReviewDetailLayoutTest(unittest.TestCase):
 
     def test_notes_receive_space_and_save_without_scrolling(self):
         dialog = self.detail()
+        for coordinate, size in [('winfo_rootx', 'winfo_width'), ('winfo_rooty', 'winfo_height')]:
+            parent_center = getattr(self.app, coordinate)() + getattr(self.app, size)() / 2
+            dialog_center = getattr(dialog, coordinate)() + getattr(dialog, size)() / 2
+            self.assertLessEqual(abs(parent_center - dialog_center), 2)
         dialog.note_toggle.invoke()
         self.root.update()
         self.assertGreater(dialog.note.winfo_height(), 160)

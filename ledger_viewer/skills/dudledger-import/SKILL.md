@@ -9,7 +9,11 @@ description: 分析本机 Excel/CSV 的表头和账簿结构，通过 DudLedger 
 
 ## 本机入口
 
-复制任务里提供了 `python`、`working_directory`、`sources`、`output_folder`。使用该 Python，在该工作目录运行 `python -m ledger_viewer.agent_import`。这里的 `python` 要替换成参数里的解释器路径，路径作为独立参数传入并正确引用，不要将表名、文件名拼接成可执行命令。
+复制任务里提供了 `runtime`、`command_prefix`、`working_directory`、`sources`、`output_folder`。使用 `command_prefix` 参数列表，在该工作目录追加下述子命令执行。例如用 `subprocess.run([*command_prefix, "inspect", source_path], cwd=working_directory, check=True)`；路径和表名均作为独立参数传入，不拼接 shell 命令。
+
+源码版的前缀为 `[Python路径, "-m", "ledger_viewer.agent_import"]`；Mac 便携版的前缀为 `[应用内可执行文件路径, "--agent-import"]`，它已内置运行环境，**不是 Python 解释器，不能追加 `-m` 或 `-c`，也不需要安装 Python 或依赖**。兼容旧任务时，仅当明确提供 `python` 且没有 `command_prefix`，才使用旧的 `python -m ledger_viewer.agent_import` 方式。应用移动后路径会失效，应让用户从新位置重新复制任务，不猜路径、不安装另一个版本。
+
+任务只授权读取列出的原表及方案、在输出文件夹创建新账套；不读取系统钥匙串、API Key、其他账套或无关文件。`inspect/schema/validate/create` 均不需要 AI 密钥。
 
 若没有任务参数，先定位用户安装的 DudLedger 和可导入 `ledger_viewer` 的 Python。不要猜路径、下载另一个版本或直接写 SQLite。无法访问用户本机的纯聊天网页不能执行此任务，应说明缺少哪种本机访问能力。
 

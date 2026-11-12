@@ -138,6 +138,23 @@ class AgentImportTest(unittest.TestCase):
         self.assertIn(str(self.source.resolve()), content)
         self.assertIn("序时账", content)
 
+    def test_frozen_handoff_calls_application_instead_of_python(self):
+        with patch('sys.frozen', True, create=True), patch('sys.executable', '/Applications/DudLedger.app/Contents/MacOS/DudLedger'):
+            content = handoff_text([(self.source, '序时账')], self.base)
+        context = json.loads(content.split('本机任务参数：\n', 1)[1])
+        self.assertEqual(context['runtime'], 'portable')
+        self.assertEqual(context['command_prefix'], ['/Applications/DudLedger.app/Contents/MacOS/DudLedger', '--agent-import'])
+        self.assertNotIn('python', context)
+        self.assertIn('不是 Python 解释器', content)
+
+    def test_source_handoff_preserves_module_entry(self):
+        with patch('sys.frozen', False, create=True):
+            content = handoff_text([(self.source, '序时账')], self.base)
+        context = json.loads(content.split('本机任务参数：\n', 1)[1])
+        self.assertEqual(context['runtime'], 'source')
+        self.assertEqual(context['command_prefix'][1:], ['-m', 'ledger_viewer.agent_import'])
+        self.assertEqual(context['python'], context['command_prefix'][0])
+
     def test_warnings_require_acknowledgement_and_remain_in_audit(self):
         self.plan["sheets"][0]["mapping"].pop("voucher_no")
         self.save_plan()

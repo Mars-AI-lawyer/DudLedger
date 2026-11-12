@@ -28,7 +28,7 @@ class SpecialistUITest(unittest.TestCase):
         self.panel.review_accounts['其他应付款'].set(True)
         with patch.object(self.panel, 'prepare') as prepare:
             self.panel.new_batch()
-        prepare.assert_called_once_with({'review_accounts': ['其他应付款']})
+            prepare.assert_called_once_with({'review_accounts': ['其他应付款']})
 
     def test_prompt_editor_changes_each_question_advice_and_base_with_versions(self):
         batch = prepare_batch(self.app.store, {})
@@ -61,7 +61,7 @@ class SpecialistUITest(unittest.TestCase):
         reopened.destroy()
 
     def test_flash_confirm_results_and_full_voucher_details(self):
-        batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款']})
+        batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款'], 'bailian_free_confirmed': True})
         dialog = ConsentDialog(self.panel, batch)
         self.root.update()
         self.assertIn('股东借款', dialog.preview.get('1.0', 'end'))
@@ -100,7 +100,7 @@ class SpecialistUITest(unittest.TestCase):
         detail.destroy()
 
     def test_bailian_result_shows_prompt_decisions_without_probability(self):
-        batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款']})
+        batch = prepare_batch(self.app.store, {'review_accounts': ['其他应付款'], 'bailian_free_confirmed': True})
         def post(key, payload, endpoint):
             return {'model': 'decision-model-preview', 'answers': {key: decision_answer(key == 'OP01') for key in payload['questions']},
                 'usage': {'input_tokens': 100}}
@@ -150,7 +150,7 @@ class SpecialistUITest(unittest.TestCase):
             dialog.review_preferred.set('Jev 优先')
             dialog._finish()
             self.assertEqual(credentials['key'], 'fictional-bailian-key')
-            self.assertEqual(self.app.controller.preferences['review_preferred_provider'], 'jev')
+            self.assertEqual(self.app.controller.preferences['review_preferred_provider'], 'bailian')
             self.assertIn('/systemone', self.app.controller.preferences['bailian_endpoint'])
             save_preferences.assert_called_once()
 

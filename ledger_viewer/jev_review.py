@@ -591,14 +591,15 @@ class ReviewJob:
                 if not info or info['status'] != 'preview':
                     raise ValueError('批次已确认或失效，请重新预览')
                 special = json.loads(info['body_json']).get('profile') == 'account-special-v1'
+                scope = json.loads(info['scope_json'])
+                if special and scope.get('bailian_free_confirmed') is not True:
+                    self._bailian_key = ''
                 if not self._key and not (special and (self._deepseek_key or self._bailian_key)):
-                    raise ValueError('请先在设置中保存百炼、Jev 或 DeepSeek API Key')
+                    raise ValueError('请先在设置中保存 Jev 或 DeepSeek API Key，或确认百炼免费可用并保存其密钥')
                 if special:
                     from .bailian_review import DEFAULT_ENDPOINT, validate_endpoint
                     scope = json.loads(info['scope_json'])
                     self._bailian_endpoint = validate_endpoint(scope.get('bailian_endpoint', DEFAULT_ENDPOINT))
-                    if scope.get('preferred_provider') == 'jev':
-                        self._provider_order = ('jev', 'bailian', 'deepseek')
                 # Lock the database while validating the scope and marking consent.
                 store.db.execute('UPDATE jev_batches SET snapshot_hash=snapshot_hash WHERE id=?', (self.batch_id,))
                 if special:

@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import ExitStack
 
 import tkinter as tk
 
@@ -15,6 +16,56 @@ class SettingsDialogTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_first_run_can_save_all_keys_and_only_appears_once(self):
+        saved = {'jev': '', 'deepseek': '', 'bailian': ''}
+        with ExitStack() as stack:
+            for provider, getter, setter in [('jev', 'get_api_key', 'save_api_key'),
+                    ('deepseek', 'deepseek_get_api_key', 'deepseek_save_api_key'),
+                    ('bailian', 'bailian_get_api_key', 'bailian_save_api_key')]:
+                stack.enter_context(patch('ledger_viewer.ui.' + getter, side_effect=lambda p=provider: saved[p]))
+                stack.enter_context(patch('ledger_viewer.ui.' + setter, side_effect=lambda value, p=provider: saved.__setitem__(p, value)))
+            app = Application()
+            self.addCleanup(app.destroy)
+            app.preferences_path = self.base / 'preferences.json'
+            app.preferences = {}
+            dialog = app.offer_ai_setup()
+            app.update()
+            self.assertEqual(dialog.tabs.select(), str(dialog.ai_tab))
+            self.assertIn('DeepSeek', dialog.provider_tabs.tab(dialog.provider_tabs.select(), 'text'))
+            self.assertLess(dialog.winfo_reqheight(), app.winfo_screenheight() - 32)
+            self.assertFalse(dialog.bailian_free_confirmed.get())
+            with patch('ledger_viewer.jev_ui.launch_connection_test') as network:
+                dialog._test_bailian_connection()
+                network.assert_not_called()
+            dialog.api_key.set('fictional-jev')
+            dialog.deepseek_key.set('fictional-deepseek')
+            dialog.bailian_key.set('fictional-bailian')
+            dialog.bailian_free_confirmed.set(True)
+            dialog._finish()
+            self.assertEqual(saved, {'jev': 'fictional-jev', 'deepseek': 'fictional-deepseek', 'bailian': 'fictional-bailian'})
+            self.assertTrue(app.preferences['ai_setup_seen'])
+            self.assertTrue(app.preferences['bailian_free_confirmed'])
+            self.assertIsNone(app.offer_ai_setup())
+            self.assertNotIn('fictional-', app.preferences_path.read_text())
+
+    def test_first_run_can_be_skipped_without_saving_credentials(self):
+        with patch('ledger_viewer.ui.get_api_key', return_value=''), \
+             patch('ledger_viewer.ui.deepseek_get_api_key', return_value=''), \
+             patch('ledger_viewer.ui.bailian_get_api_key', return_value=''), \
+             patch('ledger_viewer.ui.save_api_key') as save_jev, \
+             patch('ledger_viewer.ui.deepseek_save_api_key') as save_deepseek, \
+             patch('ledger_viewer.ui.bailian_save_api_key') as save_bailian:
+            app = Application()
+            self.addCleanup(app.destroy)
+            app.preferences_path = self.base / 'preferences.json'
+            app.preferences = {}
+            dialog = app.offer_ai_setup()
+            dialog.deepseek_key.set('unsaved-draft')
+            dialog._skip_setup()
+            for save in (save_jev, save_deepseek, save_bailian):
+                save.assert_not_called()
+            self.assertIsNone(app.offer_ai_setup())
 
     def test_finish_saves_typed_key_and_reopening_shows_saved_key(self):
         saved = {"key": ""}

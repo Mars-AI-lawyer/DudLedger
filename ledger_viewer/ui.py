@@ -8,6 +8,7 @@ import re
 import sqlite3
 import tempfile
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from threading import Event
 from tkinter import font as tkfont
@@ -34,6 +35,7 @@ from .jev_mapping import delete_api_key, get_api_key, key_memory_only, save_api_
 from .navigation import NavigationTooltip, navigation_icon
 from .empty_state import EmptyState
 from .widgets import RoundedButton, RoundedFrame
+from .window_position import center_window
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, PrecheckStats, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
 from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, build_party_index, indexed_party_match
@@ -211,14 +213,17 @@ class ColumnDialog(tk.Toplevel):
 
 
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, parent: "App"):
+    def __init__(self, parent: "App", *, first_run=False):
         super().__init__(parent)
+        self.withdraw()
+        self.first_run = first_run
         self.parent = parent
-        self.title("设置")
+        self.title("首次使用 · 配置 AI 服务" if first_run else "设置")
         self.resizable(False, False)
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._finish)
         tabs = ttk.Notebook(self)
+        self.tabs = tabs
         tabs.pack(fill='both', expand=True)
         pref_host = ttk.Frame(tabs)
         tabs.add(pref_host, text='偏好')
@@ -266,15 +271,28 @@ class SettingsDialog(tk.Toplevel):
         self.grid_lines = tk.BooleanVar(value=parent.controller.show_grid)
         ttk.Checkbutton(body, text="显示表格虚线（关闭后大表滚动更轻快）", variable=self.grid_lines,
                         command=lambda: parent.controller.set_grid_lines(self.grid_lines.get())).pack(anchor="w", pady=(7, 0))
-        ai_tab = ttk.Frame(tabs, padding=16)
-        tabs.add(ai_tab, text='AI 服务')
-        ttk.Label(ai_tab, text="导入识别：仅 DeepSeek Flash（低思考）").pack(anchor="w")
+        ai_host = ttk.Frame(tabs)
+        self.ai_tab = ai_host
+        tabs.add(ai_host, text='AI 服务')
+        ai_canvas = tk.Canvas(ai_host, width=610, height=min(600, max(300, self.winfo_screenheight() - 230)), highlightthickness=0)
+        ai_scrollbar = ttk.Scrollbar(ai_host, orient='vertical', command=ai_canvas.yview)
+        ai_scrollbar.pack(side='right', fill='y')
+        ai_canvas.pack(side='left', fill='both', expand=True)
+        ai_canvas.configure(yscrollcommand=ai_scrollbar.set)
+        ai_tab = ttk.Frame(ai_canvas, padding=16)
+        ai_content = ai_canvas.create_window(0, 0, window=ai_tab, anchor='nw')
+        ai_tab.bind('<Configure>', lambda _event: ai_canvas.configure(scrollregion=ai_canvas.bbox('all')))
+        ai_canvas.bind('<Configure>', lambda event: ai_canvas.itemconfigure(ai_content, width=event.width))
+        self.bind('<MouseWheel>', lambda event: (ai_canvas if tabs.select() == str(ai_host) else canvas).yview_scroll(-1 if event.delta > 0 else 1, 'units'))
+        ttk.Label(ai_tab, text="先配置 DeepSeek，再按需配置百炼和 Jev。密钥均由使用者自行申请。" if first_run else "AI 服务与调用顺序").pack(anchor="w")
+        ttk.Label(ai_tab, text="导入账簿：DeepSeek Flash 分析表头和列映射。\n凭证抽查：百炼（确认免费可用）→ Jev → DeepSeek Flash。\n未配置、额度不足或服务不可用时顺延；没有可用密钥则提示配置。",
+                  wraplength=550, justify='left').pack(anchor='w', pady=6)
         self.provider = tk.StringVar(value=PROVIDER_LABELS["deepseek"])
         preference = ttk.Frame(ai_tab)
         preference.pack(fill='x', pady=(8, 5))
         ttk.Label(preference, text='凭证抽查优先模型').pack(side='left')
-        self.review_preferred = tk.StringVar(value='Jev 优先' if parent.controller.preferences.get('review_preferred_provider') == 'jev' else '百炼优先（默认）')
-        ttk.Combobox(preference, textvariable=self.review_preferred, values=('百炼优先（默认）', 'Jev 优先'), state='readonly', width=18).pack(side='left', padx=8)
+        self.review_preferred = tk.StringVar(value='百炼优先（默认）')
+        ttk.Label(preference, text='百炼免费可用时优先，其次 Jev，最后 DeepSeek').pack(side='left', padx=8)
         provider_tabs = ttk.Notebook(ai_tab)
         provider_tabs.pack(fill='x', pady=5)
         jev_host, bailian_host, deepseek_host = (ttk.Frame(provider_tabs, padding=8) for _ in range(3))
@@ -282,6 +300,7 @@ class SettingsDialog(tk.Toplevel):
         provider_tabs.add(jev_host, text='Jev（可选）')
         provider_tabs.add(deepseek_host, text='DeepSeek Flash（兜底）')
         self.provider_tabs = provider_tabs
+        ttk.Button(jev_host, text='打开 Jev 官网申请 API Key（可选）', command=lambda: webbrowser.open('https://console.typesafe.ai/')).pack(anchor='w')
         ttk.Label(jev_host, text="Jev API Key（仅用于凭证尽调筛查）").pack(anchor="w", pady=(7, 0))
         key_row = ttk.Frame(jev_host)
         key_row.pack(fill="x", pady=(5, 0))
@@ -297,6 +316,8 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(jev_host, textvariable=self.key_status, foreground=theme.MUTED).pack(anchor="w", pady=(4, 0))
         self._refresh_key_status()
         self._build_bailian_settings(bailian_host)
+        ttk.Button(deepseek_host, text='打开 DeepSeek 开放平台申请 API Key', command=lambda: webbrowser.open('https://platform.deepseek.com/api_keys')).pack(anchor='w')
+        ttk.Label(deepseek_host, text='用于导入识别，也用于凭证抽查兜底；API 调用费用以平台账户为准。', wraplength=510).pack(anchor='w', pady=4)
         ttk.Label(deepseek_host, text="DeepSeek API Key").pack(anchor="w", pady=(7, 0))
         deepseek_row = ttk.Frame(deepseek_host)
         deepseek_row.pack(fill="x", pady=(5, 0))
@@ -338,6 +359,18 @@ class SettingsDialog(tk.Toplevel):
         footer = ttk.Frame(self, padding=(16, 8))
         footer.pack(fill='x')
         ttk.Button(footer, text="保存并完成", command=self._finish).pack(side='right')
+        if first_run:
+            ttk.Button(footer, text='稍后配置', command=self._skip_setup).pack(side='right', padx=8)
+            tabs.select(ai_host)
+            provider_tabs.select(deepseek_host)
+        self.update_idletasks()
+        center_window(self, parent, self.winfo_reqwidth(), self.winfo_reqheight())
+        self.deiconify()
+
+    def _skip_setup(self):
+        self.parent.controller.preferences['ai_setup_seen'] = True
+        self.parent.controller._save_preferences()
+        self.destroy()
 
     def _toggle_storage_help(self):
         expanded = bool(self.storage_help.winfo_manager())
@@ -345,6 +378,11 @@ class SettingsDialog(tk.Toplevel):
         self.storage_toggle.configure(text=("›" if expanded else "⌄") + " 账套辅助文件说明")
 
     def _build_bailian_settings(self, host):
+        ttk.Button(host, text='打开百炼决策模型申请与使用说明', command=lambda: webbrowser.open('https://help.aliyun.com/zh/model-studio/decision-model-api')).pack(anchor='w')
+        links = ttk.Frame(host)
+        links.pack(fill='x', pady=3)
+        ttk.Button(links, text='百炼控制台 · 申请密钥', command=lambda: webbrowser.open('https://bailian.console.aliyun.com/')).pack(side='left')
+        ttk.Button(links, text='查看限时免费政策', command=lambda: webbrowser.open('https://help.aliyun.com/zh/model-studio/decision-model-preview/')).pack(side='left', padx=5)
         ttk.Label(host, text='百炼 API Key（decision-model-preview）').pack(anchor='w')
         self.bailian_key = tk.StringVar(value=bailian_get_api_key())
         row = ttk.Frame(host)
@@ -359,10 +397,18 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(host, text='决策接口地址（默认北京试用域名；可改为控制台的业务空间专属地址）').pack(anchor='w', pady=(6, 0))
         self.bailian_endpoint = tk.StringVar(value=self.parent.controller.preferences.get('bailian_endpoint', BAILIAN_ENDPOINT))
         ttk.Entry(host, textvariable=self.bailian_endpoint).pack(fill='x', pady=4)
+        ttk.Button(host, text='测试百炼连接（虚构内容）', command=self._test_bailian_connection).pack(anchor='w', pady=4)
+        self.bailian_free_confirmed = tk.BooleanVar(value=self.parent.controller.preferences.get('bailian_free_confirmed') is True)
+        ttk.Checkbutton(host, text='我已确认该模型当前限时免费，启用百炼', variable=self.bailian_free_confirmed).pack(anchor='w', pady=4)
+        ttk.Label(host, text='官方目前标注“限时免费”，开通资格和期限以平台为准。程序无法查询计费状态；未勾选时跳过百炼。免费条件变化后请取消勾选；控制台如提供“免费额度用完即停”，建议开启。', foreground='#555', wraplength=510).pack(anchor='w')
+
+    def _test_bailian_connection(self):
+        if not self.bailian_free_confirmed.get():
+            self.bailian_status.set('请先核实官方免费政策，再勾选启用百炼。')
+            return
         from .jev_ui import launch_connection_test
-        ttk.Button(host, text='测试百炼连接（虚构内容）', command=lambda: launch_connection_test(self, self.bailian_status,
-            provider='bailian', api_key=self.bailian_key.get(), endpoint=self.bailian_endpoint.get())).pack(anchor='w', pady=4)
-        ttk.Label(host, text='默认百炼 → Jev → DeepSeek；也可改为 Jev 优先。北京试用地址用于快速体验，正式长期使用可换为业务空间专属域名。', foreground='#555', wraplength=510).pack(anchor='w')
+        launch_connection_test(self, self.bailian_status, provider='bailian',
+                               api_key=self.bailian_key.get(), endpoint=self.bailian_endpoint.get())
 
     def _refresh_bailian_status(self):
         self.bailian_status.set(('密钥仅保留在本次运行内存' if bailian_memory_only() else '密钥已保存到系统安全凭据库') if bailian_get_api_key() else '尚未保存百炼密钥')
@@ -446,7 +492,9 @@ class SettingsDialog(tk.Toplevel):
         if self.bailian_key.get() and self.bailian_key.get() != bailian_get_api_key() and not self._save_bailian_key():
             return
         self.parent.controller.preferences.update(bailian_endpoint=endpoint,
-            review_preferred_provider='jev' if self.review_preferred.get() == 'Jev 优先' else 'bailian')
+            review_preferred_provider='bailian', bailian_free_confirmed=self.bailian_free_confirmed.get())
+        if self.first_run:
+            self.parent.controller.preferences['ai_setup_seen'] = True
         self.parent.controller._save_preferences()
         self.destroy()
 
@@ -1860,7 +1908,7 @@ class App(tk.Toplevel):
         self.detail_offset = 0
         self.detail_total = 0
         self._checks_cache = None
-        self.title(f"账簿核查 · v{__version__}")
+        self.title(f"DudLedger · v{__version__}")
         self.geometry("1160x690")
         self.minsize(820, 520)
         self.resizable(True, True)
@@ -2547,7 +2595,7 @@ class App(tk.Toplevel):
             choice.set("无报表")
         self.book_name.set("未打开账套")
         self.refresh_workbench_badge(0)
-        self.title(f"账簿核查 · v{__version__}")
+        self.title(f"DudLedger · v{__version__}")
         self.refresh_all()
         self.review_panel.batch_id = None
         self.review_panel.job = None
@@ -2592,7 +2640,7 @@ class App(tk.Toplevel):
         self.balance_source.set("无余额表")
         for choice in self.report_source.values():
             choice.set("无报表")
-        self.title(f"账簿核查 · {path.name}")
+        self.title(f"DudLedger · {path.name}")
         self.refresh_all()
         self.review_panel.refresh()
         self.select_page("entries" if self.store.setting("home_view", "summary") == "detail" else "accounts")
@@ -3529,6 +3577,7 @@ class App(tk.Toplevel):
         target = lines[0]
         existing_mark = mark_for_entry(self.store, entry_id)
         dialog = tk.Toplevel(self)
+        dialog.withdraw()
         dialog.ledger_app = self
         self.voucher_windows.add(dialog)
         dialog.bind("<Destroy>", lambda event: self.voucher_windows.discard(dialog) if event.widget is dialog else None)
@@ -3627,9 +3676,9 @@ class App(tk.Toplevel):
         ttk.Button(actions, text="重读已保存备注…", command=lambda: self.note_hub.reload(editor)).pack(side="right", padx=4)
         collapsed_label = "查看 / 编辑关注备注" if existing_mark else "关注这张凭证"
         note_height = 0
-        def toggle_notes() -> None:
+        def toggle_notes(initial=False) -> None:
             nonlocal note_height
-            width, height = dialog.winfo_width(), dialog.winfo_height()
+            width, height = (760, compact_height) if initial else (dialog.winfo_width(), dialog.winfo_height())
             if note_area.winfo_manager():
                 note_area.pack_forget()
                 dialog.minsize(620, 240)
@@ -3651,10 +3700,13 @@ class App(tk.Toplevel):
         dialog.bind("<Escape>", lambda _event: request_close())
         dialog.update_idletasks()
         compact_height = min(440, max(240, dialog.winfo_reqheight()))
-        dialog.geometry(f"760x{compact_height}")
-        dialog.update_idletasks()
         if edit_attention:
-            toggle_notes()
+            toggle_notes(initial=True)
+        initial_height = min(dialog.winfo_screenheight() - 100, compact_height + note_height) if edit_attention else compact_height
+        center_window(dialog, self, 760, initial_height)
+        dialog.deiconify()
+        if edit_attention:
+            editor.focus_set()
         else:
             view.focus_set()
 
@@ -3706,6 +3758,10 @@ class Application(tk.Tk):
         self.windows: set[App] = set()
         self.book_windows: dict[Path, App] = {}
         self.new_window()
+
+    def offer_ai_setup(self):
+        if not self.preferences.get('ai_setup_seen') and self.windows:
+            return SettingsDialog(next(iter(self.windows)), first_run=True)
 
     def _configure_theme(self) -> None:
         configure_theme(self)
@@ -3796,7 +3852,9 @@ class Application(tk.Tk):
 
 
 def main() -> None:
-    Application().mainloop()
+    application = Application()
+    application.after_idle(application.offer_ai_setup)
+    application.mainloop()
 
 
 if __name__ == "__main__":

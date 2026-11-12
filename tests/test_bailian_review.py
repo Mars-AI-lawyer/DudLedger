@@ -27,7 +27,7 @@ class BailianReviewTest(unittest.TestCase):
 
     def run_case(self, scope=None, jev='jev-key', bailian='bailian-key', flash='flash-key'):
         self.bailian_calls = []
-        batch = prepare_batch(self.store, scope or {'review_accounts':['其他应付款']})
+        batch = prepare_batch(self.store, {'bailian_free_confirmed': True, **(scope or {'review_accounts':['其他应付款']})})
         job = ReviewJob(self.store.path, batch, jev, existing.JevClient,
             bailian_key=bailian, bailian_post=self.post, deepseek_key=flash, deepseek_chat=self.flash)
         job.start(self.store)
@@ -48,10 +48,10 @@ class BailianReviewTest(unittest.TestCase):
         group = voucher_results(self.store, batch)[0]
         self.assertIn('bailian', group['categories'][0][2])
 
-    def test_jev_can_be_selected_as_first_choice(self):
+    def test_legacy_jev_preference_keeps_bailian_first(self):
         self.run_case({'review_accounts':['其他应付款'], 'preferred_provider':'jev'})
-        self.assertEqual(len(existing.JevClient.calls), 1)
-        self.assertFalse(self.bailian_calls)
+        self.assertFalse(existing.JevClient.calls)
+        self.assertEqual(len(self.bailian_calls), 1)
 
     def test_missing_bailian_falls_back_to_jev_then_missing_both_to_flash(self):
         self.run_case(bailian='')
@@ -97,8 +97,13 @@ class BailianReviewTest(unittest.TestCase):
 
     def test_switching_preferred_model_does_not_reuse_other_model_cache(self):
         self.run_case()
-        batch = self.run_case({'review_accounts':['其他应付款'], 'preferred_provider':'jev'})
+        batch = self.run_case({'review_accounts':['其他应付款'], 'bailian_free_confirmed':False})
         self.assertEqual(batch_counts(self.store, batch)['cached'], 0)
+        self.assertEqual(voucher_results(self.store, batch)[0]['provider'], 'jev')
+
+    def test_bailian_is_skipped_until_free_use_is_confirmed(self):
+        batch = self.run_case({'review_accounts':['其他应付款'], 'bailian_free_confirmed':False})
+        self.assertFalse(self.bailian_calls)
         self.assertEqual(voucher_results(self.store, batch)[0]['provider'], 'jev')
 
     def test_older_rules_migrate_without_overwriting_custom_prompts_or_history(self):

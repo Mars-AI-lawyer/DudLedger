@@ -122,6 +122,26 @@ class EntryWorkflowTest(unittest.TestCase):
         self.assertEqual(self.app.tabs.index('current'), 1)
         self.assertEqual(len(self.app.detail_view.get_children()), 2)
 
+    def test_vouchers_center_on_current_ledger_on_every_open(self):
+        self.app._use_book(self.base / 'book.sqlite')
+        header, _, mapping = guess_header(self.source, 'CSV', 'entry')
+        self.app.store.import_sheet(ImportSpec(self.source, 'CSV', header, 'entry', mapping))
+        self.app.refresh_all()
+        entry_id = int(self.app.detail_view.get_children()[0])
+        for geometry, edit_attention in [('1000x650+40+40', False),
+                                         ('1000x650+180+80', False),
+                                         ('1000x650+80+50', True)]:
+            self.app.geometry(geometry)
+            self.root.update()
+            self.app.open_voucher(None, entry_id=entry_id, edit_attention=edit_attention)
+            self.root.update()
+            dialog = next(iter(self.app.voucher_windows))
+            for coordinate, size in [('winfo_rootx', 'winfo_width'), ('winfo_rooty', 'winfo_height')]:
+                parent_center = getattr(self.app, coordinate)() + getattr(self.app, size)() / 2
+                dialog_center = getattr(dialog, coordinate)() + getattr(dialog, size)() / 2
+                self.assertLessEqual(abs(parent_center - dialog_center), 2)
+            self.assertEqual(dialog.note_editor.winfo_ismapped(), edit_attention)
+
     def test_voucher_lookup_stays_compact_until_notes_are_requested(self):
         self.app._use_book(self.base / 'book.sqlite')
         header, _, mapping = guess_header(self.source, 'CSV', 'entry')
@@ -147,8 +167,10 @@ class EntryWorkflowTest(unittest.TestCase):
         self.assertFalse(editor.winfo_ismapped())
         self.assertTrue(view.bbox(view.get_children()[-1]))
         self.assertEqual(list_marks(self.app.store), [])
+        position = (dialog.winfo_x(), dialog.winfo_y())
         button(dialog, '关注这张凭证').invoke()
         self.root.update()
+        self.assertEqual((dialog.winfo_x(), dialog.winfo_y()), position)
         self.assertTrue(editor.winfo_ismapped())
         self.assertGreater(dialog.winfo_height(), compact_height)
         self.assertEqual(list_marks(self.app.store), [])
@@ -157,6 +179,7 @@ class EntryWorkflowTest(unittest.TestCase):
         self.assertEqual(list_marks(self.app.store)[0]['note'], '待补合同')
         button(dialog, '收起备注').invoke()
         self.root.update()
+        self.assertEqual((dialog.winfo_x(), dialog.winfo_y()), position)
         self.assertFalse(editor.winfo_ismapped())
         self.assertLessEqual(dialog.winfo_height(), compact_height + 2)
         self.app.open_voucher(None, entry_id=entry_id)

@@ -10,6 +10,7 @@ from queue import Empty, Queue
 from threading import Thread
 
 from .background import check_cancelled
+from .window_position import center_window
 from .store import LedgerStore
 from .importer import format_money
 from .jev_mapping import get_api_key
@@ -23,8 +24,8 @@ from .jev_review import (BOUNDARY, STATUS_LABELS, SEND_FIELDS,
     refresh_staleness, save_feedback, test_connection, voucher_results, voucher_result_context)
 
 CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、往来单位、辅助核算、非零一侧的借贷金额，'
-    '以及当前账套尽调主体名单中的名称与身份（不含备注），默认依次使用阿里百炼决策模型、TypeSafe Jev、DeepSeek Flash（不思考）；可在设置中改为 Jev 优先，前一级未配置或余额不足时尝试下一级，'
-    '用于筛选值得法律尽调律师进一步查看的凭证。\n\n'
+    '以及当前账套尽调主体名单中的名称与身份（不含备注），依次使用阿里百炼决策模型、TypeSafe Jev、DeepSeek Flash（不思考）；前一级未配置、额度不足或服务不可用时尝试下一级，'
+    '用于筛选值得法律尽调律师进一步查看的凭证。百炼仅在使用者确认免费可用后启用；未确认时跳过。\n\n'
     '同时提供本次启用的专项问题及明确取得的历史背景。'
     '这些字段可能包含客户商业信息或个人信息。请确认本次使用符合项目的保密安排，并仅选择本次审查所需的范围。'
     '先按所选科目定位凭证，再发送同一凭证的完整分录作为上下文；不会因此扫描银行存款等其他科目的全部凭证。'
@@ -101,7 +102,7 @@ class ReviewRulesDialog(tk.Toplevel):
         ttk.Label(model_row, text='Jev 模型').pack(side='left')
         self.model = tk.StringVar(value=self.rules['model'])
         ttk.Combobox(model_row, textvariable=self.model, values=('jev-1.13.0', 'jev-1.14.0'), state='readonly', width=16).pack(side='left', padx=8)
-        ttk.Label(model_row, text='默认百炼优先；可在偏好设置改为 Jev 优先').pack(side='left')
+        ttk.Label(model_row, text='百炼免费可用时优先，其次 Jev，最后 DeepSeek').pack(side='left')
         ttk.Label(self, text='逐项按照提示词直接判断命中或不命中，结果由律师核查。', padding=10).pack(anchor='w')
         self.paths = {'基础提示词（三种模型共用）': ('common',), '信息不足提问（百炼／Jev）': ('insufficient',)}
         for i, topic in enumerate(self.rules['topics']):
@@ -184,7 +185,7 @@ class ConsentDialog(tk.Toplevel):
             if value and field in labels:
                 description.append(f'{labels[field]}：' + ('、'.join(value) if isinstance(value, list) else str(value)))
         wrapped_label(self, text='本次将选定凭证及其完整分录、尽调主体名单和程序特征发送至下列模型服务；可能包含客户商业信息或个人信息，请确认符合项目保密安排。原始文件不上传。完整说明、名单及实际发送字段见下方预览。', wraplength=750, padding=12).pack(fill='x')
-        order = 'Jev → 百炼 → DeepSeek Flash' if scope.get('preferred_provider') == 'jev' else '百炼 → Jev → DeepSeek Flash'
+        order = '百炼（已确认免费可用）→ Jev → DeepSeek Flash' if scope.get('bailian_free_confirmed') else 'Jev → DeepSeek Flash（百炼未确认免费，已跳过）'
         wrapped_label(self, text='本次优先顺序：' + order, padding=(12, 0)).pack(fill='x')
         wrapped_label(self, text=f'账套：{self.store.path.name}\n范围：' + ('；'.join(description) or '全部明细分录') + f'\n共 {self.total} 条分录，归为 {self.voucher_total} 张凭证／无号来源行；每张凭证去重合并后核查（相同行合并金额并标注次数，仅发送非零一侧金额）；超长内容分段 · 规则 v{info["rule_id"]} · {info["model"]}', padding=(12, 4), wraplength=750).pack(fill='x')
         parties = party_names(self.store.related_parties())
@@ -396,7 +397,8 @@ class ReviewPanel(ttk.Frame):
     def prepare(self, scope):
         if self.preparing or self.app.import_busy:
             return
-        scope = {**scope, 'preferred_provider': self.app.controller.preferences.get('review_preferred_provider', 'bailian'),
+        scope = {**scope, 'preferred_provider': 'bailian',
+                 'bailian_free_confirmed': self.app.controller.preferences.get('bailian_free_confirmed') is True,
                  'bailian_endpoint': self.app.controller.preferences.get('bailian_endpoint', BAILIAN_ENDPOINT)}
         if not self.app.store.large_book():
             try:
@@ -637,6 +639,7 @@ class ReviewDetail(tk.Toplevel):
 
     def __init__(self, panel, group):
         super().__init__(panel)
+        self.withdraw()
         from .ui import VIEW_COLUMNS, amount, tree
         from .voucher_notes import list_marks, mark_for_entry, remove_mark, save_mark, voucher_key
         self._mark_tools = (mark_for_entry, remove_mark, save_mark, list_marks)
@@ -731,6 +734,8 @@ class ReviewDetail(tk.Toplevel):
         self.json_text = None
         self.bind('<Escape>', lambda _event: self.request_close())
         self.protocol('WM_DELETE_WINDOW', self.request_close)
+        center_window(self, self.app, 840, 560)
+        self.deiconify()
 
     def request_close(self):
         if not self.note_draft.flush():
