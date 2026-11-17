@@ -28,57 +28,57 @@ class EntryWorkflowTest(unittest.TestCase):
             app._close()
         self.temp.cleanup()
 
-    def test_import_creates_book_only_after_selection_and_keeps_existing_books(self):
+    def test_import_creates_book_in_source_directory_without_extra_dialog(self):
+        self.root.preferences.pop('book_location_mode', None)
         with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=()), patch('ledger_viewer.ui.BatchImportDialog') as dialog:
             self.app.import_file()
             self.assertIsNone(self.app.store)
-            self.assertFalse(self.root.book_folder.exists())
             dialog.assert_not_called()
         with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
-             patch('ledger_viewer.ui.filedialog.asksaveasfilename', side_effect=[str(self.base / 'books' / 'sample.sqlite'), str(self.base / 'books' / 'sample-2.sqlite')]) as save, \
+             patch('ledger_viewer.ui.filedialog.asksaveasfilename') as save, \
              patch('ledger_viewer.ui.BatchImportDialog') as dialog:
             self.app.import_file()
             original = self.app.store.path
-            self.assertEqual(original.resolve(), (self.root.book_folder / 'sample.sqlite').resolve())
-            self.assertTrue(original.exists())
+            self.assertEqual(original.resolve(), (self.base / 'sample.sqlite').resolve())
             dialog.assert_called_once_with(self.app, [self.source])
             self.app.import_file()
             self.assertEqual(self.app.store.path, original)
             second = self.root.new_window()
             second.import_file()
-            self.assertEqual(second.store.path.resolve(), (self.root.book_folder / 'sample-2.sqlite').resolve())
+            self.assertEqual(second.store.path.resolve(), (self.base / 'sample-2.sqlite').resolve())
             self.assertTrue(original.exists())
-            self.assertEqual(save.call_args.kwargs['initialfile'], 'sample-2.sqlite')
+            save.assert_not_called()
+
+    def test_setting_fixed_folder_applies_to_import(self):
         chosen = self.base / 'new-folder'
         with patch('ledger_viewer.ui.filedialog.askdirectory', return_value=str(chosen)):
             self.app.choose_book_folder()
         self.assertEqual(self.root.book_folder, chosen.resolve())
-        self.assertIn(str(chosen.resolve()), self.root.preferences_path.read_text())
-
-    def test_cancel_book_location_leaves_no_book(self):
+        self.assertEqual(self.root.preferences['book_location_mode'], 'fixed')
         with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
-             patch('ledger_viewer.ui.filedialog.asksaveasfilename', return_value=''), \
-             patch('ledger_viewer.ui.BatchImportDialog') as dialog:
-            self.app.import_file()
-        self.assertIsNone(self.app.store)
-        self.assertFalse(list(self.root.book_folder.glob('*.sqlite')))
-        dialog.assert_not_called()
-
-    def test_save_dialog_can_change_book_location_without_overwriting(self):
-        destination = self.base / '客户资料' / '账套.sqlite'
-        destination.parent.mkdir()
-        destination.write_text('existing', encoding='utf-8')
-        new_book = destination.with_name('账套-新.sqlite')
-        with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
-             patch('ledger_viewer.ui.filedialog.asksaveasfilename', side_effect=[str(destination), str(new_book)]) as save, \
-             patch('ledger_viewer.ui.messagebox.showerror') as error, \
              patch('ledger_viewer.ui.BatchImportDialog'):
             self.app.import_file()
-        self.assertEqual(save.call_count, 2)
-        error.assert_called_once()
-        self.assertEqual(destination.read_text(encoding='utf-8'), 'existing')
-        self.assertEqual(self.app.store.path.resolve(), new_book.resolve())
-        self.assertEqual(self.root.book_folder.resolve(), destination.parent.resolve())
+        self.assertEqual(self.app.store.path.resolve(), (chosen / 'sample.sqlite').resolve())
+
+    def test_unwritable_folder_can_be_changed_or_cancelled(self):
+        bad_folder = self.base / 'not-a-folder'
+        bad_folder.write_text('preserve')
+        self.root.preferences.update(book_location_mode='fixed', book_folder=str(bad_folder))
+        with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
+             patch('ledger_viewer.ui.filedialog.askdirectory', return_value=''), \
+             patch('ledger_viewer.ui.messagebox.showerror'), \
+             patch('ledger_viewer.ui.BatchImportDialog') as dialog:
+            self.app.import_file()
+            self.assertIsNone(self.app.store)
+            dialog.assert_not_called()
+        alternative = self.base / 'alternative'
+        with patch('ledger_viewer.ui.filedialog.askopenfilenames', return_value=(str(self.source),)), \
+             patch('ledger_viewer.ui.filedialog.askdirectory', return_value=str(alternative)), \
+             patch('ledger_viewer.ui.messagebox.showerror'), \
+             patch('ledger_viewer.ui.BatchImportDialog'):
+            self.app.import_file()
+        self.assertEqual(self.app.store.path.resolve(), (alternative / 'sample.sqlite').resolve())
+        self.assertEqual(bad_folder.read_text(), 'preserve')
 
     def test_click_expand_and_collapse_does_not_open_details(self):
         self.app._use_book(self.base / 'book.sqlite')
@@ -162,6 +162,10 @@ class EntryWorkflowTest(unittest.TestCase):
         dialog = next(iter(self.app.voucher_windows))
         editor = next(w for w in widgets(dialog) if isinstance(w, tk.Text) and w.cget("state") == "normal")
         view = next(w for w in widgets(dialog) if isinstance(w, ttk.Treeview))
+        hint = next(w for w in widgets(dialog) if isinstance(w, ttk.Label)
+                    and w.cget('text') == '按 ESC 键关闭凭证')
+        self.assertTrue(hint.winfo_ismapped())
+        self.assertLess(hint.winfo_rootx(), dialog.winfo_rootx() + dialog.winfo_width() / 2)
         compact_height = dialog.winfo_height()
         self.assertLess(compact_height, 350)
         self.assertFalse(editor.winfo_ismapped())

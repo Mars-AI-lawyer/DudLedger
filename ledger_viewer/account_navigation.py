@@ -16,11 +16,15 @@ class AccountNavigation(ttk.Frame):
         self.search = tk.StringVar()
         top = ttk.Frame(self)
         top.pack(fill="x", pady=(0, 5))
-        ttk.Label(top, text="科目树").pack(side="left")
+        ttk.Label(top, text="明细科目").pack(side="left")
         ttk.Button(top, text="清除", width=4, style="Ghost.TButton", command=lambda: self.search.set("")).pack(side="right")
         self.entry = ttk.Entry(self, textvariable=self.search, width=20)
         self.entry.pack(fill="x", pady=(0, 5))
-        ttk.Label(self, text="输入编码或名称，单击切换科目", style="Hint.TLabel", wraplength=205).pack(fill="x")
+        ttk.Label(self, text="单击名称查明细；点左侧箭头展开下级。", style="Hint.TLabel", wraplength=205).pack(fill="x")
+        actions = ttk.Frame(self)
+        actions.pack(fill='x', pady=(5, 4))
+        ttk.Button(actions, text='展开全部', style='Ghost.TButton', command=lambda: self.set_expansion(True)).pack(side='left')
+        ttk.Button(actions, text='折叠全部', style='Ghost.TButton', command=lambda: self.set_expansion(False)).pack(side='left', padx=4)
         holder = ttk.Frame(self)
         holder.pack(fill="both", expand=True)
         holder.columnconfigure(0, weight=1)
@@ -33,6 +37,7 @@ class AccountNavigation(ttk.Frame):
         self.tree.grid(row=0, column=0, sticky="nsew")
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
+        self.tree.bind("<Button-1>", self._toggle_indicator)
         self.tree.bind("<<TreeviewSelect>>", self._select)
         self.tree.bind("<<TreeviewOpen>>", lambda _event: self._expansion(True))
         self.tree.bind("<<TreeviewClose>>", lambda _event: self._expansion(False))
@@ -87,6 +92,23 @@ class AccountNavigation(ttk.Frame):
         self.expanded.clear()
         self.search.set("")
         self.set_accounts([])
+
+    def set_expansion(self, opened):
+        parents = {parent for parent in getattr(self, 'parents', {}).values() if parent}
+        self.expanded = parents if opened else set()
+        for key in parents:
+            if self.tree.exists(key):
+                self.tree.item(key, open=opened)
+
+    def _toggle_indicator(self, event):
+        if 'indicator' not in self.tree.identify_element(event.x, event.y):
+            return
+        key = self.tree.identify_row(event.y)
+        if key and self.tree.get_children(key):
+            opened = not self.tree.item(key, 'open')
+            self.tree.item(key, open=opened)
+            self.expanded.add(key) if opened else self.expanded.discard(key)
+            return 'break'
 
     def _expansion(self, opened):
         key = self.tree.focus()

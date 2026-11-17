@@ -13,7 +13,7 @@ from ledger_viewer.jev_mapping import (
 class FakeClient:
     def __init__(self, *, api_key, model, timeout):
         assert api_key == "test-key"
-        assert model == "jev-latest"
+        assert model == "jev-1.14.0"
         assert timeout > 0
         self.calls = []
 

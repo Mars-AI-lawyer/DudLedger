@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legal-ledger-viewer"
-version = "0.3.0"
+version = "0.3.0b1"
 description = "默认本地处理的法律尽调账簿浏览器，可选 Jev 云端筛查"
 requires-python = ">=3.11"
 dependencies = ["openpyxl>=3.1,<4", "xlrd>=2.0.2,<3", "typesafe-sdk>=0.7.1,<1", "keyring>=25.7,<27"]
@@ -16,4 +16,4 @@ legal-ledger-viewer = "ledger_viewer.ui:main"
 include = ["ledger_viewer*"]
 
 [tool.setuptools.package-data]
-ledger_viewer = ["skills/dudledger-import/*.md", "specialist_rules.json"]
+ledger_viewer = ["skills/dudledger-import/*.md", "specialist_rules.json", "resources/*.png"]

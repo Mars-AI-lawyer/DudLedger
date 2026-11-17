@@ -9,8 +9,9 @@ from unittest.mock import patch
 import test_specialist_review as fixtures
 from ledger_viewer.dd_features import load_config, save_config
 from ledger_viewer.jev_review import (batch_info, prepare_batch, request_review,
-                                      validate_response, voucher_results)
-from ledger_viewer.specialist_rules import default_rules, rules_for_accounts
+                                      questions_for, validate_response, voucher_results)
+from ledger_viewer.specialist_rules import default_rules, load_rules, rules_for_accounts, save_rules
+from ledger_viewer import deepseek_review
 
 
 class PromptOnlyReviewTest(unittest.TestCase):
@@ -18,6 +19,59 @@ class PromptOnlyReviewTest(unittest.TestCase):
     tearDown = fixtures.SpecialistReviewTest.tearDown
     run_job = fixtures.SpecialistReviewTest.run_job
     flash = fixtures.SpecialistReviewTest.flash
+
+    def test_old_model_and_provider_conditions_migrate_once_without_changing_history(self):
+        stored = default_rules()
+        stored['model'] = 'jev-1.13.0'
+        topic = stored['topics'][0]
+        topic['question'] = '用户的自定义问题。'
+        topic['bailian_criteria'] = {'true': '用户的命中条件。', 'false': '用户的排除条件。'}
+        stored['topics'][1]['criteria_mode'] = 'prompt'
+        with self.store.db:
+            old = self.store.db.execute('INSERT INTO jev_rules(body_json) VALUES(?)',
+                                        (json.dumps(stored),)).lastrowid
+        version, rules = load_rules(self.store)
+        self.assertGreater(version, old)
+        self.assertEqual(rules['model'], 'jev-1.14.0')
+        self.assertEqual(rules['topics'][0]['question'],
+                         '用户的自定义问题。\n补充命中条件：用户的命中条件。\n排除条件：用户的排除条件。')
+        self.assertTrue(all('bailian_criteria' not in t and 'criteria_mode' not in t for t in rules['topics']))
+        self.assertEqual(load_rules(self.store), (version, rules))
+        saved = save_rules(self.store, rules)
+        self.assertEqual(load_rules(self.store), (saved, rules))
+        historical = self.store.db.execute('SELECT body_json FROM jev_rules WHERE id=?', (old,)).fetchone()[0]
+        self.assertEqual(json.loads(historical), stored)
+
+    def test_jev_and_bailian_receive_identical_questions_and_conditions(self):
+        rules = default_rules()
+        rules['topics'][0]['bailian_criteria'] = {'true': '仅在明确记载代偿时命中。', 'false': '普通付款排除。'}
+        jev = questions_for(rules)
+        bailian_rules = copy.deepcopy(rules)
+        bailian_rules['model'] = 'decision-model-preview'
+        bailian = questions_for(bailian_rules)
+        self.assertEqual({k: v.model_dump() for k, v in jev.items()},
+                         {k: v.model_dump() for k, v in bailian.items()})
+        self.assertIn('普通付款排除。', jev[rules['topics'][0]['id']].instructions)
+
+    def test_deepseek_receives_shared_base_topic_and_insufficient_prompts(self):
+        rules = default_rules()
+        rules['common'] = '用户的通用审查边界。'
+        rules['insufficient'] = '用户的信息不足判断条件。'
+        rules['topics'][0]['bailian_criteria'] = {'true': '用户的命中条件。', 'false': '用户的排除条件。'}
+        calls = []
+        def chat(_key, payload):
+            calls.append(payload)
+            return {'choices': [{'message': {'content': '{"hits":[],"insufficient":false}'}}]}
+        result = deepseek_review.request_review([{'summary': '虚构凭证'}], rules,
+                                               'fake', threading.Event(), chat_fn=chat)
+        self.assertEqual(result['status'], 'success')
+        content = calls[0]['messages'][0]['content']
+        for prompt in (rules['common'], rules['insufficient'], '用户的命中条件。', '用户的排除条件。'):
+            self.assertIn(prompt, content)
+        topics = json.loads(content.split('本次问题：\n')[1])
+        self.assertEqual({t['id']: t['question'] for t in topics},
+                         {key: q.instructions[len(rules['common']) + 2:]
+                          for key, q in questions_for(rules).items() if key != 'insufficient'})
 
     def test_numerical_settings_are_not_evaluated_or_sent(self):
         config = load_config(self.store)

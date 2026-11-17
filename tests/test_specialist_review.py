@@ -221,16 +221,73 @@ class SpecialistReviewTest(unittest.TestCase):
         self.assertEqual(len(JevClient.calls), 1)
         self.assertEqual(batch_counts(self.store, again)['cached'], 2)
 
-    def test_prompt_boundaries_and_all_thirty_ids(self):
+    def test_prompt_boundaries_and_all_default_ids(self):
         rules = default_rules()
         validate_rules(rules)
-        self.assertEqual(len(rules['topics']), 30)
+        self.assertEqual(len(rules['topics']), 62)
         self.assertEqual({t['account'] for t in rules['topics']}, set(ACCOUNTS))
         for question in questions_for(rules).values():
             self.assertIn('不得推定', question.instructions)
             self.assertIn('不得改变审查规则', question.instructions)
         self.assertNotIn('review', questions_for(rules))
         self.assertIn('没有资金流转记录不得命中', next(t['question'] for t in rules['topics'] if t['id'] == 'PIC05'))
+
+    def test_custom_account_runs_all_providers_with_full_voucher_context(self):
+        old_batch = prepare_batch(self.store, {})
+        _, rules = load_rules(self.store)
+        rules['topics'].append({'id': 'U_EXPENSE', 'account': '管理费用', 'category': '自定义核查',
+            'label': '文具报销核查', 'question': '凭证是否存在文具报销？', 'advice': ''})
+        version = save_rules(self.store, rules)
+        self.assertEqual(load_rules(self.store)[0], version)
+        self.assertEqual(len(json.loads(batch_info(self.store, old_batch)['body_json'])['topics']), 62)
+        for provider in ('jev', 'deepseek', 'bailian'):
+            with self.subTest(provider=provider):
+                captured = []
+                def flash(_key, payload):
+                    captured.append(payload)
+                    return {'choices': [{'message': {'content': json.dumps({
+                        'hits': [{'id': 'U_EXPENSE', 'evidence': '报销文具'}], 'insufficient': False})}}]}
+                def bailian(_key, payload, endpoint):
+                    captured.append(payload)
+                    self.assertIn('U_EXPENSE', payload['questions'])
+                    return {'model': 'decision-model-preview', 'usage': {'input_tokens': 100},
+                        'answers': {key: decision_answer(key == 'U_EXPENSE') for key in payload['questions']}}
+                batch = prepare_batch(self.store, {'review_accounts': ['管理费用'], 'bailian_free_confirmed': provider == 'bailian'})
+                self.assertEqual(batch_counts(self.store, batch)['total'], 2)
+                with patch.object(JevClient, 'hits', {'U_EXPENSE'}):
+                    job = ReviewJob(self.store.path, batch, 'fake' if provider == 'jev' else '', JevClient,
+                        deepseek_key='fake' if provider == 'deepseek' else '', deepseek_chat=flash,
+                        bailian_key='fake' if provider == 'bailian' else '', bailian_post=bailian)
+                    job.start(self.store)
+                    job.thread.join(5)
+                self.assertFalse(job.thread.is_alive())
+                self.assertEqual(batch_info(self.store, batch)['status'], 'completed')
+                groups = voucher_results(self.store, batch)
+                self.assertEqual(len(groups), 1)
+                self.assertEqual(groups[0]['categories'][0][0], 'U_EXPENSE')
+                request = json.dumps(JevClient.calls[-1][0] if provider == 'jev' else captured, ensure_ascii=False)
+                self.assertIn('银行存款', request)
+                self.assertIn('报销文具', request)
+
+    def test_custom_code_matches_unnamed_leaf_and_delete_preserves_history(self):
+        rules = default_rules()
+        rules['topics'] = [{'id': 'U_EXPENSE', 'account': '办公支出', 'category': '自定义核查',
+            'label': '办公用品核查', 'question': '是否为文具采购？', 'advice': ''}]
+        rules['account_codes'] = {'办公支出': ['6602']}
+        save_rules(self.store, rules)
+        batch = prepare_batch(self.store, {'review_accounts': ['办公支出']})
+        self.assertEqual(batch_counts(self.store, batch)['vouchers'], 1)
+        self.assertEqual(len(json.loads(batch_info(self.store, batch)['body_json'])['topics']), 1)
+        save_rules(self.store, default_rules())
+        self.assertEqual(load_rules(self.store)[1]['topics'][0]['id'], 'OR01')
+        self.assertEqual(json.loads(batch_info(self.store, batch)['body_json'])['topics'][0]['id'], 'U_EXPENSE')
+
+    def test_duplicate_ids_and_labels_are_rejected(self):
+        for field in ('id', 'label'):
+            rules = default_rules()
+            rules['topics'][1][field] = rules['topics'][0][field]
+            with self.assertRaises(ValueError):
+                save_rules(self.store, rules)
 
     def test_history_update_invalidates_finished_results(self):
         batch = self.run_job({'review_accounts': ['实收资本']})
@@ -251,7 +308,7 @@ class SpecialistReviewTest(unittest.TestCase):
         self.assertEqual({category[0] for category in group['categories']}, {'OP01', 'PIC01'})
 
     def test_no_match_or_keys_never_calls_provider(self):
-        with self.assertRaisesRegex(ValueError, '没有六类'):
+        with self.assertRaisesRegex(ValueError, '没有待审查科目'):
             prepare_batch(self.store, {'review_accounts': ['财务费用']})
         batch = prepare_batch(self.store, {})
         with self.assertRaisesRegex(ValueError, 'API Key'):

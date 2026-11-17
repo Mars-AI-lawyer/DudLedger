@@ -39,7 +39,7 @@ class WorkflowUITest(unittest.TestCase):
                 window.store.import_sheet(ImportSpec(path, "CSV", header, "entry", mapping))
                 window.refresh_all()
                 menu = window.nametowidget(window.cget("menu"))
-                self.assertEqual([menu.entrycget(index, "label") for index in range(menu.index("end") + 1)], ["文件", "查看", "设置"])
+                self.assertEqual([menu.entrycget(index, "label") for index in range(menu.index("end") + 1)], ["文件", "查看", "设置", "帮助"])
                 self.assertEqual([window.tabs.tab(tab, "text") for tab in window.tabs.tabs()], ["科目总览", "明细账", "财务报表", "关注凭证", "AI 尽调线索"])
                 # 文件菜单精简为三项：导入 Excel、打开账套、退出当前账套。
                 imports = window.nametowidget(menu.entrycget(0, "menu"))

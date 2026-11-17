@@ -16,7 +16,8 @@ from .importer import format_money
 from .jev_mapping import get_api_key
 from .deepseek_mapping import get_api_key as get_deepseek_key
 from .bailian_review import get_api_key as get_bailian_key, DEFAULT_ENDPOINT as BAILIAN_ENDPOINT
-from .specialist_rules import ACCOUNTS, default_rules, load_rules, save_rules
+from .specialist_rules import ACCOUNTS, load_rules, review_accounts
+from .review_rules_ui import ReviewRulesDialog
 from .related_parties import party_names, role_grouped_names
 from .jev_review import (BOUNDARY, STATUS_LABELS, SEND_FIELDS,
     ReviewJob, active_job, batch_counts, batch_info, discard_preview,
@@ -84,84 +85,6 @@ def launch_connection_test(parent, status, *, provider='jev', api_key=None, endp
         except Empty:
             parent.after(150, poll)
     parent.after(150, poll)
-
-
-class ReviewRulesDialog(tk.Toplevel):
-    def __init__(self, app):
-        super().__init__(app)
-        self.app = app
-        self.store = app.store
-        self.title('AI审查设置 · 当前账套')
-        self.geometry('820x720')
-        self.minsize(660, 560)
-        self.transient(app)
-        self.version, self.rules = load_rules(self.store)
-        ttk.Label(self, text=f'当前专项规则 v{self.version} · 6 类科目 / 30 项问题 · 保存生成新版本，历史结果保留原规则', padding=10).pack(anchor='w')
-        model_row = ttk.Frame(self, padding=(10, 0))
-        model_row.pack(fill='x')
-        ttk.Label(model_row, text='Jev 模型').pack(side='left')
-        self.model = tk.StringVar(value=self.rules['model'])
-        ttk.Combobox(model_row, textvariable=self.model, values=('jev-1.13.0', 'jev-1.14.0'), state='readonly', width=16).pack(side='left', padx=8)
-        ttk.Label(model_row, text='百炼免费可用时优先，其次 Jev，最后 DeepSeek').pack(side='left')
-        ttk.Label(self, text='逐项按照提示词直接判断命中或不命中，结果由律师核查。', padding=10).pack(anchor='w')
-        self.paths = {'基础提示词（三种模型共用）': ('common',), '信息不足提问（百炼／Jev）': ('insufficient',)}
-        for i, topic in enumerate(self.rules['topics']):
-            title = f"{topic['account']} / {topic['id']} {topic['label']}"
-            self.paths[f"{title} · 提问"] = ('topics', i, 'question')
-            self.paths[f"{title} · 核查建议"] = ('topics', i, 'advice')
-            if topic.get('bailian_criteria'):
-                self.paths[f"{title} · 百炼命中条件"] = ('topics', i, 'bailian_criteria', 'true')
-                self.paths[f"{title} · 百炼排除条件"] = ('topics', i, 'bailian_criteria', 'false')
-        self.selection = tk.StringVar(value=next(iter(self.paths)))
-        combo = ttk.Combobox(self, textvariable=self.selection, values=list(self.paths), state='readonly')
-        combo.pack(fill='x', padx=10, pady=5)
-        self.editor = ScrolledText(self, wrap='word', undo=True, padx=8, pady=8)
-        self.editor.pack(fill='both', expand=True, padx=10)
-        self.current = self.selection.get()
-        self.editor.insert('1.0', self._value(self.paths[self.current]))
-        combo.bind('<<ComboboxSelected>>', self._switch)
-        actions = ttk.Frame(self, padding=10)
-        actions.pack(side='bottom', fill='x', before=self.editor.frame)
-        ttk.Button(actions, text='恢复默认（保存后生效）', command=self._reset).pack(side='left')
-        ttk.Button(actions, text='保存为新版本', command=self._save).pack(side='right')
-        ttk.Button(actions, text='取消', command=self.destroy).pack(side='right', padx=8)
-        self.grab_set()
-
-    def _value(self, path):
-        value = self.rules
-        for field in path:
-            value = value[field]
-        return value
-
-    def _stash(self):
-        path = self.paths[self.current]
-        target = self.rules
-        for field in path[:-1]:
-            target = target[field]
-        target[path[-1]] = self.editor.get('1.0', 'end-1c')
-
-    def _switch(self, _event=None):
-        self._stash()
-        self.current = self.selection.get()
-        self.editor.delete('1.0', 'end')
-        self.editor.insert('1.0', self._value(self.paths[self.current]))
-
-    def _reset(self):
-        self.rules = default_rules()
-        self.model.set(self.rules['model'])
-        self.editor.delete('1.0', 'end')
-        self.editor.insert('1.0', self._value(self.paths[self.current]))
-
-    def _save(self):
-        self._stash()
-        try:
-            self.rules['model'] = self.model.get()
-            save_rules(self.store, self.rules)
-        except (ValueError, TypeError, AttributeError) as exc:
-            messagebox.showerror('规则未保存', str(exc), parent=self)
-            return
-        self.app.review_panel.refresh()
-        self.destroy()
 
 
 class ConsentDialog(tk.Toplevel):
@@ -275,11 +198,21 @@ class ReviewPanel(ttk.Frame):
         self.cancel_button.pack(side='left', padx=5)
         self.more_button = ttk.Button(actions, text='更多选项', style="Ghost.TButton", command=self._toggle_options)
         self.more_button.pack(side='right')
-        selection = ttk.LabelFrame(self, text='抽查范围（可多选；未选时默认以下六类）', padding=(6, 2))
+        selection = ttk.LabelFrame(self, text='抽查范围（可多选；未选时审查全部已设置科目）', padding=(6, 2))
         selection.pack(fill='x', padx=6)
-        self.review_accounts = {name: tk.BooleanVar(value=False) for name in ACCOUNTS}
-        for index, (name, var) in enumerate(self.review_accounts.items()):
-            ttk.Checkbutton(selection, text=name, variable=var, style='Sampling.TCheckbutton').grid(row=index // 3, column=index % 3, sticky='w', padx=(0, 24))
+        self.account_canvas = tk.Canvas(selection, height=66, highlightthickness=0)
+        scroll = ttk.Scrollbar(selection, orient='vertical', command=self.account_canvas.yview)
+        scroll.pack(side='right', fill='y')
+        self.account_canvas.pack(side='left', fill='x', expand=True)
+        self.account_canvas.configure(yscrollcommand=scroll.set)
+        self.account_selection = ttk.Frame(self.account_canvas)
+        content = self.account_canvas.create_window(0, 0, window=self.account_selection, anchor='nw')
+        self.account_selection.bind('<Configure>', lambda _event: self.account_canvas.configure(scrollregion=self.account_canvas.bbox('all')))
+        self.account_canvas.bind('<Configure>', lambda event: self.account_canvas.itemconfigure(content, width=event.width))
+        self.account_canvas.bind('<MouseWheel>', lambda event: self.account_canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units'))
+        self.review_accounts = {}
+        self.refresh_accounts()
+        ttk.Button(actions, text='科目与提示词设置', command=app.open_review_rules).pack(side='left', padx=5)
         self.progress = tk.StringVar(value='只抽查所选科目的凭证；默认百炼优先，Jev 可选，DeepSeek Flash 兜底。')
         wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050).pack(fill='x')
         self.progress_bar = ttk.Progressbar(self, mode='determinate', maximum=1, value=0)
@@ -333,6 +266,19 @@ class ReviewPanel(ttk.Frame):
         self.result_next.pack(side='right', padx=3)
         self._poll_id = self.after(200, self._poll)
         self.bind("<Destroy>", self._destroyed, add="+")
+
+    def refresh_accounts(self):
+        names = review_accounts(load_rules(self.app.store)[1]) if self.app.store else ACCOUNTS
+        if tuple(self.review_accounts) == tuple(names):
+            return
+        selected = {name for name, var in self.review_accounts.items() if var.get()}
+        for child in self.account_selection.winfo_children():
+            child.destroy()
+        self.review_accounts = {name: tk.BooleanVar(value=name in selected) for name in names}
+        self.account_canvas.configure(height=min(108, max(36, ((len(names) + 3) // 4) * 32)))
+        for index, (name, var) in enumerate(self.review_accounts.items()):
+            ttk.Checkbutton(self.account_selection, text=name, variable=var).grid(
+                row=index // 4, column=index % 4, sticky='w', padx=(0, 14))
 
     def _render_category_bar(self, rules, counts):
         for child in self.category_frame.winfo_children():
@@ -453,6 +399,7 @@ class ReviewPanel(ttk.Frame):
         store = self.app.store
         if not store or self.preparing or self.app.import_busy:
             return
+        self.refresh_accounts()
         recover_interrupted(store)
         batches = store.db.execute("SELECT * FROM jev_batches WHERE status<>'preview' ORDER BY id DESC").fetchall()
         self.batch_options = {f"#{r['id']} · {r['created_at']} · {STATUS_LABELS.get(r['status'], r['status'])} · 规则 v{r['rule_id']}": r['id'] for r in batches}
@@ -681,6 +628,8 @@ class ReviewDetail(tk.Toplevel):
         self.entry_id = group['lines'][0]['entry_id']
         lines = self.store.voucher_lines(self.entry_id)
         self.voucher_view = tree(self.voucher_page, VIEW_COLUMNS['voucher'])
+        self.voucher_key = voucher_key(lines[0])
+        self.app.shortcuts.attach(self)
         self.voucher_view.configure(style="Compact.Treeview")
         self._voucher_rows = min(6, max(2, len(lines)))
         self.voucher_view.configure(height=self._voucher_rows)

@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import tkinter as tk
 
 from ledger_viewer.ui import Application, SettingsDialog
+from tkinter import ttk
 
 
 class SettingsDialogTest(unittest.TestCase):
@@ -17,7 +18,7 @@ class SettingsDialogTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_first_run_can_save_all_keys_and_only_appears_once(self):
+    def test_ai_settings_can_save_all_keys(self):
         saved = {'jev': '', 'deepseek': '', 'bailian': ''}
         with ExitStack() as stack:
             for provider, getter, setter in [('jev', 'get_api_key', 'save_api_key'),
@@ -29,7 +30,7 @@ class SettingsDialogTest(unittest.TestCase):
             self.addCleanup(app.destroy)
             app.preferences_path = self.base / 'preferences.json'
             app.preferences = {}
-            dialog = app.offer_ai_setup()
+            dialog = SettingsDialog(next(iter(app.windows)), ai=True)
             app.update()
             self.assertEqual(dialog.tabs.select(), str(dialog.ai_tab))
             self.assertIn('DeepSeek', dialog.provider_tabs.tab(dialog.provider_tabs.select(), 'text'))
@@ -44,9 +45,7 @@ class SettingsDialogTest(unittest.TestCase):
             dialog.bailian_free_confirmed.set(True)
             dialog._finish()
             self.assertEqual(saved, {'jev': 'fictional-jev', 'deepseek': 'fictional-deepseek', 'bailian': 'fictional-bailian'})
-            self.assertTrue(app.preferences['ai_setup_seen'])
             self.assertTrue(app.preferences['bailian_free_confirmed'])
-            self.assertIsNone(app.offer_ai_setup())
             self.assertNotIn('fictional-', app.preferences_path.read_text())
 
     def test_first_run_can_be_skipped_without_saving_credentials(self):
@@ -61,11 +60,23 @@ class SettingsDialogTest(unittest.TestCase):
             app.preferences_path = self.base / 'preferences.json'
             app.preferences = {}
             dialog = app.offer_ai_setup()
-            dialog.deepseek_key.set('unsaved-draft')
-            dialog._skip_setup()
+            dialog.skip()
             for save in (save_jev, save_deepseek, save_bailian):
                 save.assert_not_called()
             self.assertIsNone(app.offer_ai_setup())
+
+    def test_checkboxes_use_ticks_and_location_setting_can_restore_source_folder(self):
+        app = Application()
+        self.addCleanup(app.destroy)
+        app.preferences_path = self.base / 'preferences.json'
+        app.preferences = {'book_location_mode': 'fixed', 'book_folder': str(self.base / 'books')}
+        self.assertEqual(ttk.Style(app).layout('TCheckbutton'), ttk.Style(app).layout('Sampling.TCheckbutton'))
+        dialog = SettingsDialog(next(iter(app.windows)))
+        dialog.book_location_mode.set('source')
+        dialog._save_book_location()
+        self.assertEqual(app.import_book_folder(self.base / 'source.xlsx'), self.base.resolve())
+        self.assertEqual(app.preferences['book_location_mode'], 'source')
+        dialog.destroy()
 
     def test_finish_saves_typed_key_and_reopening_shows_saved_key(self):
         saved = {"key": ""}

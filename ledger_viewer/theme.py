@@ -154,6 +154,7 @@ def configure_theme(root):
         ('Sampling.check', {'side': 'left', 'sticky': ''}),
         ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
             ('Checkbutton.label', {'sticky': 'nswe'})]})]})])
+    style.layout('TCheckbutton', style.layout('Sampling.TCheckbutton'))
     style.configure('Segment.TRadiobutton', padding=(14, 7), background=SIDEBAR)
     style.map('Segment.TRadiobutton', background=[('selected', ACCENT_SOFT), ('active', '#E8E4DB')], foreground=[('selected', ACCENT_INK)])
     style.configure("TSeparator", background=BORDER, lightcolor=BORDER, darkcolor=BORDER)

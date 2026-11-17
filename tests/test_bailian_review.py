@@ -127,7 +127,7 @@ class BailianReviewTest(unittest.TestCase):
 
 
 class BailianTransportTest(unittest.TestCase):
-    def test_31_native_choice_questions_split_at_16_and_usage_aggregates(self):
+    def test_all_default_choice_questions_split_at_16_and_usage_aggregates(self):
         calls = []
         def post(key, payload, endpoint):
             calls.append(payload)
@@ -136,16 +136,16 @@ class BailianTransportTest(unittest.TestCase):
         questions = questions_for(default_rules())
         with bailian_review.DecisionClient(api_key='fake-key', post_fn=post) as client:
             raw = client.system_one(state={'summary':'虚构样例'}, questions=questions).model_dump()
-        self.assertEqual([len(call['questions']) for call in calls], [16, 15])
-        self.assertEqual(len(raw['answers']), 31)
-        self.assertEqual(raw['usage'], {'input_tokens':22, 'output_tokens':0})
+        self.assertEqual([len(call['questions']) for call in calls], [16, 16, 16, 15])
+        self.assertEqual(set(raw['answers']), set(questions))
+        self.assertEqual(raw['usage'], {'input_tokens':44, 'output_tokens':0})
         for call in calls:
             self.assertEqual(set(call), {'model','state','questions'})
             self.assertNotIn('messages', call)
             self.assertNotIn('response_format', call)
             self.assertIn('criteria', next(iter(call['questions'].values())))
 
-    def test_pipeline_sends_all_thirty_questions_within_budget(self):
+    def test_pipeline_sends_all_default_questions_within_budget(self):
         from ledger_viewer.jev_review import request_review
         calls = []
         def post(key, payload, endpoint):
@@ -157,9 +157,9 @@ class BailianTransportTest(unittest.TestCase):
         result = request_review([{'name': '实收资本', 'summary': '虚构样例', 'debit': '10.00'}],
             rules, 'test-key', threading.Event(), lambda **options: bailian_review.DecisionClient(**options, post_fn=post))
         self.assertEqual(result['status'], 'success')
-        self.assertEqual([len(call['questions']) for call in calls], [11, 11, 11])
-        self.assertEqual(len(result['items'][0]['answers']), 31)
-        self.assertEqual(result['items'][0]['question_batches'], 3)
+        self.assertEqual([len(call['questions']) for call in calls], [11] * 6 + [3])
+        self.assertEqual(set(result['items'][0]['answers']), set(questions_for(rules)))
+        self.assertEqual(result['items'][0]['question_batches'], 7)
         self.assertFalse(result['items'][0]['needs_manual_review'])
 
     def test_split_request_rechecks_cancellation_and_snapshot_each_time(self):

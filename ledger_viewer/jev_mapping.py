@@ -9,7 +9,7 @@ import keyring
 from typesafe_sdk import Choice, TypeSafeClient
 
 from .importer import ImportSpec, rows, text_value
-from .jev_runtime import REQUEST_SLOTS
+from .jev_runtime import MODEL, REQUEST_SLOTS
 
 
 KEYRING_SERVICE = "DudLedger Jev"
@@ -186,7 +186,7 @@ def suggest_mapping(preview: dict, api_key: str, client_factory=TypeSafeClient) 
         raise ValueError("没有可分析的预览行")
     headers = {f"r{number}": f"第 {number} 行" for number in numbers}
     headers["none"] = "预览中找不到可靠的表头"
-    with REQUEST_SLOTS, client_factory(api_key=api_key, model="jev-latest", timeout=25.0) as client:
+    with REQUEST_SLOTS, client_factory(api_key=api_key, model=MODEL, timeout=25.0) as client:
         first = client.system_one(
             state=preview,
             questions={
@@ -244,5 +244,5 @@ def suggest_mapping(preview: dict, api_key: str, client_factory=TypeSafeClient) 
         ImportSpec(Path("preview.xlsx"), preview["sheet"], header_row, kind, mapping).validate()
     except ValueError as exc:
         warnings.append(f"当前建议尚不满足导入条件：{exc}")
-    model = getattr(second, "model", "jev-latest")
+    model = getattr(second, "model", MODEL)
     return MappingSuggestion(kind, header_row, mapping, confidence, tuple(warnings), str(model), tuple(notices))

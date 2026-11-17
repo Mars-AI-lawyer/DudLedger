@@ -9,6 +9,7 @@ a = Analysis(
     pathex=[str(stage)],
     binaries=[],
     datas=[
+        (str(stage / 'ledger_viewer' / 'resources' / 'icon-beta.png'), 'ledger_viewer/resources'),
         (str(stage / 'ledger_viewer' / 'specialist_rules.json'), 'ledger_viewer'),
         (str(stage / 'ledger_viewer' / 'skills' / 'dudledger-import' / 'SKILL.md'),
          'ledger_viewer/skills/dudledger-import'),
@@ -31,7 +32,7 @@ app = BUNDLE(
     bundle_identifier='com.dudledger.desktop',
     version='0.3.0',
     info_plist={
-        'CFBundleDisplayName': name,
+        'CFBundleDisplayName': name + ' Beta',
         'CFBundleShortVersionString': '0.3.0',
         'NSHighResolutionCapable': True,
         'LSMultipleInstancesProhibited': True,

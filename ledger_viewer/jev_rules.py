@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+from .jev_runtime import MODEL
 
 # Generation-1 built-ins (per-entry wording, priority score) are kept verbatim so
 # upgrades can detect which stored fields the user never edited.
@@ -111,7 +112,7 @@ LEGACY_V3_RULES['thresholds'] = {'宽松': 65, '中': 50, '谨慎': 35}
 # Generation-4 defaults (current): 法律尽调分类模块取代十类主题；新增整体 review 判断，
 # 输入增加按身份分组的尽调主体名单与程序特征（features）。
 DEFAULT_RULES = {
-    'model': 'jev-1.13.0',
+    'model': MODEL,
     'common': (
         '你是一级市场股权投资法律尽职调查中的凭证筛选助手，任务不是判断合法性、评估法律风险或形成法律意见，'
         '而是判断当前完整凭证是否包含值得尽调律师进一步查看、询问或与其他尽调资料交叉核实的信息。\n'
@@ -190,6 +191,7 @@ _GENERATION_CHAIN = ((LEGACY_V1_RULES, LEGACY_V2_RULES), (LEGACY_V2_RULES, LEGAC
 def migrate_rules(rules: dict) -> dict:
     """Upgrade stored rules across generations while preserving user edits."""
     updated = copy.deepcopy(rules)
+    updated['model'] = MODEL
     legacy_scored = 'priority' in updated or 'levels' in updated
     if legacy_scored:
         # The priority score was removed; any stored wording for it is obsolete.
@@ -227,8 +229,8 @@ def migrate_rules(rules: dict) -> dict:
 def validate_rules(rules: dict) -> None:
     if not isinstance(rules, dict) or set(rules) != set(DEFAULT_RULES):
         raise ValueError("规则字段不完整")
-    if rules['model'] != 'jev-1.13.0':
-        raise ValueError("首版模型固定为 jev-1.13.0")
+    if rules['model'] != MODEL:
+        raise ValueError("模型固定为 Jev 1.14")
     for field in ('common', 'insufficient', 'review'):
         if not isinstance(rules[field], str) or not rules[field].strip():
             raise ValueError("提示词不能为空")

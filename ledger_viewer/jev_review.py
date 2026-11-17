@@ -23,6 +23,7 @@ from .jev_rules import load_rules
 from .related_parties import party_names, role_grouped_names
 from .voucher_notes import voucher_key, voucher_lines_for_key
 from .jev_runtime import REQUEST_SLOTS
+from .specialist_rules import topic_question
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS jev_rules (
@@ -321,10 +322,9 @@ def questions_for(rules):
     if rules.get('decision_mode') == 'prompt':
         questions = {}
         for topic in rules['topics']:
-            criteria = topic.get('bailian_criteria', {}) if rules['model'] == 'decision-model-preview' else {}
-            questions[topic['id']] = Choice(instructions=common + topic['question'], criteria={
-                'hit': criteria.get('true', '输入有当前问题要求的具体依据，符合本问题的命中条件。'),
-                'no_hit': criteria.get('false', '输入不符合本问题的命中条件，缺少具体依据，或属于本问题明确排除的情形。')})
+            questions[topic['id']] = Choice(instructions=common + topic_question(topic), criteria={
+                'hit': '输入有当前问题要求的具体依据，符合本问题的命中条件。',
+                'no_hit': '输入不符合本问题的命中条件，缺少具体依据，或属于本问题明确排除的情形。'})
         questions['insufficient'] = Choice(instructions=common + rules['insufficient'], criteria={
             'hit': '具体交易文字相互矛盾或严重含糊，无法按本次审查问题分类，需要人工复核。',
             'no_hit': '凭证足以识别交易，或仅缺少外部附件、账龄、银行流水等补充资料；或者没有具体待核线索。'})

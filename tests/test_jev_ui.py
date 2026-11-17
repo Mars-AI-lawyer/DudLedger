@@ -62,7 +62,7 @@ class ReviewUITest(unittest.TestCase):
         old, _ = load_specialist_rules(self.app.store)
         editor = ReviewRulesDialog(self.app)
         self.root.update()
-        editor.editor.insert('end', '\n仅为线索。')
+        editor.common_editor.insert('end', '\n仅为线索。')
         editor._save()
         new, rules = load_specialist_rules(self.app.store)
         self.assertGreater(new, old)

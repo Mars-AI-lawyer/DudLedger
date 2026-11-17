@@ -28,7 +28,7 @@ def main():
     for source in sorted((ROOT / "ledger_viewer").glob("*.py")):
         shutil.copyfile(source, package / source.name)
     shutil.copyfile(ROOT / "run.py", stage / "run.py")
-    for name in ("specialist_rules.json", "skills/dudledger-import/SKILL.md"):
+    for name in ("specialist_rules.json", "skills/dudledger-import/SKILL.md", "resources/icon-beta.png"):
         target = package / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / "ledger_viewer" / name, target)

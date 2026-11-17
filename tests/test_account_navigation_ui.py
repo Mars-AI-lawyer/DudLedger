@@ -46,7 +46,7 @@ class AccountNavigationTest(unittest.TestCase):
         self.assertEqual(self.app.account, 'C:1002')
         self.assertTrue(self.app.include_descendants)
         self.assertEqual(self.app.detail_total, 2)
-        self.assertEqual(self.app.detail_search, '款项')
+        self.assertEqual(self.app.detail_conditions['summary'].values, ('款项',))
         self.assertIn('debit', self.app.detail_conditions)
         self.assertEqual((self.app.detail_sort, self.app.detail_descending), ('debit', True))
         self.nav.tree.selection_set('C:100201')

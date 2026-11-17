@@ -7,6 +7,7 @@ import urllib.request
 
 from .deepseek_mapping import API_URL, MODEL, _ca_context
 from .jev_runtime import REQUEST_SLOTS
+from .specialist_rules import topic_question
 
 OUTPUT_RULES = '''请逐项检查本次启用的审查问题，只识别值得律师核查的事项。
 严格只输出 JSON 对象：{"hits":[{"id":"审查问题编号","evidence":"支持命中的原始凭证文字"}],"insufficient":false}。
@@ -89,8 +90,9 @@ def request_review(payloads, rules, api_key, cancel, *, before_send=None, partie
         if background:
             state['background'] = background
         payload = {'model': MODEL, 'messages': [
-            {'role': 'system', 'content': rules['common'] + '\n' + OUTPUT_RULES + '\n本次问题：\n' +
-                encode([{'id': t['id'], 'question': t['question']} for t in rules['topics']])},
+            {'role': 'system', 'content': rules['common'] + '\n' + OUTPUT_RULES +
+                '\n信息不足时的判断提示词：\n' + rules['insufficient'] + '\n本次问题：\n' +
+                encode([{'id': t['id'], 'question': topic_question(t)} for t in rules['topics']])},
             {'role': 'user', 'content': encode(state)}], 'stream': False,
             'response_format': {'type': 'json_object'}, 'thinking': {'type': thinking}, 'max_tokens': 4096}
         if thinking == 'enabled':

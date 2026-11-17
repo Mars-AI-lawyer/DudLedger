@@ -7,7 +7,7 @@ from .analysis_api import iter_entries
 from .background import check_cancelled, cooperate
 from .dd_features import closing_voucher
 from .related_parties import role_grouped_names
-from .specialist_rules import account_for, account_prefixes, load_rules, selected_accounts
+from .specialist_rules import account_for, account_prefixes, load_rules, selected_accounts, review_accounts
 from .voucher_notes import voucher_key
 
 
@@ -17,19 +17,20 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
     from .bailian_review import DEFAULT_ENDPOINT, validate_endpoint
     endpoint = validate_endpoint(scope.get('bailian_endpoint', DEFAULT_ENDPOINT))
     preferred = 'bailian'
-    accounts = selected_accounts(scope.get('review_accounts'))
-    prefixes = account_prefixes(store)
+    accounts = selected_accounts(scope.get('review_accounts'), rules)
+    available = review_accounts(rules)
+    prefixes = account_prefixes(store, rules)
     filters = {k: v for k, v in scope.items() if k in ('account', 'search', 'fiscal_year', 'period', 'include_descendants', 'source_ids')}
     keys, relevant_parties = set(), set()
     for index, row in enumerate(iter_entries(store, **filters)):
         if cancelled is not None and index % 250 == 0:
             cooperate(cancelled)
-        if account_for(row, prefixes) in accounts:
+        if account_for(row, prefixes, available) in accounts:
             keys.add(voucher_key(row))
             if row['counterparty']:
                 relevant_parties.add(row['counterparty'].strip())
     if not keys:
-        raise ValueError('选定范围没有六类专项科目的凭证，请检查科目选择或导入的科目名称')
+        raise ValueError('选定范围没有待审查科目的凭证，请检查科目选择、名称或编码设置')
     parties = role_grouped_names(store.related_parties())
     # One local pass provides complete vouchers and exact-counterparty history.
     groups, history_index = {}, {}
@@ -54,7 +55,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
         for number, (key, rows) in enumerate(groups.items(), 1):
             if cancelled is not None:
                 check_cancelled(cancelled)
-            active = [name for name in accounts if any(account_for(row, prefixes) == name for row in rows)]
+            active = [name for name in accounts if any(account_for(row, prefixes, available) == name for row in rows)]
             feature = {'decision_mode': 'prompt', 'facts': [], 'rule_categories': []}
             feature['review_accounts'] = active
             feature['check_ids'] = [t['id'] for t in rules['topics'] if t['account'] in active]

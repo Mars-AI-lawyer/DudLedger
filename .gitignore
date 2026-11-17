@@ -21,3 +21,7 @@ dist/
 *secret*.json
 *credential*.json
 *.local.json
+
+# 前端/视频工具依赖与生成产物
+node_modules/
+promo/output/

@@ -24,7 +24,7 @@ def response(topic_probs=None, insufficient=0.1, review=None):
     answers = {t['id']: {'type': 'noul', 'noul': topic_probs.get(t['id'], 0.01)} for t in default_rules()['topics']}
     answers['review'] = {'type': 'noul', 'noul': review if review is not None else max(v['noul'] for v in answers.values())}
     answers['insufficient'] = {'type': 'noul', 'noul': insufficient}
-    return {'model': 'jev-1.13.0', 'answers': answers, 'usage': {'input_tokens': 120, 'output_tokens': 30}}
+    return {'model': 'jev-1.14.0', 'answers': answers, 'usage': {'input_tokens': 120, 'output_tokens': 30}}
 
 
 class FakeClient:
@@ -33,7 +33,7 @@ class FakeClient:
     responder = staticmethod(lambda state: response())
 
     def __init__(self, **options):
-        assert options['model'] == 'jev-1.13.0'
+        assert options['model'] == 'jev-1.14.0'
         assert options['retry'].max_retries == 0
 
     def __enter__(self):
@@ -460,7 +460,7 @@ class JevReviewTest(unittest.TestCase):
         result = test_connection('fake-key', factory)
         self.assertEqual(result['status'], 'success')
         self.assertAlmostEqual(result['data']['answers']['financing']['noul'], 0.66)
-        self.assertEqual(requests[0]['model'], 'jev-1.13.0')
+        self.assertEqual(requests[0]['model'], 'jev-1.14.0')
         self.assertEqual(len(requests[0]['questions']), 15)
         self.assertNotIn('fake-key', json.dumps(requests))
         grouped = request_review([requests[0]['state'], requests[0]['state']], default_rules(), 'fake-key', threading.Event(), factory)

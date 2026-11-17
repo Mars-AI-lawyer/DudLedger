@@ -309,12 +309,12 @@ class ResponsivenessTest(unittest.TestCase):
             for button in buttons:
                 self.assertTrue(button.winfo_ismapped(), (size, button.cget('text')))
                 self.assertGreaterEqual(button.winfo_width(), button.winfo_reqwidth() - 8, (size, button.cget('text')))
-            self.assertTrue(self.app.detail_entry.winfo_ismapped())
+            self.assertFalse(hasattr(self.app, "detail_entry"))
             self.assertFalse(self.app.detail_paging.winfo_ismapped())
         self.app.account_label.set("名称较长的明细科目，用于验证展开侧栏时的布局 · 含子科目")
         self.app.sidebar_toggle.invoke()
         self.root.update()
-        for widget in (self.app.detail_mark, self.app.detail_entry, self.app.detail_more, *self.app.sidebar_buttons):
+        for widget in (self.app.detail_mark, self.app.detail_join, self.app.detail_more, *self.app.sidebar_buttons):
             self.assertTrue(widget.winfo_ismapped())
             self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(),
                                  self.app.winfo_rootx() + self.app.winfo_width())

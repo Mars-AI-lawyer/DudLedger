@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="960" viewBox="0 0 1440 960">
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #30302C; }
+      .title { font-size: 22px; font-weight: 600; }
+      .subtitle { font-size: 12px; fill: #77766F; }
+      .page { font-size: 16px; font-weight: 600; }
+      .section { font-size: 12px; font-weight: 600; }
+      .body { font-size: 12px; }
+      .small { font-size: 11px; fill: #77766F; }
+      .nav { font-size: 12px; fill: #53524C; }
+      .money { font-family: Menlo, Consolas, monospace; font-size: 12px; text-anchor: end; }
+      .line { stroke: #E3E0D7; stroke-width: 1; }
+      .strong-line { stroke: #D4D0C6; stroke-width: 1; }
+      .inverse { fill: #FFFFFF; }
+      .accent-text { fill: #873F2C; }
+    </style>
+  </defs>
+  <rect width="1440" height="960" fill="#F5F3EC"/>
+  <text x="48" y="46" class="title">明细账 · 默认状态</text>
+  <text x="1392" y="44" text-anchor="end" class="subtitle">结构示意，非最终像素稿</text>
+
+  <rect x="48" y="76" width="1344" height="812" rx="6" fill="#FAF9F5" stroke="#D4D0C6"/>
+  <rect x="48" y="76" width="176" height="812" rx="6" fill="#F0EEE6"/>
+  <rect x="217" y="76" width="7" height="812" fill="#F0EEE6"/>
+  <text x="72" y="112" class="page">DudLedger</text>
+  <text x="72" y="132" class="small">法律尽调 · 账簿核查</text>
+
+  <text x="72" y="174" class="small">账簿浏览</text>
+  <rect x="60" y="188" width="152" height="34" rx="4" fill="#E2DED3"/>
+  <rect x="60" y="188" width="2" height="34" fill="#A65036"/>
+  <text x="94" y="210" class="nav accent-text">明细账</text>
+  <text x="94" y="250" class="nav">科目总览</text>
+  <text x="94" y="290" class="nav">财务报表</text>
+  <text x="72" y="340" class="small">核查处理</text>
+  <text x="94" y="374" class="nav">关注凭证</text>
+  <text x="94" y="414" class="nav">问题工作台</text>
+  <text x="94" y="454" class="nav">AI 尽调线索</text>
+  <text x="94" y="518" class="nav">计算器</text>
+  <text x="94" y="558" class="nav">尽调主体名单</text>
+  <text x="72" y="838" class="nav">设置</text>
+  <text x="72" y="866" class="small">账套：示例科技</text>
+
+  <line x1="224" y1="140" x2="1392" y2="140" class="line"/>
+  <text x="248" y="116" class="page">明细账</text>
+  <text x="1368" y="114" text-anchor="end" class="small">示例科技 · 本地账套</text>
+
+  <rect x="248" y="160" width="184" height="36" rx="4" fill="#FFFFFF" stroke="#D4D0C6"/>
+  <text x="262" y="183" class="body">全部科目</text>
+  <text x="414" y="183" text-anchor="end" class="small">⌄</text>
+  <rect x="440" y="160" width="714" height="36" rx="4" fill="#FFFFFF" stroke="#A65036"/>
+  <circle cx="463" cy="177" r="6" fill="none" stroke="#77766F" stroke-width="1.4"/>
+  <line x1="467" y1="181" x2="472" y2="186" stroke="#77766F" stroke-width="1.4"/>
+  <text x="482" y="182" class="small">搜索摘要、凭证号、科目、往来单位、辅助核算…</text>
+  <rect x="1162" y="160" width="102" height="36" rx="4" fill="#FFFFFF" stroke="#D4D0C6"/>
+  <text x="1213" y="183" text-anchor="middle" class="body">筛选 2</text>
+  <rect x="1272" y="160" width="96" height="36" rx="4" fill="#FAF9F5"/>
+  <text x="1320" y="183" text-anchor="middle" class="nav">更多 ⌄</text>
+
+  <rect x="248" y="208" width="154" height="26" rx="4" fill="#F1E3DD"/>
+  <text x="260" y="226" class="body accent-text">摘要：关联</text>
+  <text x="386" y="226" text-anchor="end" class="body accent-text">×</text>
+  <rect x="410" y="208" width="172" height="26" rx="4" fill="#F1E3DD"/>
+  <text x="422" y="226" class="body accent-text">借方 ≥ 100,000</text>
+  <text x="566" y="226" text-anchor="end" class="body accent-text">×</text>
+  <text x="1368" y="226" text-anchor="end" class="small">清除筛选</text>
+
+  <rect x="248" y="252" width="1120" height="456" fill="#FFFFFF" stroke="#E3E0D7"/>
+  <rect x="248" y="252" width="1120" height="38" fill="#F5F3EC"/>
+  <line x1="248" y1="290" x2="1368" y2="290" class="line"/>
+  <text x="272" y="276" class="small"></text>
+  <text x="302" y="276" class="section">日期 ↓</text>
+  <text x="408" y="276" class="section">凭证</text>
+  <text x="512" y="276" class="section">科目名称</text>
+  <text x="704" y="276" class="section">摘要</text>
+  <text x="962" y="276" class="section">往来单位</text>
+  <text x="1218" y="276" text-anchor="end" class="section">借方</text>
+  <text x="1338" y="276" text-anchor="end" class="section">贷方</text>
+
+  <g class="body">
+    <rect x="260" y="307" width="12" height="12" rx="2" fill="#A65036"/>
+    <path d="M263 313 L266 316 L270 310" fill="none" stroke="#FFFFFF" stroke-width="1.3"/>
+    <text x="290" y="320">01-16</text><text x="408" y="320">记0003</text><text x="512" y="320">其他应收款—关联往来</text><text x="704" y="320">向关联企业支付临时周转款</text><text x="962" y="320">示例咨询有限公司</text><text x="1218" y="320" class="money">350,000.00</text><text x="1338" y="320" class="money"></text>
+    <line x1="248" y1="332" x2="1368" y2="332" class="line"/>
+    <rect x="260" y="345" width="12" height="12" rx="2" fill="#A65036"/>
+    <path d="M263 351 L266 354 L270 348" fill="none" stroke="#FFFFFF" stroke-width="1.3"/>
+    <text x="290" y="358">01-16</text><text x="408" y="358">记0003</text><text x="512" y="358">银行存款—基本户</text><text x="704" y="358">向关联企业支付临时周转款</text><text x="962" y="358">示例咨询有限公司</text><text x="1338" y="358" class="money">350,000.00</text>
+    <line x1="248" y1="370" x2="1368" y2="370" class="line"/>
+    <rect x="260" y="383" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#A8A69E"/>
+    <text x="290" y="396">01-22</text><text x="408" y="396">记0004</text><text x="512" y="396">其他应收款—关联往来</text><text x="704" y="396">收到关联企业部分归还款</text><text x="962" y="396">示例咨询有限公司</text><text x="1218" y="396" class="money">150,000.00</text>
+    <line x1="248" y1="408" x2="1368" y2="408" class="line"/>
+    <rect x="260" y="421" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#A8A69E"/>
+    <text x="290" y="434">01-22</text><text x="408" y="434">记0004</text><text x="512" y="434">银行存款—基本户</text><text x="704" y="434">收到关联企业部分归还款</text><text x="962" y="434">示例咨询有限公司</text><text x="1338" y="434" class="money">150,000.00</text>
+    <line x1="248" y1="446" x2="1368" y2="446" class="line"/>
+    <rect x="260" y="459" width="12" height="12" rx="2" fill="#A65036"/>
+    <path d="M263 465 L266 468 L270 462" fill="none" stroke="#FFFFFF" stroke-width="1.3"/>
+    <text x="290" y="472">02-03</text><text x="408" y="472">记0005</text><text x="512" y="472">管理费用—专业服务费</text><text x="704" y="472">支付年度法律顾问服务费</text><text x="962" y="472">示例律师事务所</text><text x="1218" y="472" class="money">120,000.00</text>
+    <line x1="248" y1="484" x2="1368" y2="484" class="line"/>
+    <rect x="260" y="497" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#A8A69E"/>
+    <text x="290" y="510">02-03</text><text x="408" y="510">记0005</text><text x="512" y="510">银行存款—基本户</text><text x="704" y="510">支付年度法律顾问服务费</text><text x="962" y="510">示例律师事务所</text><text x="1338" y="510" class="money">120,000.00</text>
+    <line x1="248" y1="522" x2="1368" y2="522" class="line"/>
+    <rect x="260" y="535" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#A8A69E"/>
+    <text x="290" y="548">02-08</text><text x="408" y="548">记0006</text><text x="512" y="548">管理费用—模具开发</text><text x="704" y="548">收到产品设计服务款</text><text x="962" y="548">客户甲</text><text x="1218" y="548" class="money">678,000.00</text>
+    <line x1="248" y1="560" x2="1368" y2="560" class="line"/>
+    <rect x="260" y="573" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#A8A69E"/>
+    <text x="290" y="586">02-08</text><text x="408" y="586">记0006</text><text x="512" y="586">主营业务收入—设计服务</text><text x="704" y="586">收到产品设计服务款</text><text x="962" y="586">客户甲</text><text x="1338" y="586" class="money">640,000.00</text>
+    <line x1="248" y1="598" x2="1368" y2="598" class="line"/>
+    <rect x="260" y="611" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#A8A69E"/>
+    <text x="290" y="624">02-08</text><text x="408" y="624">记0006</text><text x="512" y="624">应交税费—销项税额</text><text x="704" y="624">收到产品设计服务款</text><text x="962" y="624">税务</text><text x="1338" y="624" class="money">38,000.00</text>
+    <line x1="248" y1="636" x2="1368" y2="636" class="line"/>
+    <rect x="260" y="649" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#A8A69E"/>
+    <text x="290" y="662">02-14</text><text x="408" y="662">记0007</text><text x="512" y="662">在建工程—模具开发</text><text x="704" y="662">支付模具开发款</text><text x="962" y="662">供应商甲</text><text x="1218" y="662" class="money">460,000.00</text>
+  </g>
+
+  <rect x="248" y="720" width="1120" height="48" rx="4" fill="#F1E3DD"/>
+  <rect x="248" y="720" width="3" height="48" fill="#A65036"/>
+  <text x="266" y="749" class="body">已勾选 3 张凭证（含跨页 1 张） · 后续操作使用勾选范围</text>
+  <text x="1004" y="749" class="nav">清空勾选</text>
+  <rect x="1080" y="728" width="96" height="32" rx="4" fill="#FFFFFF" stroke="#D4D0C6"/>
+  <text x="1128" y="749" text-anchor="middle" class="body">关注</text>
+  <rect x="1184" y="728" width="168" height="32" rx="4" fill="#A65036"/>
+  <text x="1268" y="749" text-anchor="middle" class="body inverse">加入问题…</text>
+
+  <line x1="224" y1="824" x2="1392" y2="824" class="line"/>
+  <text x="248" y="852" class="small">共 41 条 · 当前 1–41 条 · 2 项筛选</text>
+  <text x="1368" y="852" text-anchor="end" class="small">第 1 / 1 页　‹ 上一页　下一页 ›</text>
+
+  <text x="48" y="924" class="small">1　搜索与筛选共用清晰上下文　　2　没有激活条件时不占额外高度　　3　操作前持续说明实际凭证范围</text>
+</svg>
