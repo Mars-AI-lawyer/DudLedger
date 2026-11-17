@@ -20,7 +20,8 @@ from .background import check_cancelled, cooperate
 from .dd_features import FeatureContext, closing_voucher, low_value_voucher, voucher_feature
 from .importer import format_money
 from .jev_rules import load_rules
-from .related_parties import party_names, role_grouped_names
+from .related_parties import party_names, role_grouped_names, review_party_context
+from .review_providers import provider_order
 from .voucher_notes import voucher_key, voucher_lines_for_key
 from .jev_runtime import REQUEST_SLOTS
 from .specialist_rules import topic_question
@@ -600,6 +601,8 @@ class ReviewJob:
                     from .bailian_review import DEFAULT_ENDPOINT, validate_endpoint
                     scope = json.loads(info['scope_json'])
                     self._bailian_endpoint = validate_endpoint(scope.get('bailian_endpoint', DEFAULT_ENDPOINT))
+                    self._provider_order = provider_order(scope.get('preferred_provider'),
+                        bailian_enabled=scope.get('bailian_free_confirmed') is True)
                 # Lock the database while validating the scope and marking consent.
                 store.db.execute('UPDATE jev_batches SET snapshot_hash=snapshot_hash WHERE id=?', (self.batch_id,))
                 if special:
@@ -650,7 +653,8 @@ class ReviewJob:
             info = batch_info(store, self.batch_id)
             rules = json.loads(info['body_json'])
             # Freeze the grouped party list for the whole run so cache keys and sent content match.
-            parties = role_grouped_names(store.related_parties())
+            parties = (review_party_context(store.related_parties()) if rules.get('profile') == 'account-special-v1'
+                       else role_grouped_names(store.related_parties()))
             # Queue at most four tasks, so cancellation never leaves a large request backlog.
             groups = iter_voucher_groups(store, self.batch_id)
             exhausted = False

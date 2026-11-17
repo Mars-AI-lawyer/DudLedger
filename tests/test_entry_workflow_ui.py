@@ -163,7 +163,7 @@ class EntryWorkflowTest(unittest.TestCase):
         editor = next(w for w in widgets(dialog) if isinstance(w, tk.Text) and w.cget("state") == "normal")
         view = next(w for w in widgets(dialog) if isinstance(w, ttk.Treeview))
         hint = next(w for w in widgets(dialog) if isinstance(w, ttk.Label)
-                    and w.cget('text') == '按 ESC 键关闭凭证')
+                    and w.cget('text') == '顺序继承当前明细范围 · Enter 打开 · Esc 关闭')
         self.assertTrue(hint.winfo_ismapped())
         self.assertLess(hint.winfo_rootx(), dialog.winfo_rootx() + dialog.winfo_width() / 2)
         compact_height = dialog.winfo_height()

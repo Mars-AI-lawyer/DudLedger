@@ -6,6 +6,7 @@ from ledger_viewer.importer import ImportSpec, guess_header
 from ledger_viewer.related_parties import (party_names, party_entries_from_file, party_names_from_file,
                                            parse_party_lines, parse_party_names, parse_roles, party_roles,
                                            related_party_match, build_party_index, indexed_party_match, role_grouped_names)
+from ledger_viewer.related_parties import review_party_context, parse_party_records, party_records_from_file
 from ledger_viewer.store import LedgerStore
 
 
@@ -104,6 +105,26 @@ class RelatedPartiesTest(unittest.TestCase):
         self.assertEqual(parse_roles("股东,董事、监事"), ["股东", "董事", "监事"])
         self.assertEqual(parse_roles("法定代表人,股东"), ["股东"])  # 未知身份不猜测
         self.assertEqual(parse_roles(""), [])
+
+    def test_review_context_keeps_names_aliases_roles_and_relationship_together(self):
+        self.store.save_related_party('甲公司', ['甲集团'], '不发送的内部备注', None, ['关联企业'], '实控人控制的企业')
+        self.assertEqual(review_party_context(self.store.related_parties()), {'parties': [
+            {'name': '甲公司', 'aliases': ['甲集团'], 'roles': ['关联企业'], 'relation': '实控人控制的企业'}]})
+
+    def test_file_and_pasted_records_preserve_relationship_and_empty_role(self):
+        path = self.base / 'relations.csv'
+        path.write_text('名称,身份,与目标公司关系,备注\n甲公司,,实控人控制,内部备注\n张三,股东,持股30%,不发送\n', encoding='utf-8')
+        expected = [('甲公司', [], '实控人控制'), ('张三', ['股东'], '持股30%')]
+        records = party_records_from_file(path)
+        self.assertEqual(records, expected)
+        text = '\n'.join(f'{name}｜{",".join(roles)}｜{relation}' for name, roles, relation in records)
+        self.assertEqual(parse_party_records(text), expected)
+        path.write_text('与目标公司关系,名称,身份\n持股30%,张三,股东\n', encoding='utf-8')
+        self.assertEqual(party_records_from_file(path), [expected[1]])
+        path.write_text('名称,与目标公司关系\n甲公司,子公司\n', encoding='utf-8')
+        self.assertEqual(party_records_from_file(path), [('甲公司', [], '子公司')])
+        path.write_text(',甲公司,,实控人控制\n', encoding='utf-8')
+        self.assertEqual(party_records_from_file(path), [('甲公司', [], '实控人控制')])
 
     def test_party_lines_and_file_import_carry_roles(self):
         text = "张三｜股东,董事\n\n李四｜未知身份\n王五\n张三"

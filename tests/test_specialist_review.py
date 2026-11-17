@@ -221,6 +221,33 @@ class SpecialistReviewTest(unittest.TestCase):
         self.assertEqual(len(JevClient.calls), 1)
         self.assertEqual(batch_counts(self.store, again)['cached'], 2)
 
+    def test_relationship_change_invalidates_preview_results_and_cache(self):
+        party_id = self.store.save_related_party('虚构股东甲', [], '', None, [], '持股30%')
+        completed = self.run_job({'review_accounts': ['其他应付款']})
+        preview = prepare_batch(self.store, {'review_accounts': ['其他应付款']})
+        self.store.save_related_party('虚构股东甲', [], '', party_id, [], '已退出股东')
+        with self.assertRaisesRegex(ValueError, '变化'):
+            ReviewJob(self.store.path, preview, 'test', JevClient).start(self.store)
+        refresh_staleness(self.store, completed)
+        self.assertEqual(batch_counts(self.store, completed)['stale'], 2)
+        new_batch = self.run_job({'review_accounts': ['其他应付款']})
+        self.assertEqual(batch_counts(self.store, new_batch)['cached'], 0)
+        self.assertEqual(JevClient.calls[-1][0]['related_parties']['parties'][0]['relation'], '已退出股东')
+
+    def test_party_prompt_migration_preserves_custom_rules_and_runs_once(self):
+        from ledger_viewer.specialist_rules import PARTY_CONTEXT_PROMPT
+        rules = default_rules()
+        rules.pop('party_context_revision')
+        rules['common'] = '用户自定义边界。'
+        rules['topics'][0]['question'] = '用户自定义问题。'
+        with self.store.db:
+            old = self.store.db.execute('INSERT INTO jev_rules(body_json) VALUES(?)', (json.dumps(rules),)).lastrowid
+        new, migrated = load_rules(self.store)
+        self.assertGreater(new, old)
+        self.assertEqual(migrated['common'], '用户自定义边界。\n\n' + PARTY_CONTEXT_PROMPT)
+        self.assertEqual(migrated['topics'][0]['question'], '用户自定义问题。')
+        self.assertEqual(load_rules(self.store)[0], new)
+
     def test_prompt_boundaries_and_all_default_ids(self):
         rules = default_rules()
         validate_rules(rules)

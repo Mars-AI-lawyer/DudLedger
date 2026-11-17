@@ -3,11 +3,11 @@
     <style>
       text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #30302C; }
       .title { font-size: 22px; font-weight: 600; }
-      .subtitle { font-size: 12px; fill: #77766F; }
+      .subtitle { font-size: 12px; fill: #6B6962; }
       .page { font-size: 17px; font-weight: 600; }
       .section { font-size: 12px; font-weight: 600; }
       .body { font-size: 12px; }
-      .small { font-size: 11px; fill: #77766F; }
+      .small { font-size: 11px; fill: #6B6962; }
       .nav { font-size: 12px; fill: #53524C; }
       .money { font-family: Menlo, Consolas, monospace; font-size: 12px; text-anchor: end; }
       .total { font-family: Menlo, Consolas, monospace; font-size: 14px; font-weight: 600; text-anchor: end; }
@@ -18,7 +18,8 @@
   </defs>
   <rect width="1440" height="960" fill="#F5F3EC"/>
   <text x="48" y="44" class="title">凭证连续核查 · 留在当前任务中</text>
-  <text x="1392" y="42" text-anchor="end" class="subtitle">非模态凭证窗口；顺序继承当前筛选结果</text>
+  <text x="1392" y="42" text-anchor="end" class="subtitle">目标方案 · 非当前实现 · 非最终像素稿</text>
+  <text x="48" y="62" class="small">保留＝当前已有　调整＝优化现有　新增＝目标补充</text>
 
   <rect x="160" y="82" width="1120" height="802" rx="6" fill="#FAF9F5" stroke="#D4D0C6"/>
   <text x="192" y="122" class="nav">‹ 返回明细账</text>
@@ -26,6 +27,7 @@
   <rect x="420" y="144" width="66" height="26" rx="4" fill="#F1E3DD"/>
   <text x="453" y="162" text-anchor="middle" class="small accent-text">已关注</text>
   <text x="1248" y="162" text-anchor="end" class="body">‹ 上一张　 3 / 41　 下一张 ›</text>
+  <text x="1248" y="136" text-anchor="end" class="small accent-text">新增</text>
   <line x1="160" y1="190" x2="1280" y2="190" class="line"/>
 
   <text x="192" y="220" class="small">来源：示例科技_序时账.csv / 序时账：第 18–19 行</text>
@@ -74,12 +76,14 @@
   <rect x="928" y="764" width="104" height="36" rx="4" fill="#FFFFFF" stroke="#D4D0C6"/>
   <text x="980" y="787" text-anchor="middle" class="body">计算器</text>
   <rect x="1040" y="764" width="96" height="36" rx="4" fill="#FFFFFF" stroke="#D4D0C6"/>
-  <text x="1088" y="787" text-anchor="middle" class="body">确认复核</text>
+  <text x="1088" y="787" text-anchor="middle" class="body">确认关注复核</text>
   <rect x="1144" y="764" width="104" height="36" rx="4" fill="#A65036"/>
   <text x="1196" y="787" text-anchor="middle" class="body inverse">加入问题…</text>
 
   <rect x="192" y="824" width="1056" height="36" rx="4" fill="#F1E3DD"/>
-  <text x="208" y="847" class="small accent-text">切换凭证前自动保存备注；保存失败时留在当前凭证并保留输入。</text>
+  <text x="208" y="847" class="small accent-text">保留：切换/关闭前自动保存备注；失败时留在当前凭证并保留输入。</text>
 
-  <text x="160" y="922" class="small">凭证内容决定窗口高度：常见两至六行不保留大块空白；来源、合计、关注与问题状态始终可见，连续核查无需返回列表重新双击。</text>
+  <text x="160" y="910" class="small">保留：紧凑分录高度、固定合计/差额、折叠备注与保存保护（当前已有）。</text>
+  <text x="160" y="928" class="small">新增：Enter 打开、上一张/下一张、n/N 与来源直接查看（区域 3）。</text>
+  <text x="160" y="946" class="small">当前差距：连续导航与来源可达性不足；差额和事件传播仍需运行态验收。</text>
 </svg>

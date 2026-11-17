@@ -18,14 +18,15 @@ from .deepseek_mapping import get_api_key as get_deepseek_key
 from .bailian_review import get_api_key as get_bailian_key, DEFAULT_ENDPOINT as BAILIAN_ENDPOINT
 from .specialist_rules import ACCOUNTS, load_rules, review_accounts
 from .review_rules_ui import ReviewRulesDialog
-from .related_parties import party_names, role_grouped_names
+from .related_parties import party_names, review_party_context
+from .review_providers import order_description, preferred_provider
 from .jev_review import (BOUNDARY, STATUS_LABELS, SEND_FIELDS,
-    ReviewJob, active_job, batch_counts, batch_info, discard_preview,
+    ReviewJob, active_job, batch_counts, batch_info, discard_preview, digest,
     is_uncertain, prepare_batch, preview_page, recover_interrupted,
     refresh_staleness, save_feedback, test_connection, voucher_results, voucher_result_context)
 
 CONSENT_TEXT = ('本次将把所选账簿记录中的日期、科目、摘要、往来单位、辅助核算、非零一侧的借贷金额，'
-    '以及当前账套尽调主体名单中的名称与身份（不含备注），依次使用阿里百炼决策模型、TypeSafe Jev、DeepSeek Flash（不思考）；前一级未配置、额度不足或服务不可用时尝试下一级，'
+    '以及当前账套尽调主体名单中的名称、别名、身份及与目标公司关系（不含备注），按本次优先顺序使用阿里百炼决策模型、TypeSafe Jev、DeepSeek Flash（不思考）；前一级未配置、额度不足或服务不可用时尝试下一级，'
     '用于筛选值得法律尽调律师进一步查看的凭证。百炼仅在使用者确认免费可用后启用；未确认时跳过。\n\n'
     '同时提供本次启用的专项问题及明确取得的历史背景。'
     '这些字段可能包含客户商业信息或个人信息。请确认本次使用符合项目的保密安排，并仅选择本次审查所需的范围。'
@@ -53,6 +54,32 @@ def display_input(payload):
     # Optional fields (counterparty/auxiliary/amounts) are omitted when blank or zero.
     lines = [f'{label}：{payload[field]}' for field, label in SEND_FIELDS.items() if payload.get(field)]
     return '\n'.join(lines) if lines else '（无内容）'
+
+
+def saved_voucher_lines(group):
+    """Return the voucher as saved with the batch, without consulting current entries."""
+    lines = []
+    for row in group.get('lines', []):
+        local = row.get('local')
+        if local is None and row.get('local_json'):
+            local = json.loads(row['local_json'])
+        if local is not None:
+            lines.append(local)
+    return lines
+
+
+def detail_lines(group, current_lines):
+    """Use current voucher rows only while every saved result still matches them."""
+    historical = not current_lines or any(row.get('stale') for row in group.get('lines', []))
+    return (saved_voucher_lines(group) if historical else current_lines), historical
+
+
+def sent_snapshot_content(group):
+    blocks = []
+    for index, row in enumerate(group.get('lines', []), 1):
+        payload = json.loads(row['input_json']) if isinstance(row.get('input_json'), str) else row.get('input_json', {})
+        blocks.append(f'第 {index} 条已保存发送内容\n{display_input(payload)}')
+    return '\n\n'.join(blocks) or '（本批次未保存可显示的发送内容）'
 
 
 def launch_connection_test(parent, status, *, provider='jev', api_key=None, endpoint=BAILIAN_ENDPOINT):
@@ -105,17 +132,20 @@ class ConsentDialog(tk.Toplevel):
         description = []
         labels = {'account': '科目', 'search': '关键词', 'fiscal_year': '年度', 'period': '期间', 'source_ids': '来源编号', 'include_descendants': '包含下级科目', 'review_accounts': '专项科目', 'bailian_endpoint': '百炼接口'}
         for field, value in scope.items():
-            if value and field in labels:
+            if field == 'review_accounts':
+                description.append('专项科目：' + ('、'.join(value) if value else '全部已设置科目（未选择 = 全部）'))
+            elif value and field in labels:
                 description.append(f'{labels[field]}：' + ('、'.join(value) if isinstance(value, list) else str(value)))
         wrapped_label(self, text='本次将选定凭证及其完整分录、尽调主体名单和程序特征发送至下列模型服务；可能包含客户商业信息或个人信息，请确认符合项目保密安排。原始文件不上传。完整说明、名单及实际发送字段见下方预览。', wraplength=750, padding=12).pack(fill='x')
-        order = '百炼（已确认免费可用）→ Jev → DeepSeek Flash' if scope.get('bailian_free_confirmed') else 'Jev → DeepSeek Flash（百炼未确认免费，已跳过）'
+        order = order_description(scope.get('preferred_provider'), bailian_enabled=scope.get('bailian_free_confirmed') is True)
         wrapped_label(self, text='本次优先顺序：' + order, padding=(12, 0)).pack(fill='x')
-        wrapped_label(self, text=f'账套：{self.store.path.name}\n范围：' + ('；'.join(description) or '全部明细分录') + f'\n共 {self.total} 条分录，归为 {self.voucher_total} 张凭证／无号来源行；每张凭证去重合并后核查（相同行合并金额并标注次数，仅发送非零一侧金额）；超长内容分段 · 规则 v{info["rule_id"]} · {info["model"]}', padding=(12, 4), wraplength=750).pack(fill='x')
+        scope_note = '；按专项科目新建范围，不继承当前明细筛选' if 'review_accounts' in scope else ''
+        wrapped_label(self, text=f'账套：{self.store.path.name}\n范围：' + ('；'.join(description) or '全部明细分录') + scope_note + f'\n共 {self.total} 条分录，归为 {self.voucher_total} 张凭证／无号来源行；每张凭证去重合并后核查（相同行合并金额并标注次数，仅发送非零一侧金额）；超长内容分段 · 规则 v{info["rule_id"]} · {info["model"]}', padding=(12, 4), wraplength=750).pack(fill='x')
         parties = party_names(self.store.related_parties())
-        grouped = role_grouped_names(self.store.related_parties())
+        grouped = review_party_context(self.store.related_parties())
         self.party_payload = grouped
         wrapped_label(self, text='发送字段：' + '、'.join(SEND_FIELDS.values())
-            + f'；尽调主体名单共 {len(parties)} 个名称（仅名称、别名和身份）。文件名、路径、制单人及凭证标识留在本地。', padding=(12, 4), wraplength=750).pack(fill='x')
+            + f'；尽调主体名单共 {len(parties)} 个名称（名称、别名、身份及与目标公司关系，不含备注）。文件名、路径、制单人及凭证标识留在本地。', padding=(12, 4), wraplength=750).pack(fill='x')
         wrapped_label(self, text=f"已排除结转损益凭证 {counts['skipped_vouchers']} 张；仅对本次专项科目的凭证提问，不使用整体风险判断。", padding=(12, 0)).pack(fill='x')
         self.preview = read_only_text(self, '', height=13)
         bottom = ttk.Frame(self, padding=10)
@@ -198,7 +228,12 @@ class ReviewPanel(ttk.Frame):
         self.cancel_button.pack(side='left', padx=5)
         self.more_button = ttk.Button(actions, text='更多选项', style="Ghost.TButton", command=self._toggle_options)
         self.more_button.pack(side='right')
-        selection = ttk.LabelFrame(self, text='抽查范围（可多选；未选时审查全部已设置科目）', padding=(6, 2))
+        self.overview = tk.StringVar(value='待核 0 张 · 当前批次：尚无审查批次')
+        wrapped_label(self, textvariable=self.overview, padding=(8, 2), wraplength=1050).pack(fill='x')
+        self.scope_summary = tk.StringVar()
+        wrapped_label(self, textvariable=self.scope_summary, padding=(8, 2), wraplength=1050).pack(fill='x')
+        self.options = ttk.Frame(self)
+        selection = ttk.LabelFrame(self.options, text='专项范围（可多选；未选择 = 全部已设置科目）', padding=(6, 2))
         selection.pack(fill='x', padx=6)
         self.account_canvas = tk.Canvas(selection, height=66, highlightthickness=0)
         scroll = ttk.Scrollbar(selection, orient='vertical', command=self.account_canvas.yview)
@@ -212,30 +247,30 @@ class ReviewPanel(ttk.Frame):
         self.account_canvas.bind('<MouseWheel>', lambda event: self.account_canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units'))
         self.review_accounts = {}
         self.refresh_accounts()
-        ttk.Button(actions, text='科目与提示词设置', command=app.open_review_rules).pack(side='left', padx=5)
         self.progress = tk.StringVar(value='只抽查所选科目的凭证；默认百炼优先，Jev 可选，DeepSeek Flash 兜底。')
         wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050).pack(fill='x')
         self.progress_bar = ttk.Progressbar(self, mode='determinate', maximum=1, value=0)
         self.progress_bar.pack(fill='x', padx=8, pady=(0, 7))
-        self.category_frame = ttk.Frame(self, padding=(6, 0))
-        self.category_frame.pack(fill='x')
-        self.category = tk.StringVar(value='全部')
-        self.options = ttk.Frame(self)
+        primary_lanes = ttk.Frame(self, padding=(6, 0, 6, 4))
+        primary_lanes.pack(fill='x')
+        self.lane = tk.StringVar(value='candidates')
+        self.lane_buttons = {}
+        for label, value in (('待核', 'candidates'), ('已处理', 'completed'), ('全部', 'all')):
+            button = ttk.Radiobutton(primary_lanes, text=label, value=value, variable=self.lane, command=self.refresh_rows)
+            button.pack(side='left', padx=(0, 18))
+            self.lane_buttons[value] = button
         batch_row = ttk.Frame(self.options, padding=(6, 0))
         batch_row.pack(fill='x')
         ttk.Label(batch_row, text='历史批次').pack(side='left', padx=(0, 5))
-        ttk.Button(batch_row, text='AI审查设置', command=app.open_review_rules).pack(side='right', padx=5)
         self.batch = tk.StringVar()
         self.batch_combo = ttk.Combobox(batch_row, textvariable=self.batch, state='readonly')
         self.batch_combo.pack(fill='x', expand=True)
         self.batch_combo.bind('<<ComboboxSelected>>', self._select_batch)
-        lanes = ttk.Frame(self.options, padding=(6, 0))
-        lanes.pack(fill='x')
-        self.lane = tk.StringVar(value='candidates')
-        self.lane_buttons = {}
-        for index, (label, value) in enumerate((('待核线索（含不确定／失败）', 'candidates'), ('已完成结果', 'completed'), ('命中分类', 'scored'), ('信息不足／判断不确定', 'uncertain'), ('分析失败／未分析／过期', 'unfinished'), ('全部（含未命中／未送 AI）', 'all'))):
+        lanes = ttk.LabelFrame(self.options, text='高级结果筛选', padding=(6, 2))
+        lanes.pack(fill='x', padx=6, pady=(4, 0))
+        for index, (label, value) in enumerate((('仅明确命中', 'scored'), ('信息不足／判断不确定', 'uncertain'), ('分析失败／未分析／过期', 'unfinished'))):
             button = ttk.Radiobutton(lanes, text=label, value=value, variable=self.lane, command=self.refresh_rows)
-            button.grid(row=index // 2, column=index % 2, sticky='w', padx=(0, 14), pady=2)
+            button.grid(row=0, column=index, sticky='w', padx=(0, 14), pady=2)
             self.lane_buttons[value] = button
         filters = ttk.Frame(self.options, padding=6)
         filters.pack(fill='x')
@@ -251,10 +286,15 @@ class ReviewPanel(ttk.Frame):
         self.period_combo = combo
         ttk.Checkbutton(filters, text='显示已忽略', variable=self.show_ignored, command=self.refresh_rows).pack(side='left', padx=5)
         ttk.Button(filters, text='筛选', command=self.refresh_rows).pack(side='left')
+        self.category = tk.StringVar(value='全部')
+        self.category_frame = ttk.LabelFrame(self.options, text='分类', padding=(6, 2))
+        self.category_frame.pack(fill='x', padx=6)
+        self.category_frame.bind('<Configure>', lambda event: self._layout_category_buttons(event.width))
         self.view = tree(self, [('voucher', '凭证', 140), ('account', '抽查科目', 110), ('amount', '金额', 110), ('summary', '摘要', 200),
             ('categories', '审查问题 / 编号', 260),
             ('analysis', '状态', 110)])
         self.view.bind('<Double-1>', self.open_detail)
+        self.view.bind('<Return>', self.open_detail)
         bottom = ttk.Frame(self, padding=6)
         bottom.pack(side='bottom', fill='x', before=self.view.master)
         self.count_label = tk.StringVar()
@@ -264,12 +304,18 @@ class ReviewPanel(ttk.Frame):
         self.result_prev.pack(side='right', padx=3)
         self.result_next = ttk.Button(bottom, text='下一页', command=lambda: self._result_page(1), state='disabled')
         self.result_next.pack(side='right', padx=3)
+        from .empty_state import EmptyState
+        self.empty_initial = EmptyState(self.view.master, 'entries', '还没有 AI 审查结果',
+            '按专项科目新建范围；发送前可逐页预览并确认隐私说明。', '开始 AI 专项抽查', self.new_batch)
+        self.empty_results = EmptyState(self.view.master, 'filter', '当前视图没有结果',
+            '可切换待核、已处理或全部，也可清除高级筛选后恢复查看。', '查看全部结果', self._show_all_results)
         self._poll_id = self.after(200, self._poll)
         self.bind("<Destroy>", self._destroyed, add="+")
 
     def refresh_accounts(self):
         names = review_accounts(load_rules(self.app.store)[1]) if self.app.store else ACCOUNTS
         if tuple(self.review_accounts) == tuple(names):
+            self._update_scope_summary()
             return
         selected = {name for name, var in self.review_accounts.items() if var.get()}
         for child in self.account_selection.winfo_children():
@@ -277,8 +323,15 @@ class ReviewPanel(ttk.Frame):
         self.review_accounts = {name: tk.BooleanVar(value=name in selected) for name in names}
         self.account_canvas.configure(height=min(108, max(36, ((len(names) + 3) // 4) * 32)))
         for index, (name, var) in enumerate(self.review_accounts.items()):
-            ttk.Checkbutton(self.account_selection, text=name, variable=var).grid(
+            ttk.Checkbutton(self.account_selection, text=name, variable=var, command=self._update_scope_summary).grid(
                 row=index // 4, column=index % 4, sticky='w', padx=(0, 14))
+        self._update_scope_summary()
+
+    def _update_scope_summary(self):
+        selected = [name for name, var in self.review_accounts.items() if var.get()]
+        scope = (f'本次范围：已选 {len(selected)} 个专项科目' if selected else
+                 f'本次范围：全部 {len(self.review_accounts)} 个已设置科目（未选择 = 全部）')
+        self.scope_summary.set(scope + ' · 按专项科目新建范围，不继承当前明细筛选')
 
     def _render_category_bar(self, rules, counts):
         for child in self.category_frame.winfo_children():
@@ -288,11 +341,26 @@ class ReviewPanel(ttk.Frame):
         selected = self.category.get() or '全部'
         if selected not in dict(counts) and selected != '全部':
             selected = '全部'
-        for index, (label, count) in enumerate(counts):
-            button = ttk.Radiobutton(self.category_frame, text=f'{label} {count}', value=label,
+        for label, count in counts:
+            ttk.Radiobutton(self.category_frame, text=f'{label} {count}', value=label,
                 variable=self.category, command=self.refresh_rows)
-            button.grid(row=index // 7, column=index % 7, sticky='w', padx=(0, 10), pady=1)
         self.category.set(selected)
+        self._layout_category_buttons()
+
+    def _layout_category_buttons(self, width=None):
+        buttons = self.category_frame.winfo_children()
+        if not buttons:
+            return
+        width = width or self.category_frame.winfo_width() or self.category_frame.winfo_reqwidth()
+        row = column = used = 0
+        for button in buttons:
+            needed = button.winfo_reqwidth() + 10
+            if used and used + needed > width:
+                row += 1
+                column = used = 0
+            button.grid(row=row, column=column, sticky='w', padx=(0, 10), pady=1)
+            column += 1
+            used += needed
 
     def _category_counts(self, rules, candidates):
         counts = [('全部', len(candidates))]
@@ -328,6 +396,14 @@ class ReviewPanel(ttk.Frame):
             self.options.pack(fill='x', before=self.view.master)
             self.more_button.configure(text='收起选项')
 
+    def _show_all_results(self):
+        self.lane.set('all')
+        self.account.set('')
+        self.period.set('全部期间')
+        self.category.set('全部')
+        self.show_ignored.set(False)
+        self.refresh_rows()
+
     def new_batch(self):
         if not self.app.store:
             messagebox.showinfo('请打开账套', '请先新建或打开账套并导入明细账。', parent=self)
@@ -343,7 +419,7 @@ class ReviewPanel(ttk.Frame):
     def prepare(self, scope):
         if self.preparing or self.app.import_busy:
             return
-        scope = {**scope, 'preferred_provider': 'bailian',
+        scope = {**scope, 'preferred_provider': preferred_provider(self.app.controller.preferences.get('review_preferred_provider')),
                  'bailian_free_confirmed': self.app.controller.preferences.get('bailian_free_confirmed') is True,
                  'bailian_endpoint': self.app.controller.preferences.get('bailian_endpoint', BAILIAN_ENDPOINT)}
         if not self.app.store.large_book():
@@ -407,11 +483,13 @@ class ReviewPanel(ttk.Frame):
         if self.batch_id not in self.batch_options.values():
             self.batch_id = batches[0]['id'] if batches else None
         self.batch.set(next((label for label, value in self.batch_options.items() if value == self.batch_id), '尚无审查批次'))
+        self.overview.set(('待核计算中 · ' if self.batch_id is not None else '待核 0 张 · ') + '当前批次：' + self.batch.get())
         if store.large_book() and not self._visible():
             self._rows_dirty = True
             return
         if self.batch_id is not None:
-            token = (store.path, self.batch_id, store.setting('data_revision', '0'))
+            token = (store.path, self.batch_id, store.setting('data_revision', '0'),
+                     digest(review_party_context(store.related_parties())))
             if token != self._stale_token:
                 self._stale_token = token
                 if store.large_book():
@@ -464,12 +542,16 @@ class ReviewPanel(ttk.Frame):
             self.view.delete(*self.view.get_children())
             self.rows = {}
             self.progress_bar.configure(maximum=1, value=0)
+            self.overview.set('待核 0 张 · 当前批次：尚无审查批次')
             self.count_label.set('尚无结果，选择科目后点击“开始 AI 专项抽查”。')
+            self.empty_results.hide()
+            self.empty_initial.show()
             self.result_prev.configure(state='disabled')
             self.result_next.configure(state='disabled')
             for child in self.category_frame.winfo_children():
                 child.destroy()
             return
+        self.empty_initial.hide()
         if not keep_page:
             self.result_offset = 0
         self._last_refresh = time.monotonic()
@@ -489,9 +571,10 @@ class ReviewPanel(ttk.Frame):
             tier, lane, account, category, period, ignored = options
             candidates = groups if lane == 'candidates' and not category else voucher_results(
                 reader, batch_id, tier, 'candidates', account, '', period, ignored, context=context)
+            pending = voucher_results(reader, batch_id, None, 'candidates', context=context)
             periods = sorted({f"{r['local']['fiscal_year']}/{r['local']['period']}"
                 for lines in context['groups'].values() for r in lines})
-            return groups, candidates, context['rules'], periods, batch_counts(reader, batch_id), context['info'], (revision, context['totals'])
+            return groups, candidates, len(pending), context['rules'], periods, batch_counts(reader, batch_id), context['info'], (revision, context['totals'])
         if store.large_book():
             self.count_label.set('正在本机更新线索…')
             self.app._read_task('review_rows', query, self._render_rows)
@@ -501,14 +584,20 @@ class ReviewPanel(ttk.Frame):
     def _render_rows(self, result):
         if result is None:
             return
-        groups, candidates, rules, periods, counts, info, self._totals_cache = result
+        groups, candidates, pending, rules, periods, counts, info, self._totals_cache = result
         self._counts(counts, info)
+        self.overview.set(f'待核 {pending} 张 · 当前批次：{self.batch.get()}')
         if self.app.store.large_book() and not self._visible():
             self._rows_dirty = True
             return
         self._render_category_bar(rules, self._category_counts(rules, candidates))
         self.period_combo.configure(values=['全部期间', *periods])
         total = len(groups)
+        self.empty_initial.hide()
+        if total:
+            self.empty_results.hide()
+        else:
+            self.empty_results.show()
         self.result_offset = min(self.result_offset, max(0, (total - 1) // 500 * 500))
         groups = groups[self.result_offset:self.result_offset + 500]
         self.result_prev.configure(state='normal' if self.result_offset else 'disabled')
@@ -594,6 +683,9 @@ class ReviewDetail(tk.Toplevel):
         self.app.review_windows.add(self)
         self.bind('<Destroy>', lambda event: self.app.review_windows.discard(self) if event.widget is self else None, add='+')
         self.store = self.app.store
+        self.entry_id = group['lines'][0]['entry_id'] if group.get('lines') else None
+        current_lines = self.store.voucher_lines(self.entry_id) if self.entry_id is not None else []
+        lines, self.historical = detail_lines(group, current_lines)
         local = group['hits'][0]['local']
         voucher_title = f"{local['fiscal_year']}年{local['period']}期 {local['voucher_type']}{local['voucher_no']}" if local['voucher_no'] else '无凭证号来源行'
         self.title(f'AI 尽调线索 · {voucher_title}')
@@ -604,8 +696,10 @@ class ReviewDetail(tk.Toplevel):
         info = batch_info(self.store, panel.batch_id)
         self.rules = json.loads(info['body_json'])
         models = list(dict.fromkeys(json.loads(row['response_json'])['model'] for row in group['lines'] if row['response_json']))
+        history_notice = ('\n原凭证已变化或不存在；以下为发送时保存的只读快照。'
+                          '关注、归集、忽略及复核等依赖当前凭证的操作已禁用。') if self.historical else ''
         wrapped_label(self, text=f"命中事项：{'、'.join(group['labels'])} · "
-            f"规则 v{info['rule_id']} · 实际模型 {'、'.join(models) or '尚未调用'}\n{BOUNDARY}", padding=10, wraplength=760).grid(row=0, column=0, sticky='ew')
+            f"规则 v{info['rule_id']} · 实际模型 {'、'.join(models) or '尚未调用'}{history_notice}\n{BOUNDARY}", padding=10, wraplength=760).grid(row=0, column=0, sticky='ew')
         self.detail_panes = ttk.Panedwindow(self, orient='vertical')
         self.detail_panes.grid(row=1, column=0, sticky='nsew', padx=10)
         self.voucher_area = ttk.Frame(self.detail_panes)
@@ -613,7 +707,11 @@ class ReviewDetail(tk.Toplevel):
         self.preview_tabs = ttk.Notebook(self.voucher_area)
         self.preview_tabs.pack(fill='both', expand=True)
         self.voucher_page = ttk.Frame(self.preview_tabs)
-        self.preview_tabs.add(self.voucher_page, text='完整凭证')
+        self.preview_tabs.add(self.voucher_page, text='原凭证快照' if self.historical else '完整凭证')
+        if self.historical:
+            snapshot_page = ttk.Frame(self.preview_tabs)
+            self.preview_tabs.add(snapshot_page, text='发送内容快照')
+            read_only_text(snapshot_page, sent_snapshot_content(group), height=6)
         topics = {topic['id']: topic for topic in self.rules['topics']}
         suggestions = []
         for identifier, label, _sources, _probability in group['categories']:
@@ -624,18 +722,19 @@ class ReviewDetail(tk.Toplevel):
             advice_page = ttk.Frame(self.preview_tabs)
             self.preview_tabs.add(advice_page, text='核查建议')
             read_only_text(advice_page, '\n\n'.join(suggestions), height=4)
-        # 完整凭证：与明细账双击打开的凭证同一份数据与列格式。
-        self.entry_id = group['lines'][0]['entry_id']
-        lines = self.store.voucher_lines(self.entry_id)
+        # 当前凭证与历史快照共用统一表格的框选复制和计算能力。
+        from .table_tools import TableTools
         self.voucher_view = tree(self.voucher_page, VIEW_COLUMNS['voucher'])
-        self.voucher_key = voucher_key(lines[0])
-        self.app.shortcuts.attach(self)
+        self.voucher_key = group['key'] if self.historical else (voucher_key(lines[0]) if lines else group['key'])
+        self.cell_tools = TableTools(self.voucher_view, {'debit', 'credit', 'original'})
+        if not self.historical:
+            self.app.shortcuts.attach(self)
         self.voucher_view.configure(style="Compact.Treeview")
         self._voucher_rows = min(6, max(2, len(lines)))
         self.voucher_view.configure(height=self._voucher_rows)
         self.app._register_column_view('voucher', self.voucher_view)
         mark_for_entry, _remove_mark, _save_mark, _list_marks = self._mark_tools
-        existing_mark = mark_for_entry(self.store, self.entry_id)
+        existing_mark = None if self.historical else mark_for_entry(self.store, self.entry_id)
         for line in lines:
             side_tag = 'debit_row' if line['debit_cents'] and not line['credit_cents'] else 'credit_row' if line['credit_cents'] and not line['debit_cents'] else ''
             self.voucher_view.insert('', 'end', values=(line['code'], line['name'], line['summary'], line['auxiliary'],
@@ -654,29 +753,46 @@ class ReviewDetail(tk.Toplevel):
         self.json_button = ttk.Button(self.actions, text='查看 JSON 返回结果 ▾', command=self._toggle_json)
         self.json_button.grid(row=0, column=0, columnspan=2, sticky='w', pady=3)
         self.ignore_var = tk.BooleanVar(value=group['feedback'] == 'ignore')
-        ttk.Checkbutton(self.actions, text='忽略此线索', variable=self.ignore_var, command=self._save_ignore).grid(row=0, column=2, sticky='w', padx=8)
+        self.ignore_check = ttk.Checkbutton(self.actions, text='忽略此线索', variable=self.ignore_var, command=self._save_ignore)
+        self.ignore_check.grid(row=0, column=2, sticky='w', padx=8)
+        self.issue_button = ttk.Button(self.actions, text='加入尽调问题…', command=lambda: self.app.workbench.choose_issue([group['key']]))
+        self.issue_button.grid(row=0, column=3, columnspan=2, sticky='e')
+        self.calculator_button = ttk.Button(self.actions, text='计算器', command=self.cell_tools.toggle)
+        self.calculator_button.grid(row=0, column=5, sticky='e', padx=(6, 0))
         self.close_button = ttk.Button(self.actions, text='关闭', command=self.request_close)
-        self.close_button.grid(row=1, column=4, sticky='e', padx=(6, 0), pady=3)
-        ttk.Button(self.actions, text='加入尽调问题…', command=lambda: self.app.workbench.choose_issue([group['key']])).grid(row=0, column=3, columnspan=2, sticky='e')
+        self.close_button.grid(row=1, column=5, sticky='e', padx=(6, 0), pady=3)
         collapsed = '查看 / 编辑关注备注' if existing_mark else '关注这张凭证'
-        self.note_toggle = ttk.Button(self.actions, text=collapsed, command=self._toggle_notes, style='Accent.TButton')
+        self.note_toggle = ttk.Button(self.actions, text=collapsed, command=self._toggle_notes)
         self.note_toggle.grid(row=1, column=0, columnspan=2, sticky='w', pady=3)
+        if self.historical:
+            for widget in (self.ignore_check, self.issue_button, self.note_toggle):
+                widget.configure(state='disabled')
         self.note_area = ttk.Frame(self.detail_panes, padding=(2, 8, 2, 0))
         self.attention = tk.BooleanVar(value=bool(existing_mark))
-        ttk.Checkbutton(self.note_area, text='关注这张凭证', variable=self.attention).pack(anchor='w')
+        self.attention_check = ttk.Checkbutton(self.note_area, text='关注这张凭证', variable=self.attention)
+        self.attention_check.pack(anchor='w')
+        if self.historical:
+            self.attention_check.configure(state='disabled')
         self.note = ScrolledText(self.note_area, height=6, wrap='word', undo=True)
         self.note.pack(fill='both', expand=True)
         if existing_mark:
             self.note.insert('1.0', existing_mark['note'])
+        elif self.historical:
+            self.note.insert('1.0', '原凭证已变化或不存在；历史快照仅供查看，不能修改当前凭证的关注或备注。')
+            self.note.configure(state='disabled')
         self._saved_note = (self.attention.get(), self.note.get('1.0', 'end-1c'))
-        self.feedback = tk.StringVar()
-        self.note_key = voucher_key(lines[0]) if lines else group['key']
-        self.note_draft = self.app.note_hub.bind(self, self.note, self.note_key, self.feedback, on_saved=self._note_saved)
+        self.feedback = tk.StringVar(value='原凭证已变化或不存在；当前凭证操作已禁用。' if self.historical else '')
+        self.note_key = self.voucher_key
+        self.note_draft = None if self.historical else self.app.note_hub.bind(
+            self, self.note, self.note_key, self.feedback, on_saved=self._note_saved)
         ttk.Label(self.note_area, textvariable=self.feedback, foreground='#555').pack(side='bottom', anchor='w', before=self.note.frame)
-        self.note_save_button = ttk.Button(self.actions, text='保存关注与备注', command=self._save_attention, style='Accent.TButton')
+        self.note_save_button = ttk.Button(self.actions, text='保存关注与备注', command=self._save_attention)
         self.note_save_button.grid(row=1, column=3, sticky='e', pady=3)
         self.note_reload_button = ttk.Button(self.actions, text='重读备注…', command=lambda: self.app.note_hub.reload(self.note))
         self.note_reload_button.grid(row=1, column=2, sticky='w', padx=8)
+        if self.historical:
+            self.note_save_button.configure(state='disabled')
+            self.note_reload_button.configure(state='disabled')
         self.note_save_button.grid_remove()
         self.note_reload_button.grid_remove()
         self.json_area = ttk.Frame(self.preview_tabs)
@@ -687,6 +803,9 @@ class ReviewDetail(tk.Toplevel):
         self.deiconify()
 
     def request_close(self):
+        if self.historical:
+            self.destroy()
+            return True
         if not self.note_draft.flush():
             self.note.focus_set()
             return False
@@ -696,6 +815,8 @@ class ReviewDetail(tk.Toplevel):
         return True
 
     def _note_saved(self):
+        if self.historical:
+            return
         from .issue_store import note_record
         current = note_record(self.store, self.note_key)
         pending_attention = self.attention.get() != self._saved_note[0]
@@ -703,7 +824,8 @@ class ReviewDetail(tk.Toplevel):
             self.attention.set(bool(current))
         self._saved_note = (bool(current), self.note.get('1.0', 'end-1c'))
         for item in self.voucher_view.get_children():
-            self.voucher_view.item(item, tags=('marked',) if current else ())
+            tags = tuple(tag for tag in self.voucher_view.item(item, 'tags') if tag != 'marked')
+            self.voucher_view.item(item, tags=(('marked',) + tags) if current else tags)
         self.app.update_mark_indicators(self.note_key)
 
     def _toggle_json(self):
@@ -755,6 +877,8 @@ class ReviewDetail(tk.Toplevel):
         return '（本凭证未送 AI，或尚无返回结果）'
 
     def _toggle_notes(self):
+        if self.historical:
+            return
         if str(self.note_area) in self.detail_panes.panes():
             if not self.note_draft.flush():
                 self.note.focus_set()
@@ -782,6 +906,9 @@ class ReviewDetail(tk.Toplevel):
         self.detail_panes.sashpos(0, min(preferred, max(60, int(available * 0.42))))
 
     def _save_attention(self):
+        if self.historical:
+            self.feedback.set('原凭证已变化或不存在；请从当前明细重新打开凭证后再关注或复核。')
+            return False
         from .issue_store import write_note
         mark_for_entry, remove_mark, _save_mark, _list_marks = self._mark_tools
         requested = self.attention.get()
@@ -803,5 +930,8 @@ class ReviewDetail(tk.Toplevel):
         return True
 
     def _save_ignore(self):
+        if self.historical:
+            self.feedback.set('原凭证已变化或不存在；历史结果仅供查看，不能修改复核状态。')
+            return
         save_feedback(self.store, self.group['key'], 'ignore' if self.ignore_var.get() else '')
         self.panel.refresh_rows()

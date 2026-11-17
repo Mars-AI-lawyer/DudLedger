@@ -7,6 +7,7 @@ from . import issue_store as data
 from . import theme
 from .importer import format_money
 from .voucher_notes import voucher_key
+from .workbench_support import link_feedback, ordered_issue_choices, use_overlay_drawer
 
 
 class Draft:
@@ -172,7 +173,7 @@ class RightWorkbench(ttk.Frame):
         self.app = app
         self.visible = False
         self.mode = 'issues'
-        self.width = 400
+        self.width = 360
         self.calculator_width = 300
         self.active_tools = self.last_tools = None
         self.current = self.draft = None
@@ -180,8 +181,10 @@ class RightWorkbench(ttk.Frame):
         self.persisted_store = None
         self.loading_selection = False
         self.detached = False
-        self._detach_blocked = False
+        self.overlay = False
         self.window = None
+        self.recent_issue_ids = []
+        self._drag_highlight = None
         self.issue_body = None
         self.issue_id = None
         self.limit = 100
@@ -278,6 +281,12 @@ class RightWorkbench(ttk.Frame):
         menu.add_command(label='重读已保存问题…', command=lambda: self.reload_issue(self.issue_id) if self.issue_id else None)
         menu.add_command(label='删除当前问题…', command=lambda: self.remove_issue(self.issue_id) if self.issue_id else None)
         more.configure(menu=menu)
+        self.issue_switch_var = tk.StringVar()
+        self.issue_switch = ttk.Combobox(controls, textvariable=self.issue_switch_var,
+                                         state='readonly', width=16)
+        self.issue_switch.pack(side='left', fill='x', expand=True, padx=6)
+        self.issue_switch.bind('<<ComboboxSelected>>', self._switch_issue)
+        self.issue_switch_values = ()
         self.issue_title = tk.StringVar(value='请选择问题')
         self.caption = ttk.Label(self.details_body, textvariable=self.issue_title, wraplength=380, padding=(0, 5))
         self.caption.pack(fill='x')
@@ -296,6 +305,8 @@ class RightWorkbench(ttk.Frame):
         self.voucher_tools = TableTools(self.voucher_view, set(), show_stats=False)
         self.voucher_selection = VoucherSelection(self.voucher_view, lambda row: self.rows[row][1])
         selection_bar(vouchers, self.voucher_selection)
+        self.locate_button = ttk.Button(vouchers, text='定位到当前明细', command=self.locate_selected)
+        self.locate_button.pack(side='bottom', anchor='e', pady=2, before=self.voucher_view.master)
         CellTooltip(self.voucher_view)
         self.voucher_view.bind('<Double-1>', self._double)
         self.voucher_tools.menu.add_separator()
@@ -368,6 +379,21 @@ class RightWorkbench(ttk.Frame):
         if self.selected_issue_id is not None:
             self.edit_issue(self.selected_issue_id)
         return 'break'
+
+    def _switch_issue(self, _event=None):
+        index = self.issue_switch.current()
+        if not 0 <= index < len(self.issue_switch_values):
+            return
+        issue_id = self.issue_switch_values[index]
+        if issue_id != self.issue_id and not self.edit_issue(issue_id, tab=self.detail_tab):
+            self._refresh_issue_switch()
+
+    def _refresh_issue_switch(self):
+        items = [self.issue_rows[issue_id] for issue_id in sorted(self.issue_rows)]
+        self.issue_switch_values = tuple(item['id'] for item in items)
+        self.issue_switch.configure(values=[item['title'] for item in items])
+        current = self.issue_rows.get(self.issue_id)
+        self.issue_switch_var.set(current['title'] if current else '')
 
     def _detail_tab_changed(self, _event=None):
         selected = self.detail_tabs.select()
@@ -576,41 +602,45 @@ class RightWorkbench(ttk.Frame):
         return self.show(reset_directory=False) if self.detached else self._rehost(True)
 
     def dock(self):
-        if self.app.content.winfo_width() < self.width + self._main_minimum() + 8:
-            self.feedback.set('主窗口空间不足，请加宽主窗口后停靠。')
-            return False
+        # Docking is always allowed: insufficient space becomes an overlay drawer.
         return self._rehost(False)
 
     def layout(self):
         if hasattr(self.app, 'table_fit'):
             self.app.table_fit.schedule()
         if not self.visible:
+            self.overlay = False
             self.grid_remove()
+            self.place_forget()
             self.grip.grid_remove()
+            self.grip.place_forget()
             self._nav_state()
             return
         available = self.app.content.winfo_width()
         minimum = self._main_minimum()
-        if self.mode == 'issues' and not self.detached and not self._detach_blocked and 1 < available < 320 + minimum + 8:
+        desired = self.width if self.mode == 'issues' else self.calculator_width
+        self.overlay = use_overlay_drawer(available, minimum, self.mode, self.detached)
+        if self.overlay:
+            width = min(desired, max(280, available - 24))
             self.grid_remove()
             self.grip.grid_remove()
-            if not getattr(self, '_detach_job', None):
-                def detach():
-                    self._detach_job = None
-                    if self.visible and not self.detached and self.mode == 'issues':
-                        if not self.detach():
-                            self._detach_blocked = True
-                            self.layout()
-                self._detach_job = self.after_idle(detach)
-            return
-        if available >= self.width + minimum + 8:
-            self._detach_blocked = False
-        desired = self.width if self.mode == 'issues' else self.calculator_width
-        width = min(desired, max(320 if self.mode == 'issues' else 260, available - minimum - 8))
-        self.configure(width=width)
-        self.grid_propagate(False)
-        self.grip.grid(row=0, column=1, sticky='ns')
-        self.grid(row=0, column=2, sticky='nsew')
+            self.configure(width=width)
+            self.grid_propagate(False)
+            self.place(relx=1, anchor='ne', x=0, y=0, width=width, relheight=1)
+            self.grip.place(relx=1, anchor='ne', x=-width, y=0, width=8, relheight=1)
+            self.lift()
+            self.grip.lift()
+            self.heading.set('问题工作台（覆盖显示）')
+        else:
+            self.place_forget()
+            self.grip.place_forget()
+            width = min(desired, max(320 if self.mode == 'issues' else 260, available - minimum - 8))
+            self.configure(width=width)
+            self.grid_propagate(False)
+            self.grip.grid(row=0, column=1, sticky='ns')
+            self.grid(row=0, column=2, sticky='nsew')
+            if self.mode == 'issues':
+                self.heading.set('问题工作台')
         if self.mode == 'calculator' and self.active_tools:
             self.active_tools.set_compact_width(width - 8)
             self.calc_source_label.configure(wraplength=width - 16)
@@ -627,15 +657,19 @@ class RightWorkbench(ttk.Frame):
 
     def _nav_state(self):
         if hasattr(self.app, 'workbench_button'):
-            issues_open = (self.detached and self.window.state() != 'withdrawn') or (not self.detached and self.visible and self.mode == 'issues')
-            self.app.workbench_button.state(['selected' if issues_open else '!selected'])
-            self.app.workbench_button.configure(text='问题工作台（独立显示）' if self.detached and self.issues_visible else '问题工作台')
+            if hasattr(self.app, 'update_workbench_presentation'):
+                self.app.update_workbench_presentation()
+            else:
+                issues_open = (self.detached and self.window.state() != 'withdrawn') or (not self.detached and self.visible and self.mode == 'issues')
+                self.app.workbench_button.state(['selected' if issues_open else '!selected'])
         if hasattr(self.app, 'calculator_button'):
             self.app.calculator_button.state(['selected' if self.visible and self.mode == 'calculator' else '!selected'])
 
     def _resize(self, event):
         minimum = 320 if self.mode == 'issues' else 260
-        maximum = max(minimum, self.app.content.winfo_width() - self._main_minimum() - 8)
+        available = self.app.content.winfo_width()
+        maximum = (max(minimum, available - 24) if self.overlay
+                   else max(minimum, available - self._main_minimum() - 8))
         start = getattr(self, '_resize_start', None)
         desired = start[1] + start[0] - event.x_root if start else self.app.content.winfo_rootx() + self.app.content.winfo_width() - event.x_root
         width = max(minimum, min(maximum, desired))
@@ -656,7 +690,7 @@ class RightWorkbench(ttk.Frame):
         self.directory_y = 0
         self.directory_query = ''
         self.limit = 100
-        self._detach_blocked = False
+        self.recent_issue_ids.clear()
         self.pinned.clear()
         self.host_layouts.clear()
         self.search.set('')
@@ -715,6 +749,7 @@ class RightWorkbench(ttk.Frame):
         finally:
             self.loading_selection = False
         self._update_issue_caption()
+        self._refresh_issue_switch()
 
     def _select(self, _event=None):
         if self.loading_selection:
@@ -857,40 +892,92 @@ class RightWorkbench(ttk.Frame):
         dialog = tk.Toplevel(parent)
         dialog.title('加入尽调问题')
         dialog.transient(parent)
-        dialog.geometry('420x320')
-        ttk.Label(dialog, text=f'将 {len(keys)} 张凭证加入问题；已有的关联会跳过。', padding=10).pack(fill='x')
+        dialog.geometry('460x400')
+        ttk.Label(dialog, text=f'将 {len(keys)} 张凭证加入所选问题；已有的关联会跳过。', padding=(10, 8, 10, 0)).pack(fill='x')
+        ttk.Label(dialog, text='将同步加入关注；已有备注不会覆盖。', style='Hint.TLabel', padding=(10, 3, 10, 5)).pack(fill='x')
+        query = tk.StringVar()
+        ttk.Label(dialog, text='搜索问题名称或状态', style='Hint.TLabel', padding=(10, 0, 10, 2)).pack(fill='x')
+        search = ttk.Entry(dialog, textvariable=query)
+        search.pack(fill='x', padx=10, pady=(0, 5))
         choices = tk.Listbox(dialog, exportselection=False)
         choices.pack(fill='both', expand=True, padx=10)
-        for item in items:
-            choices.insert('end', f'{item["title"]}（{item["count"]} 张）')
-        def add():
-            if choices.curselection() and self.add_to_issue(items[choices.curselection()[0]]['id'], keys):
+        target_id = self.selected_issue_id if self.view_mode == 'directory' else self.issue_id
+        displayed = []
+
+        def refresh_choices(*_):
+            selected = displayed[choices.curselection()[0]]['id'] if choices.curselection() else target_id
+            displayed[:] = ordered_issue_choices(items, query.get(), target_id, self.recent_issue_ids)
+            choices.delete(0, 'end')
+            selected_index = None
+            recent = set(self.recent_issue_ids)
+            for index, item in enumerate(displayed):
+                badge = '当前 · ' if item['id'] == target_id else '最近 · ' if item['id'] in recent else ''
+                choices.insert('end', f'{badge}{item["title"]}（{item["count"]} 张）')
+                if item['id'] == selected:
+                    selected_index = index
+            if displayed:
+                selected_index = 0 if selected_index is None else selected_index
+                choices.selection_set(selected_index)
+                choices.activate(selected_index)
+            add_button.configure(state='normal' if displayed else 'disabled')
+
+        def add(_event=None):
+            if choices.curselection() and self.add_to_issue(displayed[choices.curselection()[0]]['id'], keys):
                 dialog.destroy()
+            return 'break'
+
         def create():
             title = simpledialog.askstring('新建问题并加入', '问题名称', parent=dialog)
             if title is not None:
                 try:
+                    marked_before = sum(data.note_record(self.app.store, key) is not None for key in keys)
                     issue_id = data.create_issue_with_vouchers(self.app.store, title, keys)
-                    self._after_add(issue_id, keys, {'added': len(keys), 'duplicates': 0})
+                    attention = sum(data.note_record(self.app.store, key) is not None for key in keys) - marked_before
+                    self._after_add(issue_id, keys, {'added': len(keys), 'duplicates': 0, 'attention': attention})
                     dialog.destroy()
+                    self._offer_created_issue(issue_id)
                 except Exception as exc:
                     messagebox.showerror('无法加入', str(exc), parent=dialog)
-        ttk.Button(dialog, text='加入所选问题', command=add).pack(pady=6)
-        ttk.Button(dialog, text='新建问题并加入…', command=create).pack(pady=(0, 8))
-        choices.bind('<Double-1>', lambda _e: add())
-        target_id = self.selected_issue_id if self.view_mode == 'directory' else self.issue_id
-        if target_id:
-            for index, item in enumerate(items):
-                if item['id'] == target_id:
-                    choices.selection_set(index)
+
+        footer = ttk.Frame(dialog, padding=(10, 6, 10, 10))
+        footer.pack(fill='x')
+        add_button = ttk.Button(footer, text='加入所选问题', style='Accent.TButton', command=add)
+        add_button.pack(side='left')
+        ttk.Button(footer, text='新建问题并加入…', command=create).pack(side='left', padx=6)
+        ttk.Button(footer, text='取消', command=dialog.destroy).pack(side='right')
+        choices.bind('<Double-1>', add)
+        dialog.bind('<Return>', add)
+        query.trace_add('write', refresh_choices)
+        refresh_choices()
+        search.focus_set()
         dialog.grab_set()
+
+    def _offer_created_issue(self, issue_id):
+        item = data.get_issue(self.app.store, issue_id)
+        parent = self.window if self.detached and self.issues_visible else self.app
+        dialog = tk.Toplevel(parent)
+        dialog.title('问题已创建')
+        dialog.transient(parent)
+        ttk.Label(dialog, text=f'已创建“{item["title"]}”。可查看问题，或留在当前位置继续核查。',
+                  padding=12, wraplength=360).pack(fill='x')
+        actions = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        actions.pack(fill='x')
+        def view_issue():
+            dialog.destroy()
+            self.edit_issue(issue_id)
+        ttk.Button(actions, text='查看问题', style='Accent.TButton', command=view_issue).pack(side='left')
+        ttk.Button(actions, text='继续核查', command=dialog.destroy).pack(side='left', padx=6)
+        dialog.bind('<Escape>', lambda _event: dialog.destroy())
+        dialog.bind('<Return>', lambda _event: dialog.destroy())
 
     def add_to_issue(self, issue_id, keys):
         keys = (keys,) if isinstance(keys, str) else tuple(dict.fromkeys(keys))
         if not keys or not self.flush():
             return False
         try:
+            marked_before = sum(data.note_record(self.app.store, key) is not None for key in keys)
             result = data.link_vouchers(self.app.store, issue_id, keys)
+            result['attention'] = sum(data.note_record(self.app.store, key) is not None for key in keys) - marked_before
             self._after_add(issue_id, keys, result)
             return True
         except Exception as exc:
@@ -900,6 +987,7 @@ class RightWorkbench(ttk.Frame):
     def _after_add(self, issue_id, keys, result):
         if not self.issues_visible:
             self.show()
+        self.recent_issue_ids = [issue_id] + [item for item in self.recent_issue_ids if item != issue_id]
         self.pinned[issue_id] = tuple(keys)
         self.refresh_directory()
         if self.view_mode == 'detail' and self.issue_id == issue_id:
@@ -907,7 +995,8 @@ class RightWorkbench(ttk.Frame):
         for key in keys:
             self.app.note_hub.broadcast(key)
             self.app.update_mark_indicators(key)
-        self.feedback.set(f'新增 {result["added"]} 张，已存在 {result["duplicates"]} 张')
+        item = data.get_issue(self.app.store, issue_id)
+        self.feedback.set(link_feedback(item['title'], result))
         self.app.status.set(self.feedback.get())
 
     def remove_selected_links(self):
@@ -939,6 +1028,14 @@ class RightWorkbench(ttk.Frame):
             except Exception as exc:
                 self.feedback.set(str(exc))
 
+    def locate_selected(self):
+        keys = self.voucher_selection.action_keys()
+        if len(keys) != 1:
+            self.feedback.set('请选择一张凭证定位到当前明细。')
+            return False
+        self.app.locate_issue_voucher(keys[0])
+        return True
+
     def open_key(self, key):
         if not self.flush():
             return
@@ -965,7 +1062,13 @@ class RightWorkbench(ttk.Frame):
         window = tk.Toplevel(self.app)
         window.title('归集时快照 · ' + item['label'])
         window.geometry('940x520')
-        ttk.Label(window, text=item['status'], padding=10).pack(fill='x')
+        header = ttk.Frame(window, padding=10)
+        header.pack(fill='x')
+        ttk.Label(header, text=item['status']).pack(side='left', fill='x', expand=True)
+        window.locate_button = ttk.Button(header, text='定位到当前明细',
+                                          command=lambda: self.app.locate_issue_voucher(item['key']),
+                                          state='normal' if item.get('entry_id') is not None else 'disabled')
+        window.locate_button.pack(side='right')
         view = self._table(window, [('date', '日期', 100), ('name', '科目', 150), ('summary', '摘要', 250), ('debit', '借方', 120), ('credit', '贷方', 120), ('source', '来源', 300)])
         window.cell_tools = TableTools(view, {'debit', 'credit'})
         for row in item['lines']:
@@ -979,6 +1082,49 @@ class RightWorkbench(ttk.Frame):
         if node in self.rows:
             self.open_key(self.rows[node][1])
         return 'break'
+
+    def _resolve_drag_target(self, x_root, y_root, keys):
+        if not self.app.store or not self.issues_visible:
+            return None
+        if self._drag_highlight is None:
+            self._drag_highlight = {'selection': tuple(self.tree.selection()),
+                                    'caption_style': self.caption.cget('style')}
+        widget = self.winfo_containing(x_root, y_root)
+        while widget is not None and widget not in (self.tree, self.caption):
+            widget = getattr(widget, 'master', None)
+        issue_id = None
+        node = None
+        if widget is self.tree and self.view_mode == 'directory':
+            node = self.tree.identify_row(y_root - self.tree.winfo_rooty())
+            if node.startswith('i:'):
+                issue_id = int(node[2:])
+        elif widget is self.caption and self.view_mode == 'detail':
+            issue_id = self.issue_id
+        if issue_id not in self.issue_rows:
+            selection = self._drag_highlight['selection']
+            self.tree.selection_set(selection)
+            self.caption.configure(style=self._drag_highlight['caption_style'])
+            return None
+        if node:
+            self.tree.selection_set(node)
+            self.tree.see(node)
+        else:
+            self.caption.configure(style='Title.TLabel')
+        linked = {row[0] for row in self.app.store.db.execute(
+            'SELECT voucher_key FROM dd_issue_vouchers WHERE issue_id=?', (issue_id,))}
+        duplicates = sum(key in linked for key in keys)
+        return {'issue_id': issue_id, 'title': self.issue_rows[issue_id]['title'],
+                'added': len(keys) - duplicates, 'duplicates': duplicates}
+
+    def _clear_drag_highlight(self, restore=True):
+        state = self._drag_highlight
+        if state is None:
+            return
+        if restore:
+            selection = tuple(node for node in state['selection'] if self.tree.exists(node))
+            self.tree.selection_set(selection)
+        self.caption.configure(style=state['caption_style'])
+        self._drag_highlight = None
 
     def _issue_menu(self, event):
         node = self.tree.identify_row(event.y)
@@ -1000,12 +1146,14 @@ class VoucherActions:
     def __init__(self, app):
         self.app = app
         self.sources = {}
+        self.drag_bindings = {}
 
     def attach(self, view, key_for_row):
         self.sources[view] = key_for_row
         def clean(event):
             if event.widget is view:
                 self.sources.pop(view, None)
+                self.drag_bindings.pop(view, None)
         view.bind('<Destroy>', clean, add='+')
         if hasattr(view, 'cell_tools'):
             menu = view.cell_tools.menu
@@ -1018,6 +1166,14 @@ class VoucherActions:
                 count = len(self.keys_from_view(view))
                 menu.entryconfigure(index, label=f'加入问题…（{count} 张）', state='normal' if count else 'disabled')
             menu.configure(postcommand=labels)
+        if hasattr(view, 'voucher_selection'):
+            from .voucher_drag import VoucherDragBinding
+            workbench = self.app.workbench
+            self.drag_bindings[view] = VoucherDragBinding(
+                view, key_for_row, lambda: self.keys_from_view(view),
+                workbench._resolve_drag_target,
+                lambda target, keys: workbench.add_to_issue(target['issue_id'], keys),
+                workbench._clear_drag_highlight)
 
     def keys_from_view(self, view):
         selection = getattr(view, 'voucher_selection', None)

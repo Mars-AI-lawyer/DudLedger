@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import math
 import tkinter as tk
-from tkinter import font as tkfont
 
 from . import theme
 from .widgets import RoundedButton, _rounded_points
@@ -88,10 +87,11 @@ class UsageTour:
         self.card_canvas = self.card
         self.body = tk.Frame(self.card_canvas, background=theme.SURFACE)
         self.card_canvas.create_window(18, 16, anchor='nw', window=self.body, width=264)
-        family = tkfont.nametofont('TkDefaultFont').cget('family')
-        self.title_font = tkfont.Font(root=owner, family=family, size=12, weight='bold')
-        self.text_font = tkfont.Font(root=owner, family=family, size=11)
-        self.small_font = tkfont.Font(root=owner, family=family, size=10)
+        # Share the application's live derived fonts so font-size changes also
+        # remeasure an open tour instead of leaving fixed 12/11/10px copies.
+        self.title_font = self.controller.font_title
+        self.text_font = self.controller.font_body
+        self.small_font = self.controller.font_small
         self.title = tk.StringVar()
         self.description = tk.StringVar()
         self.progress = tk.StringVar()

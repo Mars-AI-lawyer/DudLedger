@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ledger_viewer.ui import Application
+from ledger_viewer.table_layout import readable_minimum
 
 
 class WorkspaceUITest(unittest.TestCase):
@@ -65,14 +66,16 @@ class WorkspaceUITest(unittest.TestCase):
         button.event_generate("<Leave>")
         self.root.update()
         self.assertIsNone(self.app.navigation_tooltip.window)
-        self.app.sidebar_toggle.invoke()
-        self.root.update()
         self.assertTrue(self.app.sidebar_brand.winfo_ismapped())
         self.assertEqual(str(button.cget("compound")), "left")
         self.app.sidebar_toggle.invoke()
         self.root.update()
         self.assertFalse(self.app.sidebar_brand.winfo_ismapped())
         self.assertEqual(str(button.cget("compound")), "image")
+        self.app.sidebar_toggle.invoke()
+        self.root.update()
+        self.assertTrue(self.app.sidebar_brand.winfo_ismapped())
+        self.assertEqual(str(button.cget("compound")), "left")
 
     def test_calculator_keeps_navigation_and_tool_buttons_available(self):
         self.app._use_book(Path(self.temp.name) / '演示账套.sqlite')
@@ -89,7 +92,13 @@ class WorkspaceUITest(unittest.TestCase):
         self.assertTrue(self.app.sidebar.winfo_ismapped())
         self.assertTrue(self.app.workbench_button.winfo_ismapped())
         self.assertGreaterEqual(view.winfo_width(), 520)
-        self.assertEqual(view.xview(), (0.0, 1.0))
+        widths = [view.column(key, 'width') for key in self.app.table_fit.columns(view)]
+        if sum(widths) <= view.winfo_width() - 2:
+            self.assertEqual(view.xview(), (0.0, 1.0))
+        else:
+            self.assertLess(view.xview()[1], 1.0)
+        for key in self.app.table_fit.columns(view):
+            self.assertGreaterEqual(view.column(key, 'width'), readable_minimum(key, view.column(key, 'minwidth')))
         self.app.select_page('accounts')
         self.root.update()
         self.assertIs(self.app.workbench.active_tools, self.app.balance_tools)

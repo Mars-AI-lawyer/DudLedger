@@ -1,7 +1,10 @@
 """Small line icons and hover labels for the workspace navigation."""
 
+import math
 import tkinter as tk
 from tkinter import ttk
+
+from . import theme
 
 
 # Paths are drawn on a common 20 × 20 grid.
@@ -41,25 +44,39 @@ ICONS = {
     "dot": (((10, 7), (13, 10), (10, 13), (7, 10), (10, 7)),),
 }
 
-INK_SOFT = "#53524C"
+INK_SOFT = theme.INK_SOFT  # backwards-compatible alias
+ICON_SIZE = 20
+ICON_HIT_AREA = 28
+TOOLTIP_DELAY_MS = 275
 
 
-def navigation_icon(master, name, color=INK_SOFT, *, scale=1):
-    """Draw a line icon on the 20×20 grid.
+def icon_button_padding(icon_size=ICON_SIZE, minimum=ICON_HIT_AREA):
+    """Symmetric padding that guarantees a square minimum pointer target."""
+    if icon_size <= 0 or minimum <= 0:
+        raise ValueError("图标与命中区尺寸必须为正数")
+    padding = max(0, math.ceil((minimum - icon_size) / 2))
+    return padding, padding
 
-    Rendered at 2× resolution and subsampled so it stays crisp on Retina
-    displays; the returned image is logically 20×20 (scaled by `scale`).
+
+def navigation_icon(master, name, color=INK_SOFT, *, scale=1, size=None):
+    """Draw a crisp line icon on the shared 20×20 grid.
+
+    `scale` remains compatible with existing callers; new controls should use
+    `size=16` or `size=20` and leave the hit area to `icon_button_padding`.
     """
-    size = 20 * scale
-    image = tk.PhotoImage(master=master, width=size * 2, height=size * 2)
+    logical_size = int(20 * scale if size is None else size)
+    if logical_size <= 0:
+        raise ValueError("图标尺寸必须为正数")
+    ratio = logical_size / 20 * 2
+    image = tk.PhotoImage(master=master, width=logical_size * 2, height=logical_size * 2)
     for path in ICONS[name]:
         for (x1, y1), (x2, y2) in zip(path, path[1:]):
-            x1, y1, x2, y2 = x1 * scale * 2, y1 * scale * 2, x2 * scale * 2, y2 * scale * 2
-            steps = max(abs(x2 - x1), abs(y2 - y1))
+            x1, y1, x2, y2 = x1 * ratio, y1 * ratio, x2 * ratio, y2 * ratio
+            steps = max(1, math.ceil(max(abs(x2 - x1), abs(y2 - y1))))
             for step in range(steps + 1):
                 x = round(x1 + (x2 - x1) * step / steps)
                 y = round(y1 + (y2 - y1) * step / steps)
-                # 2×2 block keeps line weight proportional after subsampling
+                # 2×2 block keeps line weight proportional after subsampling.
                 image.put(color, to=(x, y, x + 2, y + 2))
     return image.subsample(2, 2)
 
@@ -71,18 +88,19 @@ class NavigationTooltip:
         self.window = None
 
     def attach(self, widget, text):
-        widget.bind("<Enter>", lambda _event: self._schedule(widget, text), add="+")
-        for event in ("<Leave>", "<ButtonPress-1>", "<Unmap>", "<Destroy>"):
+        for event in ("<Enter>", "<FocusIn>"):
+            widget.bind(event, lambda _event: self._schedule(widget, text), add="+")
+        for event in ("<Leave>", "<FocusOut>", "<ButtonPress-1>", "<Unmap>", "<Destroy>"):
             widget.bind(event, lambda _event: self.hide(), add="+")
 
     def _schedule(self, widget, text):
         self.hide()
-        self.pending = self.owner.after(450, self._show, widget, text)
+        self.pending = self.owner.after(TOOLTIP_DELAY_MS, self._show, widget, text)
 
     def _show(self, widget, text):
         self.pending = None
-        label = text()
-        if not label or not widget.winfo_ismapped():
+        label = text() if callable(text) else text
+        if not label or not widget.winfo_exists() or not widget.winfo_ismapped():
             return
         tip = self.window = tk.Toplevel(self.owner)
         tip.withdraw()

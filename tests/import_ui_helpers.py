@@ -50,8 +50,10 @@ class ImportUiCase(unittest.TestCase):
             mapping = {'account_code': 0, 'account_name': 1, 'debit': 2, 'credit': 3}
         return MappingSuggestion(kind, row['row'], mapping, {}, (), 'fake-model')
 
-    def dialog(self, paths=None):
+    def dialog(self, paths=None, *, ai=True):
         self.batch = BatchImportDialog(self.window, paths or [self.source])
+        if not ai and self.batch.winfo_exists():
+            self.batch._use_local_mode()
         return self.batch
 
     def wait_for(self, predicate, timeout=5):

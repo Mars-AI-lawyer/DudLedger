@@ -95,13 +95,13 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.assertEqual(issues.issue_vouchers(self.app.store, self.issue), [])
         self.assertIsNone(self.app.grab_current())
 
-    def test_no_drag_handles_or_mouse_capture_remain(self):
+    def test_drag_uses_explicit_handles_without_capturing_cell_selection(self):
         self.assertFalse(hasattr(self.app, 'drag'))
         for view in (self.app.detail_view, self.app.mark_view, self.panel.voucher_view):
-            self.assertNotIn('⋮⋮', view.heading('#0', 'text'))
-            self.assertFalse(any(str(tag).startswith('VoucherDrag:') for tag in view.bindtags()))
+            self.assertIn('⋮⋮', view.heading('#0', 'text'))
+            self.assertTrue(any(str(tag).startswith('VoucherDrag:') for tag in view.bindtags()))
         view = self.app.detail_view
-        box = view.bbox(str(self.entry['id']), '#0')
+        box = view.bbox(str(self.entry['id']), 'summary')
         view.event_generate('<ButtonPress-1>', x=box[0] + 20, y=box[1] + 10)
         view.event_generate('<B1-Motion>', x=400, y=300)
         view.event_generate('<ButtonRelease-1>', x=400, y=300)
@@ -376,16 +376,17 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.assertFalse(self.panel.detached)
         self.assertEqual(self.panel.issue_id, self.issue)
 
-    def test_small_window_detaches_instead_of_covering_ledger(self):
+    def test_small_window_uses_overlay_without_detaching(self):
         self.app.geometry('820x520')
         self.root.set_font_size(18, persist=False)
         self.root.update()
-        self.assertTrue(self.panel.detached)
+        self.assertFalse(self.panel.detached)
+        self.assertTrue(self.panel.overlay)
         self.assertTrue(self.panel.issues_visible)
         self.assertGreaterEqual(self.app.detail_view.winfo_width(), 520)
         self.assertTrue(self.app.workbench_button.winfo_ismapped())
 
-    def test_failed_automatic_detach_keeps_unsaved_editor_accessible(self):
+    def test_overlay_keeps_unsaved_editor_accessible(self):
         self.panel.notes.insert('end', '不可丢弃的笔记')
         with patch('ledger_viewer.issue_store.save_issue', side_effect=OSError('保存失败')):
             self.app.geometry('820x520')

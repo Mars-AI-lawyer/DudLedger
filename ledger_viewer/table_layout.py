@@ -1,6 +1,28 @@
 """Temporarily fit workspace columns while a side tool is open."""
 
 
+# These are reading widths, not global Treeview minima: original widths are
+# restored when the tool closes.  Other columns may shrink to their own minima
+# first, and the horizontal scrollbar handles any remaining overflow.
+READABLE_MINIMA = {
+    'summary': 220,
+    'counterparty': 160,
+}
+AMOUNT_COLUMNS = {
+    'amount', 'debit', 'credit', 'original',
+    'od', 'oc', 'pd', 'pc', 'yd', 'yc', 'cd', 'cc',
+    'left_amount_1', 'left_amount_2', 'left_amount_3',
+    'right_amount_1', 'right_amount_2', 'right_amount_3',
+    'left_a', 'left_b', 'left_c', 'right_a', 'right_b', 'right_c', 'a', 'b',
+}
+
+
+def readable_minimum(key, minimum):
+    """Protect narrative, counterparty and money columns differently."""
+    protected = 112 if key in AMOUNT_COLUMNS else READABLE_MINIMA.get(key, 0)
+    return max(minimum, protected)
+
+
 class WorkspaceTableFit:
     def __init__(self, app, views):
         self.app = app
@@ -35,7 +57,8 @@ class WorkspaceTableFit:
 
     def fit(self):
         self.job = None
-        if not self.app.workbench.visible:
+        if not self.app.workbench.visible or getattr(self.app.workbench, 'overlay', False):
+            # Overlay drawers cover auxiliary space; they never compress the ledger.
             for view, widths in self.saved.items():
                 for key, width in widths.items():
                     view.column(key, width=width)
@@ -56,7 +79,7 @@ class WorkspaceTableFit:
                 current = view.column(key, 'width')
                 if key not in saved or (key in previous and current != previous[key]):
                     saved[key] = current
-            minima = {key: view.column(key, 'minwidth') for key in keys}
+            minima = {key: readable_minimum(key, view.column(key, 'minwidth')) for key in keys}
             space = max(0, view.winfo_width() - 2 - sum(minima.values()))
             flexible = {key: max(0, saved[key] - minima[key]) for key in keys}
             total = sum(flexible.values())

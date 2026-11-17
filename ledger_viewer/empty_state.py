@@ -19,7 +19,7 @@ class EmptyState(ttk.Frame):
         super().__init__(parent)
         body = ttk.Frame(self)
         body.place(relx=0.5, rely=0.42, anchor="center")
-        self._image = navigation_icon(self, icon, color=theme.MUTED, scale=2)
+        self._image = navigation_icon(self, icon, color=theme.MUTED, size=20)
         tk.Label(body, image=self._image, background=theme.CANVAS).pack(pady=(0, theme.SPACE_3))
         ttk.Label(body, text=title, style="Title.TLabel").pack()
         ttk.Label(body, text=hint, style="Hint.TLabel", wraplength=360, justify="center").pack(pady=(theme.SPACE_2, 0))

@@ -19,6 +19,9 @@ class VoucherSelection:
         view.heading('#0', text='☐', command=self.toggle_all)
         view.bind('<<TreeviewSelect>>', lambda _e: self.changed(), add='+')
         self.info = tk.StringVar(value='')
+        self.display_info = tk.StringVar(value='')
+        self.context = ''
+        self.feedback = ''
 
     def row_keys(self, rows):
         keys = []
@@ -59,12 +62,26 @@ class VoucherSelection:
     def changed(self):
         visible = set(self.row_keys(self.view.get_children()))
         if self.checked:
-            self.info.set(f'已勾选 {len(self.checked)} 张，其中跨页 {len(self.checked - visible)} 张')
+            outside = len(self.checked - visible)
+            suffix = f'（含跨页 {outside} 张）' if outside else ''
+            self.info.set(f'已勾选 {len(self.checked)} 张凭证{suffix} · 后续操作使用勾选范围')
         else:
             keys = self.action_keys()
-            self.info.set(f'选区涉及 {len(keys)} 张凭证' if keys else '勾选凭证或框选单元格')
+            self.info.set(f'当前框选涉及 {len(keys)} 张凭证 · 尚未勾选' if keys else '')
+        base = self.info.get() or self.context
+        if self.feedback:
+            base = (base + ' · ' if base else '') + self.feedback
+        self.display_info.set(base)
         if self.on_change:
             self.on_change()
+
+    def set_context(self, text=''):
+        self.context = text
+        self.changed()
+
+    def show_feedback(self, text):
+        self.feedback = text
+        self.changed()
 
     def toggle_all(self):
         visible = set(self.row_keys(self.view.get_children()))
@@ -101,7 +118,7 @@ class VoucherSelection:
 def selection_bar(parent, selection):
     frame = ttk.Frame(parent, padding=(6, 2))
     frame.pack(side='bottom', fill='x', before=selection.view.master)
-    label = ttk.Label(frame, textvariable=selection.info, style='Hint.TLabel', wraplength=300)
+    label = ttk.Label(frame, textvariable=selection.display_info, style='Hint.TLabel', wraplength=300)
     label.grid(row=0, column=0, sticky='w')
     actions = ttk.Frame(frame)
     actions.grid(row=0, column=1, sticky='e')
@@ -109,8 +126,21 @@ def selection_bar(parent, selection):
     ttk.Button(actions, text='清空勾选', command=selection.clear).pack(side='right')
     ttk.Button(actions, text='本页全选', command=selection.toggle_all).pack(side='right', padx=4)
     def layout(_event=None):
+        # Keep one adaptive status line; narrow windows hide secondary select-all
+        # instead of growing an additional toolbar row.
         compact = frame.winfo_width() < label.winfo_reqwidth() + actions.winfo_reqwidth() + 20
-        actions.grid_configure(row=1 if compact else 0, column=0 if compact else 1)
+        select_all = getattr(frame, 'select_all_button', None)
+        if select_all is not None:
+            if compact:
+                select_all.pack_forget()
+            elif not select_all.winfo_manager():
+                select_all.pack(side='right', padx=4, before=frame.clear_button)
+        reserved = actions.winfo_reqwidth() + sum(
+            child.winfo_reqwidth() for child in frame.winfo_children()
+            if child not in (label, actions) and child.winfo_manager())
+        label.configure(wraplength=max(80, frame.winfo_width() - reserved - 24))
+    frame.select_all_button = next(child for child in actions.winfo_children() if child.cget('text') == '本页全选')
+    frame.clear_button = next(child for child in actions.winfo_children() if child.cget('text') == '清空勾选')
     frame.bind('<Configure>', layout)
     label.bind('<Configure>', layout)
     return frame

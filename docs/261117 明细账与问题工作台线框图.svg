@@ -3,11 +3,11 @@
     <style>
       text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #30302C; }
       .title { font-size: 22px; font-weight: 600; }
-      .subtitle { font-size: 12px; fill: #77766F; }
+      .subtitle { font-size: 12px; fill: #6B6962; }
       .page { font-size: 16px; font-weight: 600; }
       .section { font-size: 12px; font-weight: 600; }
       .body { font-size: 12px; }
-      .small { font-size: 11px; fill: #77766F; }
+      .small { font-size: 11px; fill: #6B6962; }
       .nav { font-size: 12px; fill: #53524C; }
       .money { font-family: Menlo, Consolas, monospace; font-size: 12px; text-anchor: end; }
       .line { stroke: #E3E0D7; stroke-width: 1; }
@@ -18,7 +18,8 @@
   </defs>
   <rect width="1440" height="960" fill="#F5F3EC"/>
   <text x="40" y="44" class="title">明细账＋问题工作台 · 主账表优先</text>
-  <text x="1400" y="42" text-anchor="end" class="subtitle">宽屏停靠；窄窗口改为用户主动打开的覆盖式抽屉</text>
+  <text x="1400" y="42" text-anchor="end" class="subtitle">目标方案 · 非当前实现 · 非最终像素稿</text>
+  <text x="40" y="62" class="small">保留＝当前已有　调整＝优化现有　新增＝目标补充</text>
 
   <rect x="40" y="74" width="1360" height="812" rx="6" fill="#FAF9F5" stroke="#D4D0C6"/>
   <rect x="40" y="74" width="64" height="812" rx="6" fill="#F0EEE6"/>
@@ -108,6 +109,7 @@
   <line x1="984" y1="192" x2="1376" y2="192" class="line"/>
 
   <text x="1008" y="220" class="small">当前问题</text>
+  <text x="1352" y="220" text-anchor="end" class="small accent-text">新增</text>
   <rect x="1008" y="232" width="344" height="38" rx="4" fill="#FFFFFF" stroke="#D4D0C6"/>
   <text x="1020" y="256" class="section">关联方资金往来</text>
   <text x="1336" y="256" text-anchor="end" class="body">⌄</text>
@@ -141,11 +143,14 @@
   <rect x="1008" y="732" width="344" height="48" rx="4" fill="#F5F3EC"/>
   <text x="1020" y="752" class="small">归集凭证会同步加入关注；</text>
   <text x="1020" y="769" class="small">已有备注不会覆盖。</text>
-  <text x="1008" y="828" class="small">已保存 · 问题记录可在上方标签中编辑</text>
+  <text x="1008" y="820" class="small">已加入当前问题 2 张，并同步关注</text>
+  <text x="1008" y="840" class="small">问题记录可在上方标签中编辑</text>
 
   <line x1="104" y1="824" x2="984" y2="824" class="line"/>
   <text x="128" y="852" class="small">共 41 条 · 第 1 / 1 页</text>
   <text x="960" y="852" text-anchor="end" class="small">主表保留可读列宽，必要时横向滚动</text>
 
-  <text x="40" y="924" class="small">空间不足时：保持主表结构，工作台由用户主动以抽屉打开；不再自动弹出独立窗口，也不把长备注编辑器撑满右栏。</text>
+  <text x="40" y="910" class="small">保留：问题目录搜索/Enter、相关凭证默认页、问题记录页签与手动独立窗口。</text>
+  <text x="40" y="928" class="small">新增/调整：当前问题切换、主表关键列保护、窄窗主动抽屉与同步关注反馈（区域 1、4）。</text>
+  <text x="40" y="946" class="small">当前差距：主表按弹性比例压缩；空间不足会自动拆窗；归集副作用说明不足。</text>
 </svg>

@@ -556,6 +556,46 @@ class LedgerStore:
             FROM entries e JOIN accounts a ON a.key=e.account_key JOIN sources s ON s.id=e.source_id
             WHERE e.id=?""", (entry_id,)).fetchone()
 
+    def voucher_navigation(self, entry_id: int, **filters) -> dict[str, int | None] | None:
+        """Navigate de-duplicated vouchers in the active query.
+
+        The first query builds a compact sequence from only the fields needed for
+        voucher identity. Subsequent opens reuse it until data or scope changes.
+        """
+        target = self.entry(entry_id)
+        if target is None:
+            return None
+        from .voucher_notes import voucher_key
+
+        scope = {key: value for key, value in filters.items() if key not in ('sort_by', 'descending')}
+        clause, args = self._entry_filter(**scope)
+        order = self._entry_order(filters.get('sort_by', 'date'), filters.get('descending', False))
+        cache_key = (self.data_token(), clause, tuple(args), order)
+        cache = getattr(self, '_voucher_navigation_cache', None)
+        if cache is None or cache['key'] != cache_key:
+            cursor = self.db.execute("""SELECT e.id,e.entry_date,e.fiscal_year,e.period,
+                e.voucher_type,e.voucher_no,e.row_no,s.original_path,s.sheet
+                FROM entries e JOIN accounts a ON a.key=e.account_key
+                JOIN sources s ON s.id=e.source_id""" + clause +
+                " ORDER BY " + order, args)
+            sequence = []
+            positions = {}
+            for row in cursor:
+                key = voucher_key(row)
+                if key not in positions:
+                    positions[key] = len(sequence)
+                    sequence.append((key, row['id']))
+            cache = {'key': cache_key, 'sequence': tuple(sequence), 'positions': positions}
+            self._voucher_navigation_cache = cache
+        position = cache['positions'].get(voucher_key(target))
+        if position is None:
+            return None
+        sequence = cache['sequence']
+        previous_id = sequence[position - 1][1] if position > 0 else None
+        next_id = sequence[position + 1][1] if position + 1 < len(sequence) else None
+        return {'previous_entry_id': previous_id, 'next_entry_id': next_id,
+                'position': position + 1, 'total': len(sequence)}
+
     def voucher_lines(self, entry_id: int) -> list[sqlite3.Row]:
         target = self.entry(entry_id)
         if not target:

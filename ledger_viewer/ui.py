@@ -39,7 +39,8 @@ from .widgets import RoundedButton, RoundedFrame
 from .window_position import center_window
 from .precheck import SEVERITY_CRITICAL, SEVERITY_WARNING, PrecheckStats, precheck
 from .reconciliation import empty_plan, load_plan, save_plan
-from .related_parties import PARTY_ROLES, parse_party_lines, party_entries_from_file, build_party_index, indexed_party_match
+from .related_parties import PARTY_ROLES, parse_party_records, party_records_from_file, build_party_index, indexed_party_match
+from .review_providers import PROVIDER_LABELS as REVIEW_PROVIDER_LABELS, preferred_provider
 from .store import ENTRY_SORT_COLUMNS, LedgerStore
 from .table_layout import WorkspaceTableFit
 from .theme import configure_theme
@@ -109,7 +110,7 @@ MONEY_COLUMN_KEYS = {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc", "debit", "c
 
 def visible_columns(kind: str, saved: list[str] | None) -> list[str]:
     """Keep known columns in table order; use the default for stale preferences."""
-    available = [key for key, _, _ in VIEW_COLUMNS[kind] if kind != "voucher" or key != "source"]
+    available = [key for key, _, _ in VIEW_COLUMNS[kind]]
     if saved is None:
         return DEFAULT_COLUMNS[kind].copy()
     selected = set(saved)
@@ -154,12 +155,7 @@ def tree(parent: tk.Widget, columns: list[tuple[str, str, int]]) -> ttk.Treeview
     for key, label, width in columns:
         view.heading(key, text=label, anchor="e" if key in MONEY_COLUMN_KEYS else "w")
         view.column(key, width=width, minwidth=65, stretch=False, anchor="e" if key in MONEY_COLUMN_KEYS else "w")
-    view.tag_configure("debit_row", foreground="#355E70")
-    view.tag_configure("credit_row", foreground="#776B58")
-    view.tag_configure("difference", background="#FFF9EF")
-    view.tag_configure("pending", background="#F4F8FA")
-    view.tag_configure("marked", background="#FFF1F1")
-    view.tag_configure("account_parent", foreground="#514F46")
+    theme.configure_table_semantics(view)
     def on_wheel(event: tk.Event) -> str | None:
         owner = parent.winfo_toplevel()
         controller = getattr(owner, "controller", None) or getattr(getattr(owner, "ledger_app", None), "controller", None)
@@ -183,7 +179,7 @@ class ColumnDialog(tk.Toplevel):
         self.transient(parent)
         self.resizable(False, False)
         self.on_change = on_change
-        columns = [item for item in VIEW_COLUMNS[kind] if kind != "voucher" or item[0] != "source"]
+        columns = list(VIEW_COLUMNS[kind])
         self.vars = {key: tk.BooleanVar(value=key in selected) for key, _, _ in columns}
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
@@ -221,7 +217,7 @@ class SettingsDialog(tk.Toplevel):
         self.title("设置")
         self.resizable(False, False)
         self.transient(parent)
-        self.protocol("WM_DELETE_WINDOW", self._finish)
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
         tabs = ttk.Notebook(self)
         self.tabs = tabs
         tabs.pack(fill='both', expand=True)
@@ -239,7 +235,7 @@ class SettingsDialog(tk.Toplevel):
         body.bind('<Configure>', lambda _event: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.bind('<Configure>', lambda event: canvas.itemconfigure(content, width=event.width))
         self.bind('<MouseWheel>', lambda event: canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units'))
-        ttk.Label(body, text="凭证打开方式").pack(anchor="w")
+        ttk.Label(body, text="凭证打开方式 · 即时生效").pack(anchor="w")
         current = parent.store.setting("voucher_open_mode", "replace") if parent.store else "replace"
         self.mode = tk.StringVar(value=current if current in ("replace", "multiple") else "replace")
         for label, value in (("新凭证自动关闭前一张", "replace"), ("连续打开，保留已打开凭证", "multiple")):
@@ -320,14 +316,16 @@ class SettingsDialog(tk.Toplevel):
         self.ai_step_heading = tk.StringVar(value='AI 服务与调用顺序')
         ttk.Label(ai_tab, textvariable=self.ai_step_heading, style='Title.TLabel').pack(anchor='w')
         ttk.Label(ai_tab, text=
-                  "导入账簿：DeepSeek Flash 分析表头和列映射。\n凭证抽查：百炼（确认免费可用）→ Jev → DeepSeek Flash。\n未配置、额度不足或服务不可用时顺延；没有可用密钥则提示配置。",
+                  "导入账簿：默认由 DeepSeek Flash 识别表头和列映射，也可手动设置。\n凭证抽查：默认百炼优先，也可选择 Jev 优先，DeepSeek Flash 兜底。\n未配置、额度不足或服务不可用时顺延；百炼仅在确认免费可用后启用。",
                   wraplength=550, justify='left').pack(anchor='w', pady=6)
         self.provider = tk.StringVar(value=PROVIDER_LABELS["deepseek"])
         preference = ttk.Frame(ai_tab)
         preference.pack(fill='x', pady=(8, 5))
         ttk.Label(preference, text='凭证抽查优先模型').pack(side='left')
-        self.review_preferred = tk.StringVar(value='百炼优先（默认）')
-        ttk.Label(preference, text='百炼免费可用时优先，其次 Jev，最后 DeepSeek').pack(side='left', padx=8)
+        self.review_preferred = tk.StringVar(value=REVIEW_PROVIDER_LABELS[
+            preferred_provider(parent.controller.preferences.get('review_preferred_provider'))])
+        ttk.Combobox(preference, textvariable=self.review_preferred, values=tuple(REVIEW_PROVIDER_LABELS.values()),
+                     state='readonly', width=19).pack(side='left', padx=8)
         provider_tabs = ttk.Notebook(ai_tab)
         provider_tabs.pack(fill='x', pady=5)
         jev_host, bailian_host, deepseek_host = (ttk.Frame(provider_tabs, padding=8) for _ in range(3))
@@ -374,7 +372,6 @@ class SettingsDialog(tk.Toplevel):
         jev_actions.pack(fill="x", pady=6)
         from .jev_ui import launch_connection_test
         ttk.Button(jev_actions, text="测试 Jev（虚构内容）", command=lambda: launch_connection_test(self, self.key_status)).pack(side="left")
-        ttk.Button(jev_actions, text="AI审查设置", command=parent.open_review_rules, state="normal" if parent.store else "disabled").pack(side="left", padx=6)
         ttk.Label(ai_tab, text="AI 建议列使用 DeepSeek Flash。" + PRIVACY_NOTICE
             + "保存密钥后可直接建议列；也可取消 AI 改用手动核对。完整账簿的解析、预检和疑点处理均在本机完成。",
             foreground=theme.MUTED, wraplength=430, justify="left").pack(anchor="w", pady=(7, 0))
@@ -396,12 +393,46 @@ class SettingsDialog(tk.Toplevel):
         footer.pack(fill='x')
         self.finish_button = ttk.Button(footer, text="保存并完成", command=self._finish, style='Primary.TButton')
         self.finish_button.pack(side='right')
+        ttk.Button(footer, text='取消', command=self._request_close).pack(side='right', padx=(0, 6))
+        ttk.Label(footer, text='偏好即时生效；快捷键与 AI 配置保存后生效。', style='Hint.TLabel').pack(side='left')
+        self._initial_deferred = self._deferred_state()
+        for variable in (*self.shortcut_vars.values(), self.api_key, self.deepseek_key, self.bailian_key,
+                         self.bailian_endpoint, self.bailian_free_confirmed, self.review_preferred):
+            variable.trace_add('write', lambda *_: self._refresh_dirty())
         if ai:
             tabs.select(ai_host)
             provider_tabs.select(deepseek_host)
         self.update_idletasks()
         center_window(self, parent, self.winfo_reqwidth(), self.winfo_reqheight())
         self.deiconify()
+
+    def _deferred_state(self):
+        return {
+            'shortcuts': {key: var.get() for key, var in self.shortcut_vars.items()},
+            'api_key': self.api_key.get(), 'deepseek_key': self.deepseek_key.get(),
+            'bailian_key': self.bailian_key.get(), 'bailian_endpoint': self.bailian_endpoint.get(),
+            'bailian_free_confirmed': self.bailian_free_confirmed.get(),
+            'review_preferred_provider': self.review_preferred.get(),
+        }
+
+    def _refresh_dirty(self):
+        self.dirty = self._deferred_state() != self._initial_deferred
+        self.finish_button.configure(text='保存并完成' if self.dirty else '完成')
+
+    def _request_close(self):
+        self._stop_shortcut_recording()
+        self._refresh_dirty()
+        if not self.dirty:
+            self.destroy()
+            return True
+        choice = messagebox.askyesnocancel('设置尚未保存', '保存快捷键与 AI 配置修改？\n选择“否”仅放弃尚未保存的修改；即时生效的偏好不会回退。', parent=self)
+        if choice is True:
+            self._finish()
+            return not self.winfo_exists()
+        if choice is False:
+            self.destroy()
+            return True
+        return False
 
     def _record_shortcut(self, action):
         self._stop_shortcut_recording()
@@ -472,7 +503,7 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(row, text='保存密钥', command=self._save_bailian_key).pack(side='left', padx=5)
         ttk.Button(row, text='删除密钥', command=self._delete_bailian_key).pack(side='left')
         self.bailian_status = tk.StringVar()
-        ttk.Label(host, textvariable=self.bailian_status, foreground='#555').pack(anchor='w')
+        ttk.Label(host, textvariable=self.bailian_status, foreground=theme.INK_SOFT).pack(anchor='w')
         self._refresh_bailian_status()
         ttk.Label(host, text='决策接口地址（默认北京试用域名；可改为控制台的业务空间专属地址）').pack(anchor='w', pady=(6, 0))
         self.bailian_endpoint = tk.StringVar(value=self.parent.controller.preferences.get('bailian_endpoint', BAILIAN_ENDPOINT))
@@ -480,7 +511,7 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(host, text='测试百炼连接（虚构内容）', command=self._test_bailian_connection).pack(anchor='w', pady=4)
         self.bailian_free_confirmed = tk.BooleanVar(value=self.parent.controller.preferences.get('bailian_free_confirmed') is True)
         ttk.Checkbutton(host, text='我已确认该模型当前限时免费，启用百炼', variable=self.bailian_free_confirmed).pack(anchor='w', pady=4)
-        ttk.Label(host, text='官方目前标注“限时免费”，开通资格和期限以平台为准。程序无法查询计费状态；未勾选时跳过百炼。免费条件变化后请取消勾选；控制台如提供“免费额度用完即停”，建议开启。', foreground='#555', wraplength=510).pack(anchor='w')
+        ttk.Label(host, text='官方目前标注“限时免费”，开通资格和期限以平台为准。程序无法查询计费状态；未勾选时跳过百炼。免费条件变化后请取消勾选；控制台如提供“免费额度用完即停”，建议开启。', foreground=theme.INK_SOFT, wraplength=510).pack(anchor='w')
 
     def _test_bailian_connection(self):
         if not self.bailian_free_confirmed.get():
@@ -501,6 +532,9 @@ class SettingsDialog(tk.Toplevel):
             return False
         self.bailian_key.set(bailian_get_api_key())
         self._refresh_bailian_status()
+        if hasattr(self, '_initial_deferred'):
+            self._initial_deferred['bailian_key'] = self.bailian_key.get()
+            self._refresh_dirty()
         return True
 
     def _delete_bailian_key(self):
@@ -511,6 +545,9 @@ class SettingsDialog(tk.Toplevel):
             return
         self.bailian_key.set('')
         self._refresh_bailian_status()
+        if hasattr(self, '_initial_deferred'):
+            self._initial_deferred['bailian_key'] = ''
+            self._refresh_dirty()
 
     def _save_mode(self) -> None:
         if self.parent.store:
@@ -547,6 +584,9 @@ class SettingsDialog(tk.Toplevel):
             return False
         self.api_key.set(get_api_key())
         self._refresh_key_status()
+        if hasattr(self, '_initial_deferred'):
+            self._initial_deferred['api_key'] = self.api_key.get()
+            self._refresh_dirty()
         return True
 
     def _save_deepseek_key(self) -> bool:
@@ -557,6 +597,9 @@ class SettingsDialog(tk.Toplevel):
             return False
         self.deepseek_key.set(deepseek_get_api_key())
         self._refresh_deepseek_status()
+        if hasattr(self, '_initial_deferred'):
+            self._initial_deferred['deepseek_key'] = self.deepseek_key.get()
+            self._refresh_dirty()
         return True
 
     def _finish(self) -> None:
@@ -578,8 +621,11 @@ class SettingsDialog(tk.Toplevel):
         if self.bailian_key.get() and self.bailian_key.get() != bailian_get_api_key() and not self._save_bailian_key():
             return
         self.parent.controller.preferences.update(voucher_shortcuts=shortcuts, bailian_endpoint=endpoint,
-            review_preferred_provider='bailian', bailian_free_confirmed=self.bailian_free_confirmed.get())
+            review_preferred_provider=next((key for key, label in REVIEW_PROVIDER_LABELS.items()
+                if label == self.review_preferred.get()), 'bailian'), bailian_free_confirmed=self.bailian_free_confirmed.get())
         self.parent.controller._save_preferences()
+        self._initial_deferred = self._deferred_state()
+        self.dirty = False
         self.destroy()
 
     def _delete_api_key(self) -> None:
@@ -590,6 +636,9 @@ class SettingsDialog(tk.Toplevel):
             return
         self.api_key.set("")
         self._refresh_key_status()
+        if hasattr(self, '_initial_deferred'):
+            self._initial_deferred['api_key'] = ''
+            self._refresh_dirty()
 
     def _delete_deepseek_key(self) -> None:
         try:
@@ -599,6 +648,9 @@ class SettingsDialog(tk.Toplevel):
             return
         self.deepseek_key.set("")
         self._refresh_deepseek_status()
+        if hasattr(self, '_initial_deferred'):
+            self._initial_deferred['deepseek_key'] = ''
+            self._refresh_dirty()
 
 
 class RelatedPartyImportDialog(tk.Toplevel):
@@ -613,8 +665,8 @@ class RelatedPartyImportDialog(tk.Toplevel):
         self.transient(parent.winfo_toplevel())
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, foreground=theme.MUTED, wraplength=540, text="每行一个主体，可用“｜”补充身份，例如“张三｜股东,董事”；空白行与重复项自动忽略。"
-            "也可从 Excel/CSV/TXT 导入：第一列名称，第二列身份（如“股东、董事”，识别不了的自动留空），首行表头自动跳过。"
+        ttk.Label(body, foreground=theme.MUTED, wraplength=540, text="每行一个主体，例如“张三｜股东,董事｜持股30%”；也可只填名称，空白行与重复项自动忽略。"
+            "支持 Excel/CSV/TXT：名称、身份、与目标公司关系；有表头时按列名识别。身份可留空，关系会保留并用于 AI 抽查。"
             "与现有名单重复或无效的条目导入时跳过。").pack(anchor="w")
         ttk.Label(body, foreground=theme.MUTED, wraplength=540, text=f"可选身份：{'、'.join(PARTY_ROLES)}").pack(anchor="w", pady=(4, 0))
         self.editor = tk.Text(body, height=11, wrap="word", undo=True)
@@ -629,8 +681,8 @@ class RelatedPartyImportDialog(tk.Toplevel):
         self.editor.bind("<KeyRelease>", lambda _e: self._refresh_count())
         self.grab_set()
 
-    def _entries(self) -> list[tuple[str, list[str]]]:
-        return parse_party_lines(self.editor.get("1.0", "end-1c"))
+    def _entries(self) -> list[tuple[str, list[str], str]]:
+        return parse_party_records(self.editor.get("1.0", "end-1c"))
 
     def _refresh_count(self) -> None:
         self.status.set(f"当前识别到 {len(self._entries())} 个主体")
@@ -641,7 +693,7 @@ class RelatedPartyImportDialog(tk.Toplevel):
         if not path:
             return
         try:
-            entries = party_entries_from_file(path)
+            entries = party_records_from_file(path)
         except Exception as exc:
             messagebox.showerror("读取失败", str(exc), parent=self)
             return
@@ -649,19 +701,22 @@ class RelatedPartyImportDialog(tk.Toplevel):
             messagebox.showinfo("没有可导入的主体", "文件中没有读到非空内容。", parent=self)
             return
         self.editor.delete("1.0", "end")
-        self.editor.insert("1.0", "\n".join(name + (f"｜{','.join(roles)}" if roles else "") for name, roles in entries))
+        self.editor.insert("1.0", "\n".join(name + (f"｜{','.join(roles)}｜{relation}" if roles or relation else "")
+                                          for name, roles, relation in entries))
         self._refresh_count()
         self.status.set(f"已从文件读取 {len(entries)} 个主体，可先修改再导入")
 
     def _import(self) -> None:
+        if not self.dialog.parent.store:
+            return
         entries = self._entries()
         if not entries:
             messagebox.showinfo("没有可导入的主体", "请先粘贴名称（每行一个，可选“｜身份”）或从文件读取。", parent=self)
             return
         added, skipped = 0, 0
-        for name, roles in entries:
+        for name, roles, relation in entries:
             try:
-                self.dialog.parent.store.save_related_party(name, [], "", None, roles, "")
+                self.dialog.parent.store.save_related_party(name, [], "", None, roles, relation)
                 added += 1
             except ValueError:
                 skipped += 1
@@ -678,8 +733,9 @@ class RelatedPartiesPanel(ttk.Frame):
     def __init__(self, master, parent: "App"):
         super().__init__(master, padding=12)
         self.parent = parent
-        ttk.Label(self, text="手动输入只需名称与关系：“与目标公司关系”仅保存在本地账套，不发送给 AI。"
-            "本地对往来单位、辅助核算作精确匹配，命中作为程序特征随凭证发送；AI 审查时名称、别名与身份（不含备注、关系）会随凭证发送到 Jev，用于识别关联资金往来，不构成法律关系认定。",
+        ttk.Label(self, text="手动输入只需名称与关系。AI 抽查时，当前账套名单中的名称、别名、身份及“与目标公司关系”"
+            "会随凭证发送到本次使用的模型（百炼、Jev 或 DeepSeek），备注不发送。"
+            "名单用于识别交易主体与关联资金往来；客户、供应商等不会仅因入选名单就被认定为关联方。",
             foreground=theme.MUTED, wraplength=620, justify="left").pack(anchor="w")
         self.view = ttk.Treeview(self, columns=("name", "relation", "roles"), show="headings", height=9)
         for key, title, width in (("name", "名称", 220), ("relation", "与目标公司关系", 220), ("roles", "身份", 150)):
@@ -712,9 +768,11 @@ class RelatedPartiesPanel(ttk.Frame):
             roles = "、".join(json.loads(row["roles_json"])) if "roles_json" in row.keys() else ""
             relation = row["relation"].replace("\n", " ")[:60] if "relation" in row.keys() else ""
             self.view.insert("", "end", iid=str(row["id"]), values=(row["name"], relation, roles))
-        self.parent.refresh_details()
+        self.parent.refresh_related_indicators()
 
     def _select(self, _event: object) -> None:
+        if not self.parent.store:
+            return
         selected = self.view.selection()
         if not selected:
             return
@@ -732,6 +790,8 @@ class RelatedPartiesPanel(ttk.Frame):
         self.relation_var.set("")
 
     def _save(self) -> None:
+        if not self.parent.store:
+            return
         selected = self.view.selection()
         party_id = int(selected[0]) if selected else None
         # 只改名称与关系；身份、别名、备注保留原值（身份与别名可经批量导入维护）。
@@ -754,6 +814,8 @@ class RelatedPartiesPanel(ttk.Frame):
         self.view.selection_set(str(saved_id))
 
     def _delete(self) -> None:
+        if not self.parent.store:
+            return
         selected = self.view.selection()
         if selected and messagebox.askyesno("删除尽调主体", "确定从当前项目删除这条用户维护的尽调主体记录吗？", parent=self):
             self.parent.store.delete_related_party(int(selected[0]))
@@ -1022,7 +1084,7 @@ class PrecheckDetailWindow(tk.Toplevel):
         if source["kind"] == "entry":
             header += f"\n借方合计 {format_money(stats.debit_cents, comma=True)} · 贷方合计 {format_money(stats.credit_cents, comma=True)}"
         header += f"\n疑点 {len(issues)} 条（关键 {sum(i.get('severity') == SEVERITY_CRITICAL for i in issues)} · 提醒 {sum(i.get('severity') == SEVERITY_WARNING for i in issues)}）"
-        ttk.Label(body, text=header, foreground="#31435B", justify="left", wraplength=800).pack(anchor="w")
+        ttk.Label(body, text=header, foreground=theme.INK, justify="left", wraplength=800).pack(anchor="w")
         self.view = tree(body, [("level", "级别", 55), ("row", "行", 55), ("reason", "问题原因", 330), ("interp", "当前解释", 150), ("action", "说明", 220)])
         for issue in issues:
             self.view.insert("", "end", values=(self.LEVEL_LABELS.get(issue.get("severity"), issue.get("severity", "")),
@@ -1131,14 +1193,14 @@ class ImportDialog(tk.Toplevel):
         self.preview.pack(fill="x", padx=12, pady=8)
         bottom = ttk.Frame(self, padding=12)
         bottom.pack(side="bottom", fill="x")
-        self.import_note = ttk.Label(bottom, text="账簿空白/小计行会跳过；请确认借贷列不是余额列。", foreground="#995300", wraplength=460)
+        self.import_note = ttk.Label(bottom, text="账簿空白/小计行会跳过；请确认借贷列不是余额列。", foreground=theme.WARNING, wraplength=460)
         self.import_note.pack(side="left")
         ttk.Button(bottom, text="取消", command=self._close_import).pack(side="right", padx=4)
         self.import_button = ttk.Button(bottom, text="保存列设置" if self.on_save else "确认并导入", command=self.import_now)
         self.import_button.pack(side="right", padx=4)
         map_holder = ttk.Frame(self)
         map_holder.pack(fill="both", expand=True, padx=12, pady=4)
-        self.map_canvas = tk.Canvas(map_holder, highlightthickness=0, background="#F7F5F1")
+        self.map_canvas = tk.Canvas(map_holder, highlightthickness=0, background=theme.SUNKEN)
         map_scroll = ttk.Scrollbar(map_holder, orient="vertical", command=self.map_canvas.yview)
         self.map_canvas.configure(yscrollcommand=map_scroll.set)
         self.map_canvas.pack(side="left", fill="both", expand=True)
@@ -1448,7 +1510,7 @@ class BatchImportDialog(tk.Toplevel):
             if not self.items and not self.skipped:
                 self.destroy()
                 return
-        self.title("导入表格 · 自动审查")
+        self.title("导入表格 · AI 辅助识别")
         width = min(1020, self.winfo_screenwidth() - 80)
         height = min(760, self.winfo_screenheight() - 120)
         self.geometry(f"{width}x{height}")
@@ -1456,11 +1518,12 @@ class BatchImportDialog(tk.Toplevel):
         self.transient(parent)
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="自动审查表头并在本机预检；查看建议后，点击一次“确认导入”。", wraplength=600).pack(anchor="w")
-        self.ai_hint = ttk.Label(body, text="DeepSeek Flash 默认分析前 20 行及合并单元格，可能包含真实账目；整表预检留在本机。", foreground="#777", wraplength=600)
+        ttk.Label(body, text='1  选择工作表   →   2  识别与预检   →   3  确认导入', style='Title.TLabel').pack(anchor='w', pady=(0, 5))
+        ttk.Label(body, text="自动识别表头和字段，预检通过后点击“确认导入”；需要调整时可打开“手动设置”。", wraplength=600).pack(anchor="w")
+        self.ai_hint = ttk.Label(body, text="默认由 DeepSeek Flash 分析前 20 行及合并单元格，可能包含真实账目；整表预检和导入留在本机。", foreground=theme.MUTED, wraplength=600)
         self.ai_hint.pack(fill="x", pady=(4, 8))
         self.ai_progress = ttk.Progressbar(body, mode="determinate")
-        self.ai_status = tk.StringVar(value="正在准备自动审查…")
+        self.ai_status = tk.StringVar(value="正在准备 AI 识别与本机预检…")
         status_label = ttk.Label(body, textvariable=self.ai_status, foreground=theme.MUTED, wraplength=650)
         status_label.pack(fill="x", pady=(0, 6))
         status_label.bind("<Configure>", lambda event: status_label.configure(wraplength=max(200, event.width - 8)))
@@ -1472,18 +1535,19 @@ class BatchImportDialog(tk.Toplevel):
         self.cancel_button.pack(side="right", padx=(6, 0))
         self.import_button = ttk.Button(primary, text="确认导入", style="Accent.TButton", command=self._import_selected, state="disabled")
         self.import_button.pack(side="right")
-        self.agent_button = ttk.Button(primary, text="复制提示词给我的 Agent", command=self._copy_agent)
+        self.agent_button = ttk.Button(primary, text="需要协助", style='Quiet.TButton', command=self._copy_agent)
         self.agent_button.pack(side="left")
         secondary = ttk.Frame(footer)
         secondary.pack(fill="x", pady=(6, 0))
         self.edit_button = ttk.Menubutton(secondary, text="手动设置…")
         menu = tk.Menu(self.edit_button, tearoff=False)
         menu.add_command(label="调整当前工作表的列…", command=self._edit_current)
-        menu.add_command(label="仅用本地规则和手动设置", command=self._use_local_mode)
-        menu.add_command(label="恢复 AI 自动审查", command=self._use_ai_mode)
+        menu.add_command(label="切换为本地／手动识别", command=self._use_local_mode)
         self.edit_button.configure(menu=menu)
         self.edit_button.pack(side="left")
-        self.retry_button = ttk.Button(secondary, text="重新审查", style="Quiet.TButton", command=self._retry_review)
+        self.ai_button = ttk.Button(secondary, text='AI 辅助识别', style='Quiet.TButton', command=self._use_ai_mode)
+        self.ai_button.pack(side='left', padx=(8, 0))
+        self.retry_button = ttk.Button(secondary, text="重新预检", style="Quiet.TButton", command=self._retry_review)
         self.retry_button.pack(side="left", padx=12)
         self.settings_button = ttk.Button(secondary, text="设置 AI", style="Quiet.TButton", command=self._configure_ai)
         self.settings_button.pack(side="left")
@@ -1544,10 +1608,11 @@ class BatchImportDialog(tk.Toplevel):
         self.import_button.configure(state="normal" if ready and not busy and not self._editor else "disabled")
         self.agent_button.configure(state="normal" if self.selected and not self.working else "disabled")
         failed = any(i in self.review_errors or (i in self.reviews and not self.reviews[i].ready) for i in self.selected)
-        self.agent_button.configure(style="Accent.TButton" if failed or self._needs_key else "TButton")
+        self.agent_button.configure(style="TButton")
         self.edit_button.configure(state="disabled" if self.working else "normal")
         self.retry_button.configure(state="disabled" if busy or not self.selected or self._editor else "normal")
         self.settings_button.configure(state="disabled" if busy or self._editor else "normal")
+        self.ai_button.configure(state='disabled' if busy or self._editor or not self.local_mode else 'normal')
         self.cancel_button.configure(text="停止" if self.working else "关闭", state="normal")
 
     def _inventory_ready(self, result):
@@ -1595,20 +1660,30 @@ class BatchImportDialog(tk.Toplevel):
             return
         self._cancel_review()
         self.local_mode = True
+        self.title('导入表格 · 本地／手动识别')
         self.reviews.clear()
         self.review_errors.clear()
         self.ai_hint.configure(text="手动模式：仅用本地规则和手动设置；不会发送表头。")
         self._start_review()
 
     def _use_ai_mode(self):
-        if self.working:
+        if self.working or not self.local_mode:
             return
+        _, _suggest, get_key = ai_tools(self.parent.controller)
+        try:
+            has_key = bool(get_key())
+        except Exception:
+            has_key = False
         self._cancel_review()
         self.local_mode = False
+        self.title('导入表格 · AI 辅助识别')
         self.reviews = {i: review for i, review in self.reviews.items() if i in self.manual}
         self.review_errors.clear()
         self.ai_hint.configure(text="DeepSeek Flash 默认分析前 20 行及合并单元格，可能包含真实账目；整表预检留在本机。")
-        self._start_review()
+        if has_key:
+            self._start_review()
+        else:
+            self._configure_ai()
 
     def _configure_ai(self):
         if self.working or self.ai_running or self._editor:
@@ -1647,7 +1722,7 @@ class BatchImportDialog(tk.Toplevel):
                 self._needs_key = True
                 for i in pending:
                     if i not in self.manual:
-                        self.review_errors[i] = "尚未设置 AI；点击“设置 AI”，或复制提示词给我的 Agent。"
+                        self.review_errors[i] = "尚未设置 AI；点击“设置 AI”，或从“手动设置”切换为本地识别。"
                 pending = [i for i in pending if i in self.manual]
         if not pending:
             self._review_finished()
@@ -1995,8 +2070,9 @@ class App(tk.Toplevel):
         self.detail_total = 0
         self._checks_cache = None
         self.title(f"DudLedger · {DISPLAY_VERSION}")
-        self.geometry("1160x690")
-        self.minsize(820, 520)
+        width, height = min(1160, self.winfo_screenwidth() - 48), min(690, self.winfo_screenheight() - 80)
+        self.geometry(f"{max(640, width)}x{max(420, height)}")
+        self.minsize(min(820, max(640, width)), min(520, max(420, height)))
         self.resizable(True, True)
         self.store: LedgerStore | None = None
         self.account: str | list[str] | None = None
@@ -2025,7 +2101,7 @@ class App(tk.Toplevel):
         self.column_views: dict[str, list[ttk.Treeview]] = {kind: [] for kind in VIEW_COLUMNS}
         self.voucher_windows: set[tk.Toplevel] = set()
         self.review_windows: set[tk.Toplevel] = set()
-        self._sidebar_expanded = False
+        self._sidebar_expanded = controller.preferences.get("sidebar_expanded", True) is not False
         self._sidebar_mode = None
         self._show_sidebar_with_calculator = False
         self.note_hub = NoteHub(self)
@@ -2068,8 +2144,8 @@ class App(tk.Toplevel):
             self.nav_buttons.append(button)
             if index == 3:
                 self.workbench_button = self._sidebar_button(self.sidebar_pages, "问题工作台", "workbench", lambda: self.workbench.toggle())
-        self.calculator_button = self._sidebar_button(self.sidebar_pages, "计算器", "calculator", lambda: self.workbench.show_calculator(toggle=True))
-        self._sidebar_button(self.sidebar_pages, "尽调主体名单", "parties", self.open_related_parties)
+        self.calculator_button = self._sidebar_button(self.sidebar_pages, "计算器", "calculator", lambda: self.workbench.show_calculator(toggle=True), tool=True)
+        self._sidebar_button(self.sidebar_pages, "尽调主体名单", "parties", self.open_related_parties, tool=True)
         footer = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
         footer.pack(side="bottom", fill="x", padx=9, pady=(5, 8))
         self.settings_button = self._sidebar_button(footer, "设置", "settings", self.open_settings, padx=0, side="left")
@@ -2179,12 +2255,12 @@ class App(tk.Toplevel):
         self.summary_view.bind("<<TreeviewClose>>", self._after_expansion_change)
         self.summary_view.bind("<Double-1>", self.open_account)
         self.balance_tools = TableTools(self.summary_view, {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc"},
-            source_for_row=lambda row: self.balance_calc_sources.get(row, row),
+            source_for_row=lambda row: self.balance_calc_sources.get(row, row), show_stats=False, merged_feedback=True,
             panel_parent=self.workbench.calculator_host("科目总览"),
             on_toggle=lambda reveal: self.workbench.set_calculator(self.balance_tools, "科目总览", reveal))
         self.detail_controls = ttk.Frame(frames[1], padding=5)
         self.detail_controls.pack(fill="x")
-        self.detail_controls.columnconfigure(0, weight=1)
+        self.detail_controls.columnconfigure(1, weight=1)
         self.detail_scope_wrap = ttk.Frame(self.detail_controls)
         self.detail_scope_wrap.grid(row=0, column=0, sticky="w")
         self.detail_accounts_toggle = ttk.Button(self.detail_scope_wrap, text="显示科目树 ▸", width=0,
@@ -2197,6 +2273,19 @@ class App(tk.Toplevel):
         self.detail_scope_clear.pack(side="left", padx=(2, 0))
         self.account_label.trace_add("write", lambda *_: self._refresh_scope_clear())
         self._refresh_scope_clear()
+        self.detail_search_wrap = ttk.Frame(self.detail_controls)
+        self.detail_search_wrap.grid(row=0, column=1, sticky='ew', padx=(4, 8))
+        self.detail_search_wrap.columnconfigure(1, weight=1)
+        ttk.Label(self.detail_search_wrap, text='全文', style='Hint.TLabel').grid(row=0, column=0, padx=(0, 4))
+        self.detail_search_entry = ttk.Entry(self.detail_search_wrap, textvariable=self.search)
+        self.detail_search_entry.grid(row=0, column=1, sticky='ew')
+        self.detail_search_entry.bind('<Return>', lambda _event: self.submit_detail_search())
+        self.detail_search_entry.bind('<Escape>', lambda _event: self.clear_detail_search())
+        self.detail_search_clear = ttk.Button(self.detail_search_wrap, text='×', width=2, style='Ghost.TButton',
+                                              command=self.clear_detail_search)
+        self.detail_search_clear.grid(row=0, column=2, padx=(2, 0))
+        self.navigation_tooltip.attach(self.detail_search_entry,
+            lambda: '搜索摘要、凭证号、科目、往来单位、辅助核算；Enter 执行')
         self.detail_actions = ttk.Frame(self.detail_controls)
         self.detail_actions.grid(row=0, column=2, sticky="e")
         self.detail_more = ttk.Menubutton(self.detail_actions, text="更多 ▾", width=0)
@@ -2210,27 +2299,17 @@ class App(tk.Toplevel):
         detail_menu.add_command(label="导出当前明细 CSV…", command=self.export_csv)
         detail_menu.add_command(label="恢复日期顺序", command=self.reset_detail_sort)
         self.detail_more.configure(menu=detail_menu)
-        self.detail_mark = ttk.Button(self.detail_actions, text="关注所选（0）", width=0,
+        self.detail_mark = ttk.Button(self.detail_actions, text="关注（0）", width=0,
                                       command=self.mark_selected_entry, state="disabled")
+        self.detail_filter_button = ttk.Button(self.detail_actions, text='筛选', width=0,
+                                               style='Ghost.TButton', command=self._open_detail_filter)
+        self.detail_filter_button.pack(side='right', padx=(0, 4))
         self.detail_controls.bind("<Configure>", self._resize_detail_controls)
         self.detail_scope.bind("<Configure>", self._resize_detail_controls)
         self.detail_actions.bind("<Configure>", self._resize_detail_controls)
         self.detail_filter_bar = ttk.Frame(frames[1], padding=(6, 0, 6, 4))
         self.detail_filter_bar.bind("<Configure>", self._layout_filter_chips)
-        paging = ttk.Frame(frames[1], padding=(6, 2))
-        paging.pack(side="bottom", fill="x")
-        self.detail_paging = ttk.Frame(paging)
-        self.detail_prev = ttk.Button(self.detail_paging, text="‹ 上一页", width=0, style="Ghost.TButton",
-                                      command=lambda: self.change_detail_page(-1), state="disabled")
-        self.detail_prev.pack(side="left")
         self.detail_page_label = tk.StringVar(value="第 1 / 1 页")
-        ttk.Label(self.detail_paging, textvariable=self.detail_page_label).pack(side="left", padx=5)
-        self.detail_next = ttk.Button(self.detail_paging, text="下一页 ›", width=0, style="Ghost.TButton",
-                                      command=lambda: self.change_detail_page(1), state="disabled")
-        self.detail_next.pack(side="left")
-        self.detail_status = ttk.Label(paging, textvariable=self.detail_info, style="Hint.TLabel", wraplength=440)
-        self.detail_status.pack(side="left", fill="x", expand=True)
-        self.detail_status.bind("<Configure>", self._resize_detail_status)
         self.detail_body = ttk.Panedwindow(frames[1], orient="horizontal")
         self.detail_body.pack(fill="both", expand=True)
         self.detail_accounts = AccountNavigation(self.detail_body, self._choose_detail_account)
@@ -2240,17 +2319,31 @@ class App(tk.Toplevel):
         self.detail_filter_images = (filter_arrow(self.detail_view), filter_arrow(self.detail_view, active=True))
         self.detail_view.bind("<ButtonPress-1>", self._detail_filter_click)
         self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"},
-                                       panel_parent=self.workbench.calculator_host("明细账"),
+                                       panel_parent=self.workbench.calculator_host("明细账"), show_stats=False, merged_feedback=True,
                                        on_toggle=lambda reveal: self.workbench.set_calculator(self.detail_tools, "明细账", reveal))
         self.detail_selection = VoucherSelection(self.detail_view, lambda row: self.detail_voucher_keys.get(row), self._update_detail_mark)
+        self.detail_tools.stats.trace_add('write', lambda *_: self.detail_selection.show_feedback(self.detail_tools.stats.get()))
         self.voucher_actions.attach(self.detail_view, lambda row: self.detail_voucher_keys.get(row))
-        selection_bar(self.detail_table, self.detail_selection)
-        self.detail_join = ttk.Button(self.detail_actions, text="加入问题…（0）", command=lambda: self.voucher_actions.choose_from_view(self.detail_view), state='disabled')
+        self.detail_bottom = selection_bar(self.detail_table, self.detail_selection)
+        self.detail_paging = ttk.Frame(self.detail_bottom)
+        self.detail_prev = ttk.Button(self.detail_paging, text="‹ 上一页", width=0, style="Ghost.TButton",
+                                      command=lambda: self.change_detail_page(-1), state="disabled")
+        self.detail_prev.pack(side="left")
+        ttk.Label(self.detail_paging, textvariable=self.detail_page_label).pack(side="left", padx=5)
+        self.detail_next = ttk.Button(self.detail_paging, text="下一页 ›", width=0, style="Ghost.TButton",
+                                      command=lambda: self.change_detail_page(1), state="disabled")
+        self.detail_next.pack(side="left")
+        self.detail_help = ttk.Button(self.detail_bottom, text='?', width=3, style='Ghost.TButton')
+        self.detail_help.grid(row=0, column=3, sticky='e', padx=(3, 0))
+        self.navigation_tooltip.attach(self.detail_help, lambda: self.detail_tools.selection_hint)
+        self.detail_help.configure(command=lambda: self.detail_selection.show_feedback(self.detail_tools.selection_hint))
+        self.detail_join = ttk.Button(self.detail_actions, text="加入问题…（0）", command=lambda: self._join_selected(self.detail_view, self.detail_selection), state='disabled')
         self.detail_join.pack(side="right", padx=4)
         self.detail_mark.pack(side="right")
 
         self._register_column_view("detail", self.detail_view)
         self.detail_view.bind("<Double-1>", self.open_voucher)
+        self.detail_view.bind("<Return>", self.open_voucher)
         self.detail_view.bind("<<TreeviewSelect>>", self._update_detail_mark, add="+")
         for key in DETAIL_FILTER_LABELS:
             self.detail_view.heading(key, command=lambda column=key: self._open_detail_filter(column))
@@ -2277,7 +2370,7 @@ class App(tk.Toplevel):
             self.report_views[kind] = tree(frame, columns)
             self.report_views[kind].configure(displaycolumns=[key for key, _, _ in columns if key != "source"])
             self.report_tools[kind] = TableTools(self.report_views[kind], {"left_a", "left_b", "left_c", "right_a", "right_b", "right_c"},
-                panel_parent=self.workbench.calculator_host(REPORT_LABELS[kind]),
+                panel_parent=self.workbench.calculator_host(REPORT_LABELS[kind]), show_stats=False, merged_feedback=True,
                 on_toggle=lambda reveal, report_kind=kind: self.workbench.set_calculator(self.report_tools[report_kind], REPORT_LABELS[report_kind], reveal))
         check_top = ttk.Frame(frames[4], padding=5)
         check_top.pack(fill="x")
@@ -2310,7 +2403,7 @@ class App(tk.Toplevel):
         ttk.Button(mark_search_row, text="筛选", style="Ghost.TButton", command=self.refresh_marks).pack(side="left")
         self.mark_note_toggle = ttk.Button(mark_search_row, text='编辑备注 ▸', style="Ghost.TButton", command=self.toggle_mark_note)
         self.mark_note_toggle.pack(side='left', padx=(8, 0))
-        self.mark_join = ttk.Button(mark_search_row, text="加入问题…（0）", command=lambda: self.voucher_actions.choose_from_view(self.mark_view), state='disabled')
+        self.mark_join = ttk.Button(mark_search_row, text="加入问题…（0）", command=lambda: self._join_selected(self.mark_view, self.mark_selection), state='disabled')
         self.mark_join.pack(side='right', padx=4)
         mark_more = ttk.Menubutton(mark_search_row, text='更多 ▾')
         mark_more.pack(side='right')
@@ -2330,6 +2423,7 @@ class App(tk.Toplevel):
         selection_bar(frames[6], self.mark_selection)
         self.mark_view.bind("<<TreeviewSelect>>", self._load_selected_mark, add='+')
         self.mark_view.bind("<Double-1>", self.open_selected_mark_voucher)
+        self.mark_view.bind("<Return>", self.open_selected_mark_voucher)
         self.mark_note_frame = ttk.Frame(frames[6], padding=(6, 6))
         self.mark_note = tk.Text(self.mark_note_frame, height=4, wrap="word", undo=True, background=theme.SURFACE, relief="solid", borderwidth=1,
                                  highlightthickness=1, highlightcolor=theme.ACCENT, highlightbackground=theme.BORDER_STRONG)
@@ -2343,11 +2437,17 @@ class App(tk.Toplevel):
         for view in (self.summary_view, self.detail_view, *self.report_views.values()):
             CellTooltip(view)
         self.tabs.bind("<<NotebookTabChanged>>", self._page_changed)
-        status_bar = ttk.Frame(self.workspace)
-        status_bar.pack(fill="x")
-        self.busy_bar = ttk.Progressbar(status_bar, mode="indeterminate", style="Thin.Horizontal.TProgressbar", length=120)
-        self.status_label = ttk.Label(status_bar, textvariable=self.status, anchor="w", style="Status.TLabel")
+        self.status_bar = ttk.Frame(self.workspace)
+        self.status_bar.pack(fill="x")
+        self.busy_bar = ttk.Progressbar(self.status_bar, mode="indeterminate", style="Thin.Horizontal.TProgressbar", length=120)
+        self.status_label = ttk.Label(self.status_bar, textvariable=self.status, anchor="w", style="Status.TLabel")
         self.status_label.pack(fill="x")
+        self.status.trace_add('write', self._global_feedback)
+        feedback_sources = [(self.balance_tools, 'accounts', None)] + [
+            (self.report_tools[kind], 'reports', kind) for kind in self.report_tools]
+        for tools, page, kind in feedback_sources:
+            tools.stats.trace_add('write', lambda _a, _b, _c, tool=tools, p=page, k=kind:
+                                  self._table_stats_feedback(tool, p, k))
         self.welcome = ttk.Frame(self.content)
         self.welcome.place(relx=0, rely=0, relwidth=1, relheight=1)
         welcome_body = ttk.Frame(self.welcome)
@@ -2370,6 +2470,30 @@ class App(tk.Toplevel):
 
     def select_page(self, page):
         self.tabs.select(self.page_frames[page])
+
+    def _focus_context_search(self, _event=None):
+        page = self.current_page()
+        if page not in ('entries', 'accounts', 'marks'):
+            self.select_page('entries')
+            page = 'entries'
+        if page == 'entries':
+            self.detail_search_entry.focus_set()
+            self.detail_search_entry.selection_range(0, 'end')
+        elif page == 'accounts':
+            for child in self.page_frames['accounts'].winfo_children()[0].winfo_children():
+                if isinstance(child, ttk.Entry):
+                    child.focus_set()
+                    child.selection_range(0, 'end')
+                    break
+        elif page == 'marks':
+            for child in self.page_frames['marks'].winfo_children()[0].winfo_children()[0].winfo_children():
+                if isinstance(child, ttk.Entry):
+                    child.focus_set()
+                    child.selection_range(0, 'end')
+                    break
+        else:
+            return None
+        return 'break'
 
     def switch_report(self):
         for kind, frame in self.report_frames.items():
@@ -2404,8 +2528,50 @@ class App(tk.Toplevel):
             button.state(["selected" if page == index else "!selected"])
         self._resize_workspace()
         self.workbench.page_changed()
+        if self.current_page() in ('entries', 'marks'):
+            self.status_bar.pack_forget()
+        elif not self.status_bar.winfo_manager():
+            self.status_bar.pack(fill='x')
+        self.import_cta.configure(variant='secondary' if self.store else 'primary')
+        if self.welcome.winfo_manager():
+            self.import_cta.pack_forget()
+        elif not self.import_cta.winfo_manager():
+            self.import_cta.pack(side='right')
         if self.current_page() == "review":
             self.review_panel.refresh()
+
+    def _table_stats_feedback(self, tools, page, kind=None):
+        if self.current_page() != page:
+            return
+        if kind is not None and self.report_kind.get() != kind:
+            return
+        text = tools.stats.get()
+        if text:
+            self.status.set(text)
+            return
+        if page == 'accounts':
+            self.status.set('科目总览 · 双击科目进入明细')
+        elif kind:
+            self.status.set(f'{REPORT_LABELS[kind]} · 框选金额可复制或计算')
+
+    def _global_feedback(self, *_args):
+        if not hasattr(self, 'detail_selection'):
+            return
+        page = self.current_page()
+        selection = self.detail_selection if page == 'entries' else self.mark_selection if page == 'marks' else None
+        if self.status_bar.winfo_manager() and page in ('entries', 'marks'):
+            self.status_bar.pack_forget()
+        elif not self.status_bar.winfo_manager() and page not in ('entries', 'marks'):
+            self.status_bar.pack(fill='x')
+        if selection is not None:
+            text = self.status.get()
+            selection.show_feedback(text)
+            token = object()
+            self._feedback_token = token
+            def clear():
+                if self._feedback_token is token and selection.feedback == text:
+                    selection.show_feedback('')
+            self.after(4500, clear)
 
     def _detail_calculator_active(self) -> bool:
         return (self.workbench.visible and self.workbench.mode == "calculator"
@@ -2417,16 +2583,25 @@ class App(tk.Toplevel):
         self._resize_workspace()
 
     def _toggle_sidebar(self) -> None:
-        self._sidebar_expanded = not self._sidebar_expanded
+        narrow = self.winfo_width() < 960
+        self._sidebar_expanded = not (self._sidebar_mode == 'text')
+        self._sidebar_narrow_override = narrow and self._sidebar_expanded
+        self.controller.preferences['sidebar_expanded'] = self._sidebar_expanded
+        self.controller._save_preferences()
         self._resize_workspace()
 
     def busy_start(self, label: str | None = None) -> None:
         """Show indeterminate progress in the status bar (and mark the main CTA)."""
         self._busy_count = getattr(self, "_busy_count", 0) + 1
         if self._busy_count == 1:
-            if not self.busy_bar.winfo_manager():
-                self.busy_bar.pack(side="left", padx=(18, 6), before=self.status_label)
-            self.busy_bar.start(80)
+            page = self.current_page()
+            selection = self.detail_selection if page == 'entries' else self.mark_selection if page == 'marks' else None
+            if selection is not None:
+                selection.show_feedback(label or '正在处理…')
+            else:
+                if not self.busy_bar.winfo_manager():
+                    self.busy_bar.pack(side="left", padx=(18, 6), before=self.status_label)
+                self.busy_bar.start(80)
             if label:
                 self._busy_prev_status = self.status.get()
                 self.status.set(label)
@@ -2443,12 +2618,24 @@ class App(tk.Toplevel):
             self.import_cta.configure(state="normal")
 
     def refresh_workbench_badge(self, count: int) -> None:
-        text = f"问题工作台（{count}）" if count else "问题工作台"
-        self.workbench_button.configure(text=text)
+        self.workbench_count = max(0, int(count))
+        self.update_workbench_presentation()
 
-    def _sidebar_button(self, parent, title, icon, command, *, padx=9, side=None, expand=False):
+    def update_workbench_presentation(self) -> None:
+        count = getattr(self, 'workbench_count', 0)
+        detached = bool(getattr(self.workbench, 'detached', False))
+        overlay = bool(getattr(self.workbench, 'overlay', False))
+        state = ' · 独立显示' if detached and self.workbench.issues_visible else ' · 覆盖显示' if overlay else ''
+        text = '问题工作台' + (f'  {count}' if count else '') + state
+        self.workbench_button.configure(text=text)
+        issues_open = ((detached and self.workbench.window.state() != 'withdrawn') or
+                       (not detached and self.workbench.visible and self.workbench.mode == 'issues'))
+        self.workbench_button.state(['selected'] if issues_open else ['!selected'])
+
+    def _sidebar_button(self, parent, title, icon, command, *, padx=9, side=None, expand=False, tool=False):
         image = self.sidebar_icons[icon] = navigation_icon(self, icon)
         button = ttk.Button(parent, text=title, image=image, width=0, command=command)
+        button._nav_tool = tool
         if side:
             button.pack(side=side, fill="x" if expand else "none", expand=expand, padx=padx, pady=1)
         else:
@@ -2478,15 +2665,20 @@ class App(tk.Toplevel):
                 heading.pack_forget()
             self.sidebar_footer_label.pack_forget()
         for button in self.sidebar_buttons:
-            button.configure(style="Nav.TButton" if expanded else "Rail.Nav.TButton",
-                             compound="left" if expanded else "image")
+            tool = getattr(button, '_nav_tool', False)
+            style = ('Tool.Nav.TButton' if expanded else 'Rail.Tool.Nav.TButton') if tool else ('Nav.TButton' if expanded else 'Rail.Nav.TButton')
+            button.configure(style=style, compound="left" if expanded else "image")
 
     def _resize_workspace(self, event=None) -> None:
         if event is not None and event.widget is not self:
             return
         calculator = self._detail_calculator_active()
         hidden = False
-        mode = "hidden" if hidden else ("text" if self._sidebar_expanded else "icons")
+        narrow = self.winfo_width() < 960
+        if not narrow:
+            self._sidebar_narrow_override = False
+        show_text = self._sidebar_expanded and (not narrow or getattr(self, '_sidebar_narrow_override', False))
+        mode = "hidden" if hidden else ("text" if show_text else "icons")
         sidebar_width = max(184, self.controller.font_size * 13)
         self.sidebar.configure(width=sidebar_width if mode == "text" else 56)
         self._render_sidebar(mode)
@@ -2509,15 +2701,17 @@ class App(tk.Toplevel):
         menu = tk.Menu(self)
         # 文件菜单只保留最高频的三个动作；其余功能在各页面内（导入记录、明细账“更多”、关注凭证页）。
         files = tk.Menu(menu, tearoff=False)
-        files.add_command(label="导入 Excel…", command=self.import_file, accelerator="⌘I")
-        files.add_command(label="打开账套…", command=self.open_book, accelerator="⌘O")
+        macos = self.tk.call("tk", "windowingsystem") == "aqua"
+        files.add_command(label="导入 Excel…", command=self.import_file, accelerator="⌘I" if macos else "Ctrl+I")
+        files.add_command(label="打开账套…", command=self.open_book, accelerator="⌘O" if macos else "Ctrl+O")
         files.add_separator()
         files.add_command(label="退出当前账套", command=self.close_book)
         menu.add_cascade(label="文件", menu=files)
         review = tk.Menu(menu, tearoff=False)
-        macos = self.tk.call("tk", "windowingsystem") == "aqua"
         review.add_command(label="切换侧栏", command=self._toggle_sidebar,
                            accelerator="⌘⇧L" if macos else "Ctrl+Shift+L")
+        review.add_command(label='查找 / 全文搜索', command=self._focus_context_search,
+                           accelerator='⌘F' if macos else 'Ctrl+F')
         review.add_command(label="科目总览", command=lambda: self.select_page("accounts"))
         review.add_command(label="明细账", command=lambda: self.select_page("entries"))
         review.add_command(label="财务报表", command=lambda: self.select_page("reports"))
@@ -2540,9 +2734,10 @@ class App(tk.Toplevel):
         self.configure(menu=menu)
         for dialog in self.utility_windows.values():
             dialog.configure(menu=menu)
-        self.bind("<Command-i>", lambda _event: self.import_file())
-        self.bind("<Command-o>", lambda _event: self.open_book())
         modifier = "Command" if macos else "Control"
+        self.bind(f"<{modifier}-i>", lambda _event: self.import_file())
+        self.bind(f"<{modifier}-o>", lambda _event: self.open_book())
+        self.bind(f"<{modifier}-f>", self._focus_context_search)
         self.bind(f"<{modifier}-Shift-L>", lambda _event: self._toggle_sidebar())
 
     def open_utility(self, title: str) -> None:
@@ -2576,7 +2771,13 @@ class App(tk.Toplevel):
         ColumnDialog(parent, kind, visible_columns(kind, self.store.display_columns(kind)), lambda selected: self._change_columns(kind, selected))
 
     def open_settings(self) -> None:
-        SettingsDialog(self)
+        existing = getattr(self, 'settings_window', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            return existing
+        self.settings_window = SettingsDialog(self)
+        return self.settings_window
 
     def show_usage_tour(self):
         return self.controller.show_usage_tour(self)
@@ -2607,7 +2808,22 @@ class App(tk.Toplevel):
         if not self.store:
             messagebox.showinfo("先选择项目", "请先新建或打开本地项目。", parent=self)
             return
-        RelatedPartiesDialog(self)
+        existing = getattr(self, 'related_parties_window', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            return existing
+        self.related_parties_window = RelatedPartiesDialog(self)
+        return self.related_parties_window
+
+    def _close_book_dialogs(self) -> bool:
+        settings = getattr(self, 'settings_window', None)
+        if settings is not None and settings.winfo_exists() and not settings._request_close():
+            return False
+        related = getattr(self, 'related_parties_window', None)
+        if related is not None and related.winfo_exists():
+            related.destroy()
+        return True
 
     def _close(self) -> None:
         if not self.workbench.flush():
@@ -2615,6 +2831,8 @@ class App(tk.Toplevel):
         for dialog in list(self.voucher_windows | self.review_windows):
             if dialog.winfo_exists() and not dialog.request_close():
                 return
+        if not self._close_book_dialogs():
+            return
         self.review_panel.cancel()
         self.tasks.cancel_all()
         if self.store:
@@ -2648,6 +2866,8 @@ class App(tk.Toplevel):
         for dialog in list(self.voucher_windows | self.review_windows):
             if dialog.winfo_exists() and not dialog.request_close():
                 return
+        if not self._close_book_dialogs():
+            return
         self.review_panel.cancel()
         self.voucher_windows.clear()
         for child in list(self.winfo_children()):
@@ -2929,13 +3149,16 @@ class App(tk.Toplevel):
                 self.mark_view.selection_set(iid)
                 self.mark_view.see(iid)
         self.mark_selection.refresh()
+        self.mark_selection.set_context(f'关注记录 {len(marks)} 张 · 当前显示 {len(self.mark_view.get_children())} 张')
         self._load_selected_mark()
         self._sync_empty_states()
 
     def open_selected_mark_voucher(self, _event: object = None) -> None:
-        if _event is not None and self.mark_view.identify_column(_event.x) == "#0":
+        mouse_event = _event is not None and getattr(_event, 'keysym', None) != 'Return'
+        if mouse_event and self.mark_view.identify_column(_event.x) == "#0":
             return "break"
-        row = self.mark_view.identify_row(_event.y) if _event is not None else next(iter(self.mark_view.selection()), None)
+        row = (self.mark_view.identify_row(_event.y) if mouse_event
+               else next(iter(self.mark_view.selection()), None))
         if row and row in self.mark_keys:
             self.workbench.open_key(self.mark_keys[row])
 
@@ -2970,7 +3193,8 @@ class App(tk.Toplevel):
             # Update existing rows in place: do not reset cell selection or scroll.
             if getattr(self, "detail_voucher_keys", {}).get(row) == key:
                 self.detail_view.set(row, "marked", "●" if mark else "")
-                self.detail_view.item(row, tags=("marked",) if mark else ())
+                tags = tuple(tag for tag in self.detail_view.item(row, 'tags') if tag != 'marked')
+                self.detail_view.item(row, tags=(('marked',) + tags) if mark else tags)
         if mark is not None and key not in self.mark_keys.values() and not getattr(self, "_marks_refresh_scheduled", False):
             self._marks_refresh_scheduled = True
             def refresh_later():
@@ -2981,6 +3205,18 @@ class App(tk.Toplevel):
         for row, row_key in self.mark_keys.items():
             if row_key == key and self.mark_view.exists(row) and mark:
                 self.mark_view.set(row, "note", mark["note"].replace("\n", " "))
+
+    def refresh_related_indicators(self) -> None:
+        """Refresh only party labels; preserve query, checks, ranges and focus."""
+        if not self.store:
+            return
+        party_index = build_party_index(self.store.related_parties())
+        for row_id, record in getattr(self, 'detail_row_records', {}).items():
+            if self.detail_view.exists(row_id):
+                self.detail_view.set(row_id, 'related', indexed_party_match(record, party_index))
+        panel = getattr(self, 'review_panel', None)
+        if panel is not None:
+            panel.refresh()
 
     def locate_issue_voucher(self, key):
         if not self.store or not self.workbench.flush():
@@ -2993,7 +3229,9 @@ class App(tk.Toplevel):
         if self.detail_view.exists(str(entry_id)):
             self.select_page("entries")
             self.detail_view.selection_set(str(entry_id))
+            self.detail_view.focus(str(entry_id))
             self.detail_view.see(str(entry_id))
+            self.detail_view.focus_set()
             return
         if (self.account or self.detail_search or self.detail_conditions or any(self._period_bounds())):
             if not messagebox.askyesno("定位凭证", "目标分录不在当前显示范围内。清除科目和筛选，并按日期定位该分录？", parent=self):
@@ -3059,7 +3297,10 @@ class App(tk.Toplevel):
 
     def _update_mark_actions(self):
         count = len(self.mark_selection.action_keys())
-        self.mark_join.configure(text=f'加入问题…（{count}）', state='normal' if count else 'disabled')
+        source = '勾选' if self.mark_selection.checked else '框选/行'
+        current = self.workbench.issues_visible and self.workbench.view_mode == 'detail' and self.workbench.issue_id
+        join_text = f'加入当前问题（{source} {count}）' if current else f'加入{source}到问题（{count}）'
+        self.mark_join.configure(text=join_text if count else '加入问题…（0）', state='normal' if count else 'disabled')
         self.mark_note_toggle.configure(state='normal' if count == 1 else 'disabled')
         if hasattr(self, 'mark_note'):
             if count != 1 and self.mark_note_frame.winfo_manager():
@@ -3095,9 +3336,15 @@ class App(tk.Toplevel):
         self.refresh_details()
 
     def submit_detail_search(self) -> None:
-        keyword = self.search.get().strip()
+        self.detail_search = self.search.get().strip()
+        self.detail_offset = 0
+        self.refresh_details()
+
+    def clear_detail_search(self) -> None:
+        self.search.set('')
         self.detail_search = ''
-        self._set_detail_filter('summary', EntryCondition('summary', 'contains', (keyword,)) if keyword else None)
+        self.detail_offset = 0
+        self.refresh_details()
 
     def _has_detail_filter(self, column: str) -> bool:
         if column == "period":
@@ -3130,13 +3377,24 @@ class App(tk.Toplevel):
     def _refresh_scope_clear(self) -> None:
         self.detail_scope_clear.configure(state="normal" if getattr(self, "account", None) else "disabled")
 
+    def _join_selected(self, view, selection):
+        keys = selection.action_keys()
+        workbench = self.workbench
+        if keys and workbench.issues_visible and workbench.view_mode == 'detail' and workbench.issue_id:
+            workbench.add_to_issue(workbench.issue_id, keys)
+        else:
+            self.voucher_actions.choose_from_view(view)
+
     def _update_detail_mark(self, _event=None) -> None:
         selection = getattr(self, 'detail_selection', None)
         count = len(selection.action_keys()) if selection else 0
-        self.detail_mark.configure(text=f'关注所选（{count}）', state='normal' if count else 'disabled',
+        source = '勾选' if selection and selection.checked else '框选/行'
+        self.detail_mark.configure(text=f'关注{source}（{count}）' if count else '关注（0）', state='normal' if count else 'disabled',
                                    style='Accent.TButton' if count else 'TButton')
         if hasattr(self, 'detail_join'):
-            self.detail_join.configure(text=f'加入问题…（{count}）', state='normal' if count else 'disabled')
+            current = self.workbench.issues_visible and self.workbench.view_mode == 'detail' and self.workbench.issue_id
+            join_text = f'加入当前问题（{source} {count}）' if current else f'加入{source}到问题（{count}）'
+            self.detail_join.configure(text=join_text if count else '加入问题…（0）', state='normal' if count else 'disabled')
 
     def reset_detail_sort(self) -> None:
         self.detail_sort = "date"
@@ -3200,12 +3458,21 @@ class App(tk.Toplevel):
                 "entries_plain": EmptyState(self.detail_view.master, "entries",
                                             "暂无分录", "导入序时账后在此查看全部明细。",
                                             "导入表格", self.import_file),
+                "accounts_filtered": EmptyState(self.summary_view.master, "filter",
+                                                "没有匹配的科目", "尝试其他编码或名称，或清除科目搜索。",
+                                                "清除科目搜索", self.clear_summary_filter),
                 "entries_filtered": EmptyState(self.detail_view.master, "filter",
-                                               "没有符合筛选条件的分录", "调整或清除筛选条件后再看。",
-                                               "清除筛选", self.clear_filter),
+                                               "没有符合搜索或筛选条件的分录", "调整条件，或清除搜索与筛选；科目范围可单独清除。",
+                                               "清除搜索与筛选", self.clear_filter),
+                "entries_account": EmptyState(self.detail_view.master, "entries",
+                                              "当前科目范围没有分录", "可返回全部科目；不会建议重新导入已有账套。",
+                                              "显示全部科目", self.show_all_entries),
                 "marks": EmptyState(self.mark_view.master, "marks",
-                                    "暂无关注凭证", "在明细账勾选凭证后点『关注所选』。",
+                                    "暂无关注凭证", "在明细账勾选凭证后点『关注』。",
                                     "去明细账", lambda: self.select_page("entries")),
+                "marks_filtered": EmptyState(self.mark_view.master, "filter",
+                                             "没有匹配的关注凭证", "清除关注列表搜索后查看全部记录。",
+                                             "清除搜索", self.clear_mark_search),
             }
             for kind in REPORT_KINDS:
                 self._empty_states[f"report_{kind}"] = EmptyState(
@@ -3213,24 +3480,33 @@ class App(tk.Toplevel):
                     "尚未导入报表", "导入后在此查看；可在上方切换报表类型。",
                     "导入表格", self.import_file)
         states = self._empty_states
-        if self.summary_view.get_children():
-            states["accounts"].hide()
-        else:
-            states["accounts"].show()
-        if self.detail_view.get_children():
-            states["entries_plain"].hide()
-            states["entries_filtered"].hide()
-        else:
+        account_empty = not self.summary_view.get_children()
+        for key in ('accounts', 'accounts_filtered'):
+            states[key].hide()
+        if account_empty:
+            states['accounts_filtered' if self.summary_search.get().strip() and self.store else 'accounts'].show()
+        entry_keys = ('entries_plain', 'entries_filtered', 'entries_account')
+        for key in entry_keys:
+            states[key].hide()
+        if not self.detail_view.get_children():
             filter_count = len(self.detail_conditions) + bool(self.detail_search) + self._has_detail_filter("period")
-            (states["entries_filtered"] if filter_count and self.store else states["entries_plain"]).show()
-            (states["entries_plain"] if filter_count and self.store else states["entries_filtered"]).hide()
+            if filter_count and self.store:
+                states['entries_filtered'].show()
+            elif self.account and self.store:
+                states['entries_account'].show()
+            else:
+                states['entries_plain'].show()
         for kind in REPORT_KINDS:
             state = states[f"report_{kind}"]
             (state.hide() if self.report_views[kind].get_children() else state.show())
-        if self.mark_view.get_children():
-            states["marks"].hide()
-        else:
-            states["marks"].show()
+        states['marks'].hide()
+        states['marks_filtered'].hide()
+        if not self.mark_view.get_children():
+            states['marks_filtered' if self.mark_search.get().strip() else 'marks'].show()
+
+    def clear_mark_search(self) -> None:
+        self.mark_search.set('')
+        self.refresh_marks()
 
     def refresh_all(self) -> None:
         if not self.workbench.flush():
@@ -3342,6 +3618,7 @@ class App(tk.Toplevel):
             else:
                 self.summary_view.dashed_grid.schedule()
                 self.balance_tools.structure_changed()
+                self._sync_empty_states()
         append()
 
     def refresh_checks(self):
@@ -3384,6 +3661,7 @@ class App(tk.Toplevel):
         source_id = self.report_options[kind].get(self.report_source[kind].get())
         if source_id is None:
             self.report_info[kind].set("尚未导入报表。")
+            self._sync_empty_states()
             return
         source = next(row for row in self.store.sources() if row["id"] == source_id)
         metadata = json.loads(source["mapping_json"])
@@ -3416,6 +3694,7 @@ class App(tk.Toplevel):
                 values.extend((row["right_item"], report_amount(row["right_amount_1_cents"]), report_amount(row["right_amount_2_cents"]), report_amount(row["right_amount_3_cents"])))
             values.append(f'{source["filename"]}/{source["sheet"]}:{row["row_no"]}')
             view.insert("", "end", iid=str(row["row_no"]), values=values)
+        self._sync_empty_states()
 
     @staticmethod
     def _report_item_name(value: str) -> str:
@@ -3427,7 +3706,7 @@ class App(tk.Toplevel):
     @staticmethod
     def _flow_bar(container, first, second):
         if container.winfo_width() < first.winfo_reqwidth() + second.winfo_reqwidth() + 12:
-            second.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            second.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
         else:
             second.grid(row=0, column=1, columnspan=1, sticky="e", pady=0)
 
@@ -3446,11 +3725,6 @@ class App(tk.Toplevel):
         return dict(account=self.account, search=self.detail_search, conditions=conditions,
                     period_from=period_start, period_to=period_end, include_descendants=self.include_descendants,
                     sort_by=self.detail_sort, descending=self.detail_descending)
-
-    def _resize_detail_status(self, event) -> None:
-        wrap = max(80, event.width - 4)
-        if int(self.detail_status.cget("wraplength")) != wrap:
-            self.detail_status.configure(wraplength=wrap)
 
     def change_detail_page(self, direction):
         self.detail_offset = max(0, self.detail_offset + direction * 500)
@@ -3494,24 +3768,29 @@ class App(tk.Toplevel):
         (rows_found, total, offset), marked_keys, party_index, *locate = result
         locate_id = locate[0] if locate else None
         self.detail_voucher_keys = {}
+        self.detail_row_records = {}
         self.detail_total, self.detail_offset = total, offset
         self.detail_view.delete(*self.detail_view.get_children())
         for row in rows_found:
             side_tag = "debit_row" if row["debit_cents"] and not row["credit_cents"] else "credit_row" if row["credit_cents"] and not row["debit_cents"] else ""
             self.detail_voucher_keys[str(row["id"])] = voucher_key(row)
+            self.detail_row_records[str(row["id"])] = row
             marked = voucher_key(row) in marked_keys
-            self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=("marked",) if marked else ((side_tag,) if side_tag else ()))
+            tags = tuple(filter(None, ('marked' if marked else '', side_tag)))
+            self.detail_view.insert("", "end", iid=str(row["id"]), values=("●" if marked else "", row["entry_date"], row["fiscal_year"], row["period"], f'{row["voucher_type"]}{row["voucher_no"]}', row["code"], row["name"], row["summary"], row["counterparty"], indexed_party_match(row, party_index), row["auxiliary"], row["currency"], row["original_amount"], amount(row["debit_cents"]), amount(row["credit_cents"]), row["maker"], f'{row["filename"]}/{row["sheet"]}:{row["row_no"]}'), tags=tags)
         self.detail_selection.refresh()
         if locate_id is not None and self.detail_view.exists(str(locate_id)):
             self.detail_view.selection_set(str(locate_id))
+            self.detail_view.focus(str(locate_id))
             self.detail_view.see(str(locate_id))
+            self.detail_view.focus_set()
             self._update_detail_mark()
         pages = max(1, (total + 499) // 500)
         self.detail_page_label.set(f"第 {offset // 500 + 1} / {pages} 页")
         if pages > 1:
-            self.detail_paging.pack(side="right", before=self.detail_status)
+            self.detail_paging.grid(row=0, column=2, sticky='e', padx=(5, 0))
         else:
-            self.detail_paging.pack_forget()
+            self.detail_paging.grid_forget()
         self.detail_prev.configure(state="normal" if offset else "disabled")
         self.detail_next.configure(state="normal" if offset + 500 < total else "disabled")
         end = offset + len(rows_found)
@@ -3519,21 +3798,33 @@ class App(tk.Toplevel):
         filter_count = len(self.detail_conditions) + bool(self.detail_search) + self._has_detail_filter("period")
         filter_info = f" · 已筛选 {filter_count} 项" if filter_count else " · 点击摘要、日期或金额列标题筛选"
         self.detail_info.set(f"共 {total:,} 条 · {shown}{filter_info} · {self._period_label()}")
+        self.detail_selection.set_context(self.detail_info.get())
         self._update_filter_chips()
         self._sync_empty_states()
 
     def _update_filter_chips(self):
         for child in self.detail_filter_bar.winfo_children():
             child.destroy()
-        if not self.detail_conditions:
+        has_period = self._has_detail_filter('period')
+        if not self.detail_conditions and not self.detail_search and not has_period:
             self.detail_filter_bar.pack_forget()
+            self.detail_filter_button.configure(text='筛选')
             return
         from .detail_filter_ui import condition_label
         self.detail_filter_bar.pack(fill='x', after=self.detail_controls)
+        if self.detail_search:
+            label = self.detail_search if len(self.detail_search) <= 24 else self.detail_search[:23] + '…'
+            ttk.Button(self.detail_filter_bar, text=f'全文：{label} ×', style='Ghost.TButton',
+                       command=self.clear_detail_search)
+        if has_period:
+            ttk.Button(self.detail_filter_bar, text=f'期间：{self._period_label()} ×', style='Ghost.TButton',
+                       command=lambda: self._set_detail_filter('period', None))
         for column, condition in self.detail_conditions.items():
             ttk.Button(self.detail_filter_bar, text=condition_label(condition) + ' ×', style='Ghost.TButton',
                        command=lambda key=column: self._set_detail_filter(key, None))
-        ttk.Button(self.detail_filter_bar, text='清除全部', style='Quiet.TButton', command=self.clear_filter)
+        ttk.Button(self.detail_filter_bar, text='清除搜索与筛选', style='Quiet.TButton', command=self.clear_filter)
+        count = len(self.detail_conditions) + bool(self.detail_search) + bool(has_period)
+        self.detail_filter_button.configure(text=f'筛选 {count}')
         self.after_idle(self._layout_filter_chips)
 
     def _layout_filter_chips(self, _event=None):
@@ -3666,10 +3957,14 @@ class App(tk.Toplevel):
         self._save_expansion()
         self.status.set("已记住当前展开的科目；刷新或重启后仍保持。")
 
-    def open_voucher(self, _event: object, entry_id: int | None = None, *, edit_attention: bool = False) -> None:
-        if _event is not None and self.detail_view.identify_column(_event.x) == "#0":
+    def open_voucher(self, _event: object = None, entry_id: int | None = None, *, edit_attention: bool = False,
+                     replace_window: tk.Toplevel | None = None) -> None:
+        mouse_event = _event is not None and getattr(_event, 'keysym', None) != 'Return'
+        if mouse_event and getattr(_event, 'x', None) is not None and self.detail_view.identify_column(_event.x) == "#0":
             return "break"
         if not self.store:
+            return
+        if replace_window is not None and replace_window.winfo_exists() and not replace_window.request_close():
             return
         selection = self.detail_view.selection()
         if entry_id is None:
@@ -3685,26 +3980,46 @@ class App(tk.Toplevel):
                     return
             self.voucher_windows.clear()
         target = lines[0]
+        navigation = self.store.voucher_navigation(entry_id, **self._detail_query_filters())
         existing_mark = mark_for_entry(self.store, entry_id)
         dialog = tk.Toplevel(self)
         dialog.withdraw()
         dialog.ledger_app = self
         dialog.voucher_key = voucher_key(target)
+        dialog.voucher_entry_id = entry_id
         self.voucher_windows.add(dialog)
         dialog.bind("<Destroy>", lambda event: self.voucher_windows.discard(dialog) if event.widget is dialog else None)
         dialog.title(f'凭证 · {target["fiscal_year"]}年{target["period"]}期 {target["voucher_type"]}{target["voucher_no"]}')
         dialog.minsize(620, 240)
-        voucher_top = ttk.Frame(dialog, padding=10)
+        voucher_top = ttk.Frame(dialog, padding=(10, 8))
         voucher_top.pack(fill="x")
-        ttk.Label(voucher_top, text="已导入的凭证分录").pack(side="left")
-        ttk.Label(voucher_top, text="按 ESC 键关闭凭证", style="Hint.TLabel").pack(side="left", padx=(12, 0))
+        ttk.Label(voucher_top, text=f'{target["entry_date"]} · {target["voucher_type"]}{target["voucher_no"]}',
+                  style='Title.TLabel').pack(side="left")
+        if navigation:
+            ttk.Label(voucher_top, text=f'第 {navigation["position"]}/{navigation["total"]} 张', style='Hint.TLabel').pack(side='left', padx=(12, 0))
         more = ttk.Menubutton(voucher_top, text="显示设置")
         more.pack(side="right")
         display_menu = tk.Menu(more, tearoff=False)
         display_menu.add_command(label="选择显示列…", command=lambda: self._open_columns(dialog, "voucher"))
         display_menu.add_command(label="还原默认格式", command=self.reset_voucher_format)
         more.configure(menu=display_menu)
+        context = ttk.Frame(dialog, padding=(12, 0, 12, 6))
+        context.pack(fill='x')
+        sources = '；'.join(dict.fromkeys(f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}' for line in lines))
+        ttk.Label(context, text=('已关注 · 待复核' if existing_mark else '未关注') + '  ·  来源 ' + sources,
+                  style='Hint.TLabel', wraplength=650).pack(side='left', fill='x', expand=True)
+        if navigation:
+            sequence = ttk.Frame(dialog, padding=(12, 0, 12, 5))
+            sequence.pack(fill='x')
+            ttk.Button(sequence, text='‹ 上一张', style='Ghost.TButton',
+                       command=lambda: self.open_voucher(None, entry_id=navigation['previous_entry_id'], replace_window=dialog),
+                       state='normal' if navigation['previous_entry_id'] is not None else 'disabled').pack(side='left')
+            ttk.Button(sequence, text='下一张 ›', style='Ghost.TButton',
+                       command=lambda: self.open_voucher(None, entry_id=navigation['next_entry_id'], replace_window=dialog),
+                       state='normal' if navigation['next_entry_id'] is not None else 'disabled').pack(side='left', padx=(5, 0))
+            ttk.Label(sequence, text='顺序继承当前明细范围 · Enter 打开 · Esc 关闭', style='Hint.TLabel').pack(side='left', padx=10)
         view = tree(dialog, VIEW_COLUMNS["voucher"])
+        view.configure(style='Compact.Treeview')
         dialog.voucher_view = view
         self.shortcuts.attach(dialog)
         dialog.cell_tools = TableTools(view, {"debit", "credit", "original"})
@@ -3719,17 +4034,26 @@ class App(tk.Toplevel):
         view.bind("<ButtonRelease-1>", lambda _e, widget=view: self._save_voucher_widths(widget), add="+")
         for line in lines:
             side_tag = "debit_row" if line["debit_cents"] and not line["credit_cents"] else "credit_row" if line["credit_cents"] and not line["debit_cents"] else ""
-            view.insert("", "end", values=(line["code"], line["name"], line["summary"], line["auxiliary"], line["currency"], line["original_amount"], amount(line["debit_cents"]), amount(line["credit_cents"]), f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'), tags=("marked",) if existing_mark else ((side_tag,) if side_tag else ()))
+            tags = tuple(filter(None, ('marked' if existing_mark else '', side_tag)))
+            view.insert("", "end", values=(line["code"], line["name"], line["summary"], line["auxiliary"], line["currency"], line["original_amount"], amount(line["debit_cents"]), amount(line["credit_cents"]), f'{line["filename"]}/{line["sheet"]}:{line["row_no"]}'), tags=tags)
         debit = sum(line["debit_cents"] for line in lines)
         credit = sum(line["credit_cents"] for line in lines)
-        ttk.Label(dialog, text=f"{len(lines)} 行分录   借方 {amount(debit) or '0.00'}   贷方 {amount(credit) or '0.00'}   差额 {amount(debit-credit) or '0.00'}", padding=(12, 7)).pack(anchor="w")
+        totals = ttk.Frame(dialog, padding=(12, 7))
+        totals.pack(fill='x')
+        ttk.Label(totals, text=f"{len(lines)} 行分录   借方 {amount(debit) or '0.00'}   贷方 {amount(credit) or '0.00'}",
+                  font=getattr(self, 'font_mono', None)).pack(side='left')
+        difference = debit - credit
+        ttk.Label(totals, text=f'差额 {amount(difference) or "0.00"}' + (' · 不平衡' if difference else ' · 平衡'),
+                  foreground=theme.DANGER if difference else theme.INK_SOFT,
+                  font=getattr(self, 'font_mono', None)).pack(side='left', padx=(18, 0))
         quick_actions = ttk.Frame(dialog, padding=(12, 0, 12, 8))
         quick_actions.pack(fill="x")
         note_area = ttk.Frame(dialog, padding=(12, 5, 12, 10))
         attention = tk.BooleanVar(value=bool(existing_mark))
         ttk.Checkbutton(note_area, text="关注这张凭证", variable=attention).pack(anchor="w")
         ttk.Label(note_area, text="注释会随关注记录保存在当前账套；再次导出 MD 时使用最新内容。", style="Hint.TLabel").pack(anchor="w", pady=(2, 5))
-        editor = tk.Text(note_area, height=4, wrap="word", undo=True, background="#FFFDFB", relief="solid", borderwidth=1)
+        editor = tk.Text(note_area, height=4, wrap="word", undo=True, background=theme.SURFACE, relief="solid", borderwidth=1,
+                         highlightthickness=1, highlightcolor=theme.ACCENT, highlightbackground=theme.BORDER_STRONG)
         editor.pack(fill="x")
         if existing_mark:
             editor.insert("1.0", existing_mark["note"])
@@ -3745,7 +4069,8 @@ class App(tk.Toplevel):
             if not pending_attention:
                 attention.set(bool(current))
             for item in view.get_children():
-                view.item(item, tags=("marked",) if current else ())
+                tags = tuple(tag for tag in view.item(item, 'tags') if tag != 'marked')
+                view.item(item, tags=(('marked',) + tags) if current else tags)
             self.update_mark_indicators(voucher_key(target))
             saved_state = (bool(current), editor.get("1.0", "end-1c"))
 
@@ -3904,9 +4229,8 @@ class Application(tk.Tk):
                 tkfont.nametofont(name).configure(size=size)
             except tk.TclError:
                 pass
-        ttk.Style(self).configure("Treeview", rowheight=max(28, size + 16))
-        self.intro_font.configure(size=size + 3)
-        self.welcome_font.configure(size=size + 13)
+        theme.configure_derived_fonts(self, size)
+        theme.configure_treeview_metrics(self)
         self.font_size = size
         for window in getattr(self, "windows", ()):
             window._resize_workspace()
@@ -3917,6 +4241,8 @@ class Application(tk.Tk):
                 grid = getattr(widget, "dashed_grid", None)
                 if grid is not None:
                     grid.schedule()
+                if isinstance(widget, RoundedButton):
+                    widget.remeasure()
         if persist:
             self._save_preferences()
 

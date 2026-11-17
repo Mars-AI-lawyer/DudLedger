@@ -3,11 +3,11 @@
     <style>
       text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #30302C; }
       .title { font-size: 22px; font-weight: 600; }
-      .subtitle { font-size: 12px; fill: #77766F; }
+      .subtitle { font-size: 12px; fill: #6B6962; }
       .page { font-size: 16px; font-weight: 600; }
       .section { font-size: 12px; font-weight: 600; }
       .body { font-size: 12px; }
-      .small { font-size: 11px; fill: #77766F; }
+      .small { font-size: 11px; fill: #6B6962; }
       .nav { font-size: 12px; fill: #53524C; }
       .money { font-family: Menlo, Consolas, monospace; font-size: 12px; text-anchor: end; }
       .line { stroke: #E3E0D7; stroke-width: 1; }
@@ -18,7 +18,8 @@
   </defs>
   <rect width="1440" height="960" fill="#F5F3EC"/>
   <text x="48" y="46" class="title">明细账 · 默认状态</text>
-  <text x="1392" y="44" text-anchor="end" class="subtitle">结构示意，非最终像素稿</text>
+  <text x="1392" y="44" text-anchor="end" class="subtitle">目标方案 · 非当前实现 · 非最终像素稿</text>
+  <text x="48" y="64" class="small">保留＝当前已有　调整＝优化现有　新增＝目标补充</text>
 
   <rect x="48" y="76" width="1344" height="812" rx="6" fill="#FAF9F5" stroke="#D4D0C6"/>
   <rect x="48" y="76" width="176" height="812" rx="6" fill="#F0EEE6"/>
@@ -49,9 +50,10 @@
   <text x="262" y="183" class="body">全部科目</text>
   <text x="414" y="183" text-anchor="end" class="small">⌄</text>
   <rect x="440" y="160" width="714" height="36" rx="4" fill="#FFFFFF" stroke="#A65036"/>
-  <circle cx="463" cy="177" r="6" fill="none" stroke="#77766F" stroke-width="1.4"/>
-  <line x1="467" y1="181" x2="472" y2="186" stroke="#77766F" stroke-width="1.4"/>
+  <circle cx="463" cy="177" r="6" fill="none" stroke="#6B6962" stroke-width="1.4"/>
+  <line x1="467" y1="181" x2="472" y2="186" stroke="#6B6962" stroke-width="1.4"/>
   <text x="482" y="182" class="small">搜索摘要、凭证号、科目、往来单位、辅助核算…</text>
+  <text x="1138" y="179" text-anchor="end" class="small accent-text">新增</text>
   <rect x="1162" y="160" width="102" height="36" rx="4" fill="#FFFFFF" stroke="#D4D0C6"/>
   <text x="1213" y="183" text-anchor="middle" class="body">筛选 2</text>
   <rect x="1272" y="160" width="96" height="36" rx="4" fill="#FAF9F5"/>
@@ -63,6 +65,7 @@
   <rect x="410" y="208" width="172" height="26" rx="4" fill="#F1E3DD"/>
   <text x="422" y="226" class="body accent-text">借方 ≥ 100,000</text>
   <text x="566" y="226" text-anchor="end" class="body accent-text">×</text>
+  <text x="596" y="225" class="small">保留</text>
   <text x="1368" y="226" text-anchor="end" class="small">清除筛选</text>
 
   <rect x="248" y="252" width="1120" height="456" fill="#FFFFFF" stroke="#E3E0D7"/>
@@ -125,5 +128,7 @@
   <text x="248" y="852" class="small">共 41 条 · 当前 1–41 条 · 2 项筛选</text>
   <text x="1368" y="852" text-anchor="end" class="small">第 1 / 1 页　‹ 上一页　下一页 ›</text>
 
-  <text x="48" y="924" class="small">1　搜索与筛选共用清晰上下文　　2　没有激活条件时不占额外高度　　3　操作前持续说明实际凭证范围</text>
+  <text x="48" y="910" class="small">保留：条件 chips、表头筛选/排序、科目范围与跨页勾选。</text>
+  <text x="48" y="928" class="small">新增/调整：通用搜索入口（区域 2）；持续显示实际选择范围来源（区域 3）。</text>
+  <text x="48" y="946" class="small">当前差距：主界面无通用搜索入口；勾选优先于框选，但范围来源提示不足。</text>
 </svg>

@@ -6,7 +6,8 @@ import json
 from .analysis_api import iter_entries
 from .background import check_cancelled, cooperate
 from .dd_features import closing_voucher
-from .related_parties import role_grouped_names
+from .related_parties import review_party_context, role_grouped_names
+from .review_providers import preferred_provider
 from .specialist_rules import account_for, account_prefixes, load_rules, selected_accounts, review_accounts
 from .voucher_notes import voucher_key
 
@@ -16,7 +17,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
     version, rules = load_rules(store)
     from .bailian_review import DEFAULT_ENDPOINT, validate_endpoint
     endpoint = validate_endpoint(scope.get('bailian_endpoint', DEFAULT_ENDPOINT))
-    preferred = 'bailian'
+    preferred = preferred_provider(scope.get('preferred_provider'))
     accounts = selected_accounts(scope.get('review_accounts'), rules)
     available = review_accounts(rules)
     prefixes = account_prefixes(store, rules)
@@ -31,7 +32,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
                 relevant_parties.add(row['counterparty'].strip())
     if not keys:
         raise ValueError('选定范围没有待审查科目的凭证，请检查科目选择、名称或编码设置')
-    parties = role_grouped_names(store.related_parties())
+    parties = review_party_context(store.related_parties())
     # One local pass provides complete vouchers and exact-counterparty history.
     groups, history_index = {}, {}
     for index, row in enumerate(iter_entries(store)):
@@ -47,6 +48,7 @@ def prepare_batch(store, scope, *, cancelled=None, progress=None):
                    'preferred_provider': preferred, 'bailian_endpoint': endpoint,
                    'bailian_free_confirmed': scope.get('bailian_free_confirmed') is True,
                    'data_revision': store.setting('data_revision', '0'),
+                   'party_context_version': 1,
                    'party_hash': digest(parties)}
     hashes = []
     with store.db:
@@ -110,7 +112,9 @@ def snapshot_current(store, info, *, check_entries=True):
     scope = json.loads(info['scope_json'])
     if scope['data_revision'] != store.setting('data_revision', '0'):
         return False
-    if scope['party_hash'] != digest(role_grouped_names(store.related_parties())):
+    parties = (review_party_context(store.related_parties()) if scope.get('party_context_version') == 1
+               else role_grouped_names(store.related_parties()))
+    if scope['party_hash'] != digest(parties):
         return False
     if not check_entries:
         return True

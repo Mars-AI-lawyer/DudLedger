@@ -19,13 +19,13 @@ SURFACE = "#FFFFFF"         # tables, entries, cards
 SUNKEN = "#F5F3EC"          # toolbars, table headers, recessed areas
 HOVER = "#ECE9E1"           # generic hover fill (ghost buttons, list rows)
 SELECTED = "#E2DED3"        # nav / segment selected fill
-ACCENT_SOFT = "#F1E3DD"     # terracotta 10% tint (selected rows, badges)
+ACCENT_SOFT = "#F1E3DD"     # terracotta tint for navigation/badges, not table states
 
 # Text layers
 INK = "#30302C"             # primary text
 INK_SOFT = "#53524C"        # secondary text
-MUTED = "#77766F"           # hint text
-DISABLED = "#9C9A92"        # disabled text
+MUTED = "#6B6962"           # hint text; >= 4.5:1 on Canvas and Sidebar
+DISABLED = "#77746C"        # readable disabled text, with a recessed fill
 
 # Border layers
 BORDER = "#E3E0D7"          # default hairline
@@ -40,13 +40,31 @@ SUCCESS = "#356348"
 WARNING = "#8A6D1A"
 DANGER = "#9E3B2E"
 DANGER_SOFT = "#F7E9E6"
+FOCUS_RING = "#315F78"      # keyboard focus, deliberately cooler than hover
+
+# Table states are separate channels. In particular, a native selected row,
+# a checked voucher, a followed voucher and a rectangular cell range must not
+# share Accent Soft as a catch-all background.
+TABLE_SELECTED = "#E7ECEF"
+TABLE_SELECTED_INK = INK
+TABLE_CHECKED = "#E8F0EA"
+TABLE_CHECKED_INK = "#2F5940"
+TABLE_MARKED = "#F7ECDD"
+TABLE_MARKED_INK = ACCENT_INK
+TABLE_ERROR = DANGER_SOFT
+TABLE_ERROR_INK = DANGER
+TABLE_PENDING = "#F2F4F5"
+RANGE_BORDER = ACCENT
+DEBIT_INK = "#355E70"
+CREDIT_INK = "#776B58"
 
 # ---------------------------------------------------------------------------
 # Radius & spacing tokens (used by widgets.py canvas-drawn components)
 # ---------------------------------------------------------------------------
 
-RADIUS_CONTROL = 8          # buttons, entries, chips
-RADIUS_PANEL = 12           # panels, cards, dialogs
+RADIUS_CONTROL = 4          # ordinary buttons and other compact controls
+RADIUS_POPUP = 6            # menus and small floating surfaces
+RADIUS_PANEL = 12           # existing large panels/cards only
 
 SPACE_1 = 4
 SPACE_2 = 8
@@ -70,6 +88,77 @@ def _mono_family():
     return "TkFixedFont"
 
 
+def treeview_row_height(font, *, compact=False):
+    """Return a density row height from real font metrics, never font size alone.
+
+    The padding preserves the existing 32/27px baseline for a 16px-linespace
+    font while allowing large fonts and CJK fallback fonts to grow naturally.
+    """
+    linespace = max(1, int(font.metrics("linespace")))
+    return max(24 if compact else 30, linespace + (11 if compact else 16))
+
+
+def configure_derived_fonts(root, size=None):
+    """Create or reconfigure every shared derived font as one operation."""
+    base = tkfont.nametofont("TkDefaultFont")
+    size = abs(base.cget("size")) if size is None else int(size)
+    family = base.cget("family")
+    specifications = {
+        "font_body": (family, size, "normal"),
+        "font_small": (family, max(9, size - 1), "normal"),
+        "font_title": (family, size + 2, "bold"),
+        "font_brand": (family, size + 1, "bold"),
+        "font_mono": (family, size, "normal"),
+        "intro_font": (family, size + 3, "bold"),
+        "welcome_font": (family, size + 13, "normal"),
+    }
+    fonts = {}
+    for name, (font_family, font_size, weight) in specifications.items():
+        font = getattr(root, name, None)
+        if font is None:
+            font = tkfont.Font(root=root, family=font_family, size=font_size, weight=weight)
+            setattr(root, name, font)
+        else:
+            font.configure(family=font_family, size=font_size, weight=weight)
+        fonts[name] = font
+    return fonts
+
+
+def configure_treeview_metrics(root):
+    """Synchronize normal/compact table density with the current data font."""
+    style = ttk.Style(root)
+    data_font = getattr(root, "font_body", None) or tkfont.nametofont("TkDefaultFont")
+    # Keep table numbers and text in the original system UI family.
+    metric_fonts = [data_font]
+    body_font = getattr(root, "font_body", None)
+    if body_font is not None and body_font is not data_font:
+        metric_fonts.append(body_font)  # include actual CJK/system-font line height
+    style.configure("Treeview", font=data_font,
+                    rowheight=max(treeview_row_height(font) for font in metric_fonts))
+    style.configure("Compact.Treeview", font=data_font,
+                    rowheight=max(treeview_row_height(font, compact=True) for font in metric_fonts))
+    for name in ("Amount.TEntry", "Amount.TLabel", "Amount.Treeview"):
+        style.configure(name, font=data_font)
+
+
+def configure_table_semantics(view):
+    """Apply shared, independent row-state tags without changing row data."""
+    tags = {
+        "selected": dict(background=TABLE_SELECTED, foreground=TABLE_SELECTED_INK),
+        "checked": dict(background=TABLE_CHECKED, foreground=TABLE_CHECKED_INK),
+        "voucher_checked": dict(background=TABLE_CHECKED, foreground=TABLE_CHECKED_INK),
+        "marked": dict(background=TABLE_MARKED, foreground=TABLE_MARKED_INK),
+        "difference": dict(background=TABLE_ERROR, foreground=TABLE_ERROR_INK),
+        "error": dict(background=TABLE_ERROR, foreground=TABLE_ERROR_INK),
+        "pending": dict(background=TABLE_PENDING, foreground=INK_SOFT),
+        "debit_row": dict(foreground=DEBIT_INK),
+        "credit_row": dict(foreground=CREDIT_INK),
+        "account_parent": dict(foreground=INK_SOFT),
+    }
+    for tag, options in tags.items():
+        view.tag_configure(tag, **options)
+
+
 def configure_theme(root):
     style = ttk.Style(root)
     if "clam" in style.theme_names():
@@ -82,7 +171,7 @@ def configure_theme(root):
     root.option_add("*Text.selectForeground", INK)
     root.option_add("*Text.font", "TkTextFont")
     style.configure(".", background=CANVAS, foreground=INK, bordercolor=BORDER,
-                    lightcolor=CANVAS, darkcolor=BORDER, focuscolor=ACCENT)
+                    lightcolor=CANVAS, darkcolor=BORDER, focuscolor=FOCUS_RING)
     for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label"):
         style.configure(name, background=CANVAS)
     style.configure("Hint.TLabel", foreground=MUTED)
@@ -92,11 +181,11 @@ def configure_theme(root):
     style.configure("TButton", padding=PAD_BUTTON, background=SURFACE, foreground=INK,
                     borderwidth=1, relief="solid", bordercolor=BORDER_STRONG,
                     lightcolor=BORDER_STRONG, darkcolor=BORDER_STRONG,
-                    focusthickness=1, focuscolor=ACCENT)
+                    focusthickness=1, focuscolor=FOCUS_RING)
     style.map("TButton",
               background=[("disabled", SUNKEN), ("pressed", SELECTED), ("active", HOVER)],
               foreground=[("disabled", DISABLED)],
-              bordercolor=[("focus", ACCENT)])
+              bordercolor=[("focus", FOCUS_RING)])
     # Primary: solid terracotta, exactly one per view
     primary_map_bg = [("disabled", "#DDD5CB"), ("pressed", ACCENT_PRESSED), ("active", ACCENT_HOVER)]
     primary_map_fg = [("disabled", MUTED), ("!disabled", "#FFFFFF")]
@@ -109,7 +198,7 @@ def configure_theme(root):
     style.map("Accent.TButton", background=primary_map_bg, foreground=primary_map_fg)
     # Ghost: borderless, hover reveals a soft fill
     style.configure("Ghost.TButton", padding=(SPACE_2, 5), background=CANVAS,
-                    foreground=INK_SOFT, borderwidth=0, relief="flat", focuscolor=ACCENT)
+                    foreground=INK_SOFT, borderwidth=0, relief="flat", focuscolor=FOCUS_RING)
     style.map("Ghost.TButton",
               background=[("disabled", CANVAS), ("pressed", SELECTED), ("active", HOVER)],
               foreground=[("disabled", DISABLED)])
@@ -128,7 +217,7 @@ def configure_theme(root):
     style.configure("TMenubutton", background=CANVAS, padding=(8, 6), relief="flat", borderwidth=0)
     style.configure("TEntry", fieldbackground=SURFACE, padding=6, borderwidth=1,
                     bordercolor=BORDER_STRONG, lightcolor=BORDER_STRONG, darkcolor=BORDER_STRONG)
-    style.map("TEntry", bordercolor=[("focus", ACCENT)])
+    style.map("TEntry", bordercolor=[("focus", FOCUS_RING)])
     style.configure("TCombobox", fieldbackground=SURFACE, background="#F0EEE8", padding=5, arrowsize=12)
     style.map("TCombobox", fieldbackground=[("readonly", SURFACE)],
               selectbackground=[("readonly", SURFACE)], selectforeground=[("readonly", INK)])
@@ -164,12 +253,12 @@ def configure_theme(root):
     style.layout("Workspace.TNotebook.Tab", [])
     style.configure("Workspace.TNotebook", tabmargins=0, borderwidth=0, lightcolor=CANVAS, darkcolor=CANVAS, bordercolor=CANVAS)
     style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=INK,
-                    borderwidth=0, relief="flat", lightcolor=BORDER, darkcolor=BORDER,
-                    rowheight=32)
-    style.configure("Treeview.Heading", background=SUNKEN, foreground="#65635C", padding=(8, 8), relief="flat")
-    style.map("Treeview", background=[("selected", ACCENT_SOFT)], foreground=[("selected", INK)])
-    # Compact variant for space-constrained dialogs (e.g. voucher preview in review detail)
-    style.configure("Compact.Treeview", rowheight=27)
+                    borderwidth=0, relief="flat", lightcolor=BORDER, darkcolor=BORDER)
+    style.configure("Treeview.Heading", background=SUNKEN, foreground=INK_SOFT, padding=(8, 8), relief="flat")
+    style.map("Treeview", background=[("selected", TABLE_SELECTED)],
+              foreground=[("selected", TABLE_SELECTED_INK)])
+    # Compact variant shares the same font and derives its height below.
+    style.configure("Compact.Treeview")
     style.map("Treeview.Heading", background=[("active", "#E9E5DC")])
     for axis in ("Vertical", "Horizontal"):
         style.configure(f"{axis}.TScrollbar", background=BORDER_STRONG, troughcolor=CANVAS,
@@ -181,25 +270,25 @@ def configure_theme(root):
     style.configure("Sidebar.TFrame", background=SIDEBAR)
     style.configure("Sidebar.TLabel", background=SIDEBAR)
     style.configure("SidebarHint.TLabel", background=SIDEBAR, foreground=MUTED)
-    style.configure("Nav.TButton", background=SIDEBAR, anchor="w", padding=(10, 4), focuscolor="#B5AEA0")
+    style.configure("Nav.TButton", background=SIDEBAR, anchor="w", padding=(10, 4), focuscolor=FOCUS_RING)
     style.map("Nav.TButton", background=[("selected", SELECTED), ("active", "#E8E4DB")],
               foreground=[("selected", ACCENT_INK), ("!selected", INK_SOFT)])
-    style.configure("Rail.Nav.TButton", anchor="center", padding=(0, 7))
+    style.configure("Tool.Nav.TButton", background=SIDEBAR, anchor="w", padding=(14, 3),
+                    foreground=MUTED, focuscolor=FOCUS_RING)
+    style.map("Tool.Nav.TButton", background=[("selected", SELECTED), ("active", HOVER)],
+              foreground=[("selected", ACCENT_INK), ("!selected", MUTED)])
+    style.configure("Rail.Nav.TButton", anchor="center", padding=(0, 4))
+    style.configure("Rail.Tool.Nav.TButton", anchor="center", padding=(0, 3), foreground=MUTED)
+    style.configure("Icon.TButton", padding=4)  # 20px icon + padding = >= 28px target
     style.configure("Status.TLabel", foreground=MUTED, padding=(18, 7))
+    style.configure("TableFeedback.TLabel", foreground=INK_SOFT, padding=(5, 3))
+    style.configure("TableFeedback.Warning.TLabel", foreground=WARNING, padding=(5, 3))
 
-    # --- Font tokens (derived from the base size so global 9-20 scaling works)
-    base = tkfont.nametofont("TkDefaultFont")
-    size = abs(base.cget("size"))
-    family = base.cget("family")
-    root.font_body = tkfont.Font(root=root, family=family, size=size)
-    root.font_small = tkfont.Font(root=root, family=family, size=max(9, size - 1))
-    root.font_title = tkfont.Font(root=root, family=family, size=size + 2, weight="bold")
-    root.font_brand = tkfont.Font(root=root, family=family, size=size + 1, weight="bold")
-    root.font_mono = tkfont.Font(root=root, family=_mono_family(), size=max(9, size - 1))
-    root.intro_font = tkfont.Font(root=root, family=family, size=size + 3, weight="bold")
-    root.welcome_font = tkfont.Font(root=root, family=family, size=size + 13)
+    # --- Font tokens (all recreated/reconfigured through one public helper)
+    configure_derived_fonts(root)
     style.configure("Intro.TLabel", font=root.intro_font)
     style.configure("Title.TLabel", font=root.font_title)
     style.configure("Brand.TLabel", background=SIDEBAR, font=root.intro_font)
     style.configure("Welcome.TLabel", font=root.welcome_font)
     style.configure("Mono.TLabel", font=root.font_mono)
+    configure_treeview_metrics(root)

@@ -8,6 +8,8 @@ import tkinter as tk
 from tkinter import ttk
 
 from . import theme
+from .navigation import NavigationTooltip
+from .window_position import constrained_size
 
 
 def cell_number(value: str) -> Decimal:
@@ -91,26 +93,121 @@ def display_number(number: Decimal) -> str:
     return whole + "." + fraction.ljust(2, "0")
 
 
+def amount_kind(column: str, heading: str = "") -> str:
+    """Classify the accounting basis without changing the arithmetic rules."""
+    key = column.lower()
+    if key in {"original", "original_amount"} or "原币" in heading:
+        return "original"
+    if key in {"debit", "od", "pd", "yd", "cd"} or "借方" in heading:
+        return "debit"
+    if key in {"credit", "oc", "pc", "yc", "cc"} or "贷方" in heading:
+        return "credit"
+    return "amount"
+
+
+@dataclass(frozen=True)
+class SelectionGroup:
+    label: str
+    kind: str
+    count: int
+    total: Decimal
+
+
+@dataclass(frozen=True)
+class SelectionComposition:
+    groups: tuple[SelectionGroup, ...] = ()
+    currencies: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def mixed_directions(self):
+        kinds = {group.kind for group in self.groups}
+        return "debit" in kinds and "credit" in kinds
+
+    @property
+    def mixed_basis(self):
+        kinds = {group.kind for group in self.groups}
+        return "original" in kinds and len(kinds) > 1
+
+    @property
+    def multi_currency(self):
+        return len(self.currencies) > 1
+
+    @property
+    def text(self):
+        return " · ".join(f"{group.label} {display_number(group.total)}（{group.count} 项）"
+                          for group in self.groups)
+
+    @property
+    def warning_text(self):
+        return "；".join(self.warnings)
+
+
+def selection_composition(samples):
+    """Group `(column, heading, Decimal value, currency)` samples for display.
+
+    The all-selection total and committed snapshots remain unchanged; these
+    groups only explain what that total contains.
+    """
+    totals = {}
+    counts = {}
+    kinds = {}
+    currencies = []
+    for column, heading, value, currency in samples:
+        label = str(heading or column)
+        kind = amount_kind(column, label)
+        kinds[label] = kind
+        counts[label] = counts.get(label, 0) + 1
+        calculation = totals.setdefault(label, Calculation())
+        calculation.add(1, str(value), "")
+        # Debit/credit columns are base-currency amounts even when the row's
+        # original document currency differs. Only original amounts use it.
+        if kind == "original" and currency is not None:
+            currency = str(currency).strip() or "币种未注明"
+            if currency not in currencies:
+                currencies.append(currency)
+    groups = tuple(SelectionGroup(label, kinds[label], counts[label], calculation.total)
+                   for label, calculation in totals.items())
+    composition = SelectionComposition(groups, tuple(currencies))
+    warnings = []
+    if composition.mixed_directions:
+        warnings.append("借方与贷方为算术合计，不是借贷净额")
+    if composition.mixed_basis:
+        warnings.append("原币与本币金额混合，未换算")
+    if composition.multi_currency:
+        warnings.append("多币种金额未折算：" + "、".join(currencies))
+    return SelectionComposition(groups, tuple(currencies), tuple(warnings))
+
+
 @dataclass
 class SelectionSummary:
     cells: int = 0
     count: int = 0
     numbers: int = 0
     total: Decimal = Decimal(0)
+    composition: SelectionComposition = SelectionComposition()
 
 
 class TableTools:
     """Track disjoint rectangles in displayed order, independently of row focus."""
 
     def __init__(self, view: ttk.Treeview, money_columns: set[str], *, source_for_row=None,
-                 on_visibility_changed=None, panel_parent=None, on_toggle=None, show_stats=True):
+                 on_visibility_changed=None, panel_parent=None, on_toggle=None, show_stats=True,
+                 footer_parent=None, merged_feedback=False):
         self.view = view
         view.cell_tools = self
+        theme.configure_table_semantics(view)
         self.money_columns = money_columns
-        self.selection_hint = "拖动框选；Ctrl / ⌘ 追加选区；Esc 清空；Ctrl+C / ⌘C 复制"
+        self.selection_hint = "拖动框选；Ctrl / ⌘ 追加选区；Shift 扩展；Esc 清空；Ctrl+C / ⌘C 复制"
+        self.idle_hint = "" if merged_feedback else ("框选金额查看合计" if money_columns else "框选单元格可复制")
         self.source_for_row = source_for_row
         self.on_visibility_changed = on_visibility_changed
         self.on_toggle = on_toggle
+        self.merged_feedback = merged_feedback
+        owner = view.winfo_toplevel()
+        controller = getattr(owner, "controller", None) or getattr(getattr(owner, "ledger_app", None), "controller", None)
+        self.title_font = getattr(controller, "font_title", None)
+        self.section_font = getattr(controller, "font_brand", None)
         self.active: tuple[str, str] | None = None
         self.anchor: tuple[str, str] | None = None
         self.saved_ranges = []
@@ -126,10 +223,31 @@ class TableTools:
         self._height_before_open = None
         self._grown_height = None
         self.job = None
-        self.stats = tk.StringVar(value=self.selection_hint)
+        self._feedback_job = None
+        self._feedback_active = False
+        self._selection_stats = self.idle_hint
+        self.stats = tk.StringVar(value=self.idle_hint)
+        self.footer = self.stats_label = self.help_button = self.clear_selection_button = None
+        self.help_tooltip = None
         if show_stats:
-            ttk.Label(view.master, textvariable=self.stats, padding=(5, 4), anchor="w").grid(
-                row=2, column=0, columnspan=2, sticky="ew")
+            self.footer = ttk.Frame(footer_parent if footer_parent is not None else view.master)
+            if footer_parent is None:
+                self.footer.grid(row=2, column=0, columnspan=2, sticky="ew")
+            else:
+                self.footer.pack(fill="x")
+            self.footer.columnconfigure(0, weight=1)
+            self.stats_label = ttk.Label(self.footer, textvariable=self.stats, anchor="w",
+                                         style="TableFeedback.TLabel")
+            self.stats_label.grid(row=0, column=0, sticky="ew")
+            self.clear_selection_button = ttk.Button(self.footer, text="清空", width=0,
+                                                     style="Ghost.TButton", command=self.reset_selection)
+            self.help_button = ttk.Button(self.footer, text="?", width=3, style="Ghost.TButton")
+            self.clear_selection_button.grid(row=0, column=1, sticky="e")
+            self.clear_selection_button.grid_remove()
+            self.help_button.grid(row=0, column=2, sticky="e")
+            self.help_tooltip = NavigationTooltip(view.winfo_toplevel())
+            self.help_tooltip.attach(self.help_button, lambda: self.selection_hint)
+            self.help_button.configure(command=self._toggle_selection_help)
         self.panel = ttk.Frame(panel_parent if panel_parent is not None else view.master, padding=(12, 8), width=270)
         self.panel.grid(row=0, column=2, rowspan=2, sticky="nsew")
         self.panel.grid_remove()
@@ -137,17 +255,23 @@ class TableTools:
         self.panel.rowconfigure(4, weight=1)
         top = ttk.Frame(self.panel)
         top.grid(row=0, column=0, sticky="ew")
-        ttk.Label(top, text="计算器", font=("", 12, "bold")).pack(side="left")
+        ttk.Label(top, text="计算器", font=self.title_font).pack(side="left")
         ttk.Button(top, text="收起", width=4, style="Ghost.TButton", command=self.toggle).pack(side="right")
         selection = ttk.Frame(self.panel)
         selection.grid(row=1, column=0, sticky="ew", pady=(8, 6))
-        ttk.Label(selection, text="当前选区", font=("", 11, "bold")).pack(anchor="w")
+        ttk.Label(selection, text="当前选区", font=self.section_font).pack(anchor="w")
         self.selected = tk.StringVar(value="拖动框选一段金额")
         self.selection_label = ttk.Label(selection, textvariable=self.selected, wraplength=245, justify="left")
         self.selection_label.pack(anchor="w", pady=(3, 5))
+        self.composition = tk.StringVar()
+        self.composition_label = ttk.Label(selection, textvariable=self.composition, wraplength=245,
+                                           justify="left", foreground=theme.MUTED)
         self.selection_total = tk.StringVar(value="—")
         self.selection_total_entry = ttk.Entry(selection, textvariable=self.selection_total,
-                                                state="readonly", justify="right", width=24)
+                                                state="readonly", justify="right", width=24,
+                                                style="Amount.TEntry")
+        # An empty composition must not consume five pixels in short dialogs.
+        # It is inserted above the already-packed total only when data exists.
         self.selection_total_entry.pack(fill="x")
         for event in ("<Control-c>", "<Command-c>"):
             self.selection_total_entry.bind(event, lambda _event: self._copy_entry(self.selection_total_entry))
@@ -157,13 +281,14 @@ class TableTools:
         self.plus.pack(side="left", fill="x", expand=True)
         self.minus = ttk.Button(operations, text="－ 减去", width=8, command=lambda: self.calculate(-1), state="disabled")
         self.minus.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        history_title = ttk.Label(self.panel, text="计算过程", font=("", 11, "bold"))
+        history_title = ttk.Label(self.panel, text="计算过程", font=self.section_font)
         history_title.grid(row=3, column=0, sticky="w", pady=(12, 5))
         history_holder = ttk.Frame(self.panel)
         history_holder.grid(row=4, column=0, sticky="nsew")
         history_holder.rowconfigure(0, weight=1)
         history_holder.columnconfigure(0, weight=1)
-        self.history = ttk.Treeview(history_holder, columns=("operation", "amount"), show="", height=3, selectmode="browse")
+        self.history = ttk.Treeview(history_holder, columns=("operation", "amount"), show="", height=3,
+                                    selectmode="browse", style="Amount.Treeview")
         self.history.column("operation", width=145, minwidth=120)
         self.history.column("amount", width=115, minwidth=95, anchor="e")
         scroll = ttk.Scrollbar(history_holder, command=self.history.yview)
@@ -174,13 +299,14 @@ class TableTools:
         horizontal.grid(row=1, column=0, sticky="ew")
         self.history.bind("<<TreeviewSelect>>", self._show_history_detail)
         self.history_detail = tk.Text(self.panel, height=2, width=28, wrap="word", state="disabled",
-                                      relief="flat", borderwidth=0, font="TkTextFont", background="#FAF9F5")
+                                      relief="flat", borderwidth=0, font="TkTextFont", background=theme.CANVAS)
         self.history_detail.grid(row=5, column=0, sticky="ew", pady=(5, 8))
         self._set_history_detail("点击加或减，将当前选区记入计算。")
-        result_title = ttk.Label(self.panel, text="累计结果", font=("", 11, "bold"))
+        result_title = ttk.Label(self.panel, text="累计结果", font=self.section_font)
         result_title.grid(row=6, column=0, sticky="w")
         self.result = tk.StringVar(value="0.00")
-        self.result_entry = ttk.Entry(self.panel, textvariable=self.result, state="readonly", justify="right", width=24)
+        self.result_entry = ttk.Entry(self.panel, textvariable=self.result, state="readonly", justify="right",
+                                      width=24, style="Amount.TEntry")
         self.result_entry.grid(row=7, column=0, sticky="ew", pady=(3, 8))
         for event in ("<Control-c>", "<Command-c>"):
             self.result_entry.bind(event, self._copy_result_selection)
@@ -212,7 +338,7 @@ class TableTools:
         view.bind("<ButtonRelease-1>", self._release, add="+")
         for event in ("<Button-3>", "<Button-2>"):
             view.bind(event, self._context, add="+")
-        view.bind("<Escape>", lambda _event: self.reset_selection())
+        view.bind("<Escape>", self._escape)
         for event in ("<Command-c>", "<Control-c>", "<<Copy>>"):
             view.bind(event, self.copy_cell)
         for event in ("<Configure>", "<Map>", "<ButtonRelease-1>"):
@@ -221,6 +347,67 @@ class TableTools:
             view.bind(f"<{direction}>", lambda event, step=direction: self._move(step))
             view.bind(f"<Shift-{direction}>", lambda event, step=direction: self._move(step, extend=True))
         view.bind("<Destroy>", self._destroy, add="+")
+
+    def _toggle_selection_help(self):
+        if self.help_tooltip is None:
+            return
+        if self.help_tooltip.window is not None:
+            self.help_tooltip.hide()
+        else:
+            self.help_tooltip._show(self.help_button, lambda: self.selection_hint)
+
+    def _set_selection_stats(self, text):
+        self._selection_stats = text
+        if not self._feedback_active:
+            self.stats.set(text)
+            if self.stats_label is not None:
+                warning = bool(self.summary.composition.warnings)
+                self.stats_label.configure(style="TableFeedback.Warning.TLabel" if warning
+                                           else "TableFeedback.TLabel")
+
+    def _sync_selection_action(self):
+        if self.clear_selection_button is not None:
+            if self.summary.cells:
+                self.clear_selection_button.grid()
+            else:
+                self.clear_selection_button.grid_remove()
+
+    def _render_composition(self, text, *, warning=False):
+        self.composition.set(text)
+        self.composition_label.configure(foreground=theme.WARNING if warning else theme.MUTED)
+        if text:
+            if not self.composition_label.winfo_manager():
+                self.composition_label.pack(anchor="w", pady=(0, 5),
+                                            before=self.selection_total_entry)
+        else:
+            self.composition_label.pack_forget()
+
+    def show_feedback(self, text, *, tone="info", duration=4000):
+        """Use the table footer for transient/global feedback, not another row."""
+        if self._feedback_job is not None:
+            self.view.after_cancel(self._feedback_job)
+            self._feedback_job = None
+        if not text:
+            self.clear_feedback()
+            return
+        self._feedback_active = True
+        self.stats.set(str(text))
+        if self.stats_label is not None:
+            self.stats_label.configure(style="TableFeedback.Warning.TLabel" if tone in ("warning", "error")
+                                       else "TableFeedback.TLabel")
+        if duration is not None:
+            self._feedback_job = self.view.after(max(0, int(duration)), self._feedback_expired)
+
+    def _feedback_expired(self):
+        self._feedback_job = None
+        self.clear_feedback()
+
+    def clear_feedback(self):
+        if self._feedback_job is not None:
+            self.view.after_cancel(self._feedback_job)
+            self._feedback_job = None
+        self._feedback_active = False
+        self._set_selection_stats(self._selection_stats)
 
     def columns(self):
         columns = self.view.cget("displaycolumns")
@@ -419,25 +606,46 @@ class TableTools:
             return
         summary = SelectionSummary(cells=len(self.selected_cells()))
         numbers = Calculation()
-        for _row, column, value in self._selected_values():
+        samples = []
+        has_currency = "currency" in tuple(self.view.cget("columns"))
+        currencies = dict(zip(rows, self._values(rows, ("currency",)))) if has_currency else {}
+        for row, column, value in self._selected_values():
             if value.strip():
                 summary.count += 1
             if column in self.money_columns:
                 try:
-                    numbers.add(1, value, "")
+                    number = cell_number(value)
                 except ValueError:
                     continue
+                numbers.add(1, str(number), "")
                 summary.numbers += 1
+                heading = str(self.view.heading(column, "text"))
+                currency = currencies.get(row, [""])[0] if has_currency else None
+                samples.append((column, heading, number, currency))
         summary.total = numbers.total
+        summary.composition = selection_composition(samples)
         self.summary = summary
         self.summary_dirty = False
         stats = f"合计 {display_number(summary.total)}   计数 {summary.count}   金额 {summary.numbers} 项"
-        self.stats.set(stats if self.money_columns else f"已选 {summary.cells} 格 · 可复制")
+        if not self.money_columns:
+            stats = f"已选 {summary.cells} 格 · 可复制"
         ranges = len(self.selection_ranges())
-        self.selected.set(f"{ranges} 个选区 · {summary.numbers} 项金额 · 计数 {summary.count}")
         if ranges > 1:
-            self.stats.set(f"{ranges} 个选区 · " + self.stats.get())
+            stats = f"{ranges} 个选区 · " + stats
+        if summary.composition.mixed_directions:
+            stats += " · 借贷非净额"
+        if summary.composition.mixed_basis:
+            stats += " · 原币/本币未换算"
+        if summary.composition.multi_currency:
+            stats += " · 多币种未折算"
+        self._set_selection_stats(stats)
+        self.selected.set(f"{ranges} 个选区 · {summary.numbers} 项金额 · 计数 {summary.count}")
+        composition = summary.composition.text
+        if summary.composition.warnings:
+            composition += ("\n" if composition else "") + "提醒：" + summary.composition.warning_text
+        self._render_composition(composition, warning=bool(summary.composition.warnings))
         self.selection_total.set(display_number(summary.total) if summary.numbers else "—")
+        self._sync_selection_action()
         if hasattr(self.view, "voucher_selection"):
             self.view.voucher_selection.changed()
         usable = summary.numbers > 0
@@ -557,7 +765,7 @@ class TableTools:
         self._compact_width = width
         compact = width is not None
         self.panel.configure(padding=(8, 8) if compact else (12, 8))
-        for label in (self.selection_label, self.hint):
+        for label in (self.selection_label, self.composition_label, self.hint):
             label.configure(wraplength=width - 20 if compact else 245)
         for entry in (self.selection_total_entry, self.result_entry):
             entry.configure(width=1 if compact else 24)
@@ -589,7 +797,10 @@ class TableTools:
         owner = self.view.winfo_toplevel()
         if visible:
             owner.update_idletasks()
-            desired = min(owner.winfo_reqheight(), owner.winfo_screenheight() - 100)
+            _width, desired = constrained_size(
+                owner.winfo_width(), owner.winfo_reqheight(),
+                owner.winfo_screenwidth(), owner.winfo_screenheight(),
+                horizontal_margin=0, vertical_margin=100)
             if desired > owner.winfo_height():
                 self._height_before_open = owner.winfo_height()
                 self._grown_height = desired
@@ -601,6 +812,8 @@ class TableTools:
         self.schedule()
 
     def _move(self, direction, extend=False):
+        if not self.active or self.value() is None:
+            return None
         if self.active and self.value() is not None:
             row, column = self.active
             columns = self.columns()
@@ -620,6 +833,12 @@ class TableTools:
             self.select(row, column, extend=extend)
         return "break"
 
+    def _escape(self, _event=None):
+        if self.active or self.saved_ranges:
+            self.reset_selection()
+            return 'break'
+        return None
+
     def reset_selection(self):
         self._stop_scroll()
         self.dragging = False
@@ -629,9 +848,11 @@ class TableTools:
         self.row_cache.clear()
         self.summary = SelectionSummary()
         self.summary_dirty = False
-        self.stats.set(self.selection_hint)
+        self._set_selection_stats(self.idle_hint)
         self.selected.set("拖动框选一段金额")
+        self._render_composition("")
         self.selection_total.set("—")
+        self._sync_selection_action()
         if hasattr(self.view, "voucher_selection"):
             self.view.voucher_selection.changed()
         for button in (self.plus, self.minus):
@@ -668,7 +889,7 @@ class TableTools:
 
     def _ensure_borders(self, count):
         while len(self.borders) < count:
-            border = tk.Frame(self.view, background=theme.ACCENT, borderwidth=0)
+            border = tk.Frame(self.view, background=theme.RANGE_BORDER, borderwidth=0)
             self.borders.append(border)
             border.bind("<Button-1>", self._click)
             border.bind("<B1-Motion>", self._drag)
@@ -714,3 +935,8 @@ class TableTools:
             if self.job is not None:
                 self.view.after_cancel(self.job)
                 self.job = None
+            if self._feedback_job is not None:
+                self.view.after_cancel(self._feedback_job)
+                self._feedback_job = None
+            if self.help_tooltip is not None:
+                self.help_tooltip.hide()

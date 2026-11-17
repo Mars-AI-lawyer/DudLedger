@@ -278,16 +278,21 @@ class TableToolsUiTest(unittest.TestCase):
         self.assertEqual(list(csv.reader(io.StringIO(copy.call_args.args[0]), delimiter="\t")),
                          [["有制表符\t和换行\n的摘要", "0.10"], ["另一条摘要", ""]])
 
-    def test_range_invalidates_on_sort_and_heading_mouse_release_still_sorts(self):
+    def test_range_invalidates_when_sorting_through_filter_dialog(self):
         self.view.configure(displaycolumns=("credit", "debit"))
         self.root.update()
         first, second = self.view.get_children()
         self.tools.select(first, "debit")
         self.tools.select(second, "debit", extend=True)
-        self.view.event_generate("<Button-1>", x=self.view.column("#0", "width")+30, y=8)
-        self.view.event_generate("<ButtonRelease-1>", x=self.view.column("#0", "width")+30, y=8)
+        self.window._open_detail_filter('credit')
+        dialog = next(child for child in self.window.winfo_children()
+                      if child.winfo_exists() and child.title() == '明细账 · 列筛选')
+        ascending = next(button for button in dialog.sorting.winfo_children()
+                         if isinstance(button, ttk.Button) and button.cget('text').startswith('↑'))
+        ascending.invoke()
         self.root.update()
         self.assertEqual(self.window.detail_sort, "credit")
+        self.assertFalse(self.window.detail_descending)
         self.assertIsNone(self.tools.anchor)
         self.assertEqual(self.tools.summary.cells, 0)
 

@@ -11,6 +11,14 @@ from tests.import_ui_helpers import ImportUiCase
 
 
 class ImportDialogTest(ImportUiCase):
+    def test_manual_mode_uses_local_rules_without_calling_ai(self):
+        dialog = self.dialog(ai=False)
+        self.wait_review(dialog)
+        self.assertTrue(dialog.local_mode)
+        self.suggest.assert_not_called()
+        self.assertTrue(dialog.reviews[0].ready)
+        self.assertEqual(self.window.store.sources(), [])
+
     def test_file_selection_automatically_reviews_without_writing_and_confirmation_reuses_result(self):
         dialog = self.dialog()
         self.wait_review(dialog)

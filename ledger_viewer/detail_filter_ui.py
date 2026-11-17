@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import ttk
 
+from . import theme
 from .background import BackgroundTasks
 from .detail_filters import make_condition
 from .store import LedgerStore
@@ -17,10 +18,10 @@ def filter_arrow(view, active=False):
     for row in range(6):
         left, right = 3 + row, 14 - row
         if active or row == 0:
-            image.put("#87523D" if active else "#77766F", to=(left, row + 2, right + 1, row + 3))
+            image.put(theme.ACCENT_INK if active else theme.MUTED, to=(left, row + 2, right + 1, row + 3))
         else:
             for x in (left, right):
-                image.put("#77766F", (x, row + 2))
+                image.put(theme.MUTED, (x, row + 2))
     return image
 
 
@@ -93,7 +94,7 @@ class DetailFilterDialog(tk.Toplevel):
         self.editor = ttk.Frame(body)
         self.editor.pack(fill='x')
         self.error = tk.StringVar(self)
-        ttk.Label(body, textvariable=self.error, foreground='#A65036', wraplength=360).pack(anchor='w', pady=(6, 0))
+        ttk.Label(body, textvariable=self.error, foreground=theme.DANGER, wraplength=360).pack(anchor='w', pady=(6, 0))
         footer = ttk.Frame(body)
         footer.pack(fill='x', pady=(8, 0))
         self.clear = ttk.Button(footer, text='清除此列条件', command=self._clear)

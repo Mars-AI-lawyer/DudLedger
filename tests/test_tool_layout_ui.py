@@ -8,6 +8,7 @@ from openpyxl import Workbook
 
 from ledger_viewer.importer import classify_sheet
 from ledger_viewer.ui import Application, SettingsDialog, visible_columns
+from ledger_viewer.table_layout import readable_minimum
 
 
 class ToolLayoutUITest(unittest.TestCase):
@@ -37,8 +38,11 @@ class ToolLayoutUITest(unittest.TestCase):
         self.root.update()
 
     def assert_fitted(self, view):
-        self.assertEqual(view.xview(), (0.0, 1.0))
-        self.assertLessEqual(sum(view.column(key, 'width') for key in self.app.table_fit.columns(view)), view.winfo_width() - 2)
+        # Critical narrative and amount columns keep readable minima; overflow
+        # intentionally uses the existing horizontal scrollbar.
+        for key in self.app.table_fit.columns(view):
+            self.assertGreaterEqual(view.column(key, 'width'), readable_minimum(key, view.column(key, 'minwidth')))
+        self.assertLessEqual(view.xview()[0], view.xview()[1])
 
     def test_main_columns_fit_both_tools_and_restore_after_closing(self):
         view = self.app.detail_view
@@ -82,12 +86,12 @@ class ToolLayoutUITest(unittest.TestCase):
         self.root.update()
         self.assertEqual(panel.winfo_width(), saved_calc_width)
 
-    def test_source_column_stays_hidden_for_saved_vouchers_and_imported_reports(self):
-        self.assertEqual(visible_columns('voucher', ['code', 'debit', 'source']), ['code', 'debit'])
+    def test_voucher_source_can_be_enabled_and_imported_reports_stay_compact(self):
+        self.assertEqual(visible_columns('voucher', ['code', 'debit', 'source']), ['code', 'debit', 'source'])
         self.app.store.save_display_columns('voucher', ['code', 'debit', 'source'])
         self.app.open_voucher(None, entry_id=self.app.store.entries()[0]['id'])
         dialog = next(iter(self.app.voucher_windows))
-        self.assertNotIn('source', dialog.cell_tools.columns())
+        self.assertIn('source', dialog.cell_tools.columns())
         book = Workbook()
         sheet = book.active
         sheet.title = '资产负债表'

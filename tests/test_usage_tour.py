@@ -137,7 +137,7 @@ class SpotlightTourTest(unittest.TestCase):
         self.assertIs(self.window.show_usage_tour(), replay)
         replay.skip()
         self.assertIsNone(self.root.offer_ai_setup())
-        self.assertFalse(self.window._sidebar_expanded)
+        self.assertTrue(self.window._sidebar_expanded)
 
     def test_closing_owner_cleans_layers_without_marking_tour_done(self):
         tour = self.root.offer_ai_setup()

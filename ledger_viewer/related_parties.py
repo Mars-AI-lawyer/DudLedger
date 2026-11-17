@@ -159,22 +159,37 @@ def parse_party_names(text: str) -> list[str]:
     return names
 
 
+def review_party_context(parties: list) -> dict:
+    """Keep each identity, alias and user relationship together; exclude private notes."""
+    records = []
+    for party in parties:
+        names = party_names([party])
+        if not names:
+            continue
+        records.append({'name': names[0], 'aliases': names[1:], 'roles': party_roles(party),
+                        'relation': (party['relation'] or '').strip() if 'relation' in party.keys() else ''})
+    return {'parties': records}
+
+
 def parse_party_lines(text: str) -> list[tuple[str, list[str]]]:
     """One party per line: “名称” or “名称｜股东,董事”; invalid roles are dropped."""
-    entries: list[tuple[str, list[str]]] = []
+    return [(name, roles) for name, roles, _relation in parse_party_records(text)]
+
+
+def parse_party_records(text: str) -> list[tuple[str, list[str], str]]:
+    """Parse editable name | roles | relationship records without losing relationships."""
+    entries = []
     seen: set[str] = set()
     for line in text.splitlines():
         value = unicodedata.normalize("NFKC", line or "").strip()
         if not value:
             continue
-        name, separator, role_text = value.partition("｜")
-        if not separator:
-            name, separator, role_text = value.partition("|")
-        name = name.strip()
+        parts = re.split(r'[|｜]', value, maxsplit=2)
+        name = parts[0].strip()
         if not name or normalized_name(name) in seen:
             continue
         seen.add(normalized_name(name))
-        entries.append((name, parse_roles(role_text) if separator else []))
+        entries.append((name, parse_roles(parts[1]) if len(parts) > 1 else [], parts[2].strip() if len(parts) > 2 else ''))
     return entries
 
 
@@ -186,27 +201,50 @@ def party_entries_from_file(path) -> list[tuple[str, list[str]]]:
     The first non-empty cell is the name; when a second non-empty cell parses
     as known role words (e.g. “股东,董事”), it becomes the party's roles.
     """
+    return [(name, roles) for name, roles, _relation in party_records_from_file(path)]
+
+
+def party_records_from_file(path) -> list[tuple[str, list[str], str]]:
+    """Read named columns, retaining empty role cells and explicit relationships."""
     path = Path(path)
     if path.suffix.lower() == ".txt":
-        return parse_party_lines(path.read_text(encoding="utf-8-sig", errors="replace"))
+        return parse_party_records(path.read_text(encoding="utf-8-sig", errors="replace"))
     from .importer import rows, sheet_names
 
-    entries: list[tuple[str, list[str]]] = []
+    entries = []
     seen: set[str] = set()
     sheet = "CSV" if path.suffix.lower() == ".csv" else sheet_names(path)[0]
+    columns = None
+    first = True
     for _row_no, values in rows(path, sheet):
-        cells = [unicodedata.normalize("NFKC", str(value)).strip() for value in values
-                 if value is not None and str(value).strip()]
-        if not cells:
+        cells = [unicodedata.normalize("NFKC", str(value)).strip() if value is not None else '' for value in values]
+        if not any(cells):
             continue
-        name = cells[0]
-        roles = parse_roles(cells[1]) if len(cells) > 1 else []
+        if first:
+            first = False
+            name_col = next((i for i, cell in enumerate(cells) if cell.casefold() in _HEADERS), None)
+            if name_col is not None:
+                columns = {'name': name_col,
+                           'roles': next((i for i, cell in enumerate(cells) if cell in ('身份', '身份类型', '角色', 'roles')), None),
+                           'relation': next((i for i, cell in enumerate(cells) if cell in ('与目标公司关系', '关系', '关联关系', 'relation')), None)}
+                continue
+        def cell_at(index):
+            return cells[index] if index is not None and index < len(cells) else ''
+        if columns is None:
+            name_index = next(i for i, cell in enumerate(cells) if cell)
+            name = cells[name_index]
+            roles = parse_roles(cell_at(name_index + 1))
+            relation = cell_at(name_index + 2)
+        else:
+            name = cell_at(columns['name'])
+            roles = parse_roles(cell_at(columns['roles']))
+            relation = cell_at(columns['relation'])
+        if not name:
+            continue
         if normalized_name(name) in seen:
             continue
         seen.add(normalized_name(name))
-        entries.append((name, roles))
-    if entries and entries[0][0].casefold() in _HEADERS:
-        entries = entries[1:]
+        entries.append((name, roles, relation))
     return entries
 
 def party_names_from_file(path) -> list[str]:

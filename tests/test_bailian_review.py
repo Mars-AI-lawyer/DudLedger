@@ -48,10 +48,42 @@ class BailianReviewTest(unittest.TestCase):
         group = voucher_results(self.store, batch)[0]
         self.assertIn('bailian', group['categories'][0][2])
 
-    def test_legacy_jev_preference_keeps_bailian_first(self):
+    def test_jev_preference_runs_jev_before_bailian(self):
         self.run_case({'review_accounts':['其他应付款'], 'preferred_provider':'jev'})
-        self.assertFalse(existing.JevClient.calls)
+        self.assertEqual(len(existing.JevClient.calls), 1)
+        self.assertFalse(self.bailian_calls)
+
+    def test_changing_preference_does_not_reuse_bailian_cache_for_jev(self):
+        self.run_case()
+        batch = self.run_case({'review_accounts': ['其他应付款'], 'preferred_provider': 'jev'})
+        self.assertEqual(batch_counts(self.store, batch)['cached'], 0)
+        self.assertEqual(voucher_results(self.store, batch)[0]['provider'], 'jev')
+        self.assertEqual(json.loads(batch_info(self.store, batch)['scope_json'])['preferred_provider'], 'jev')
+
+    def test_jev_quota_falls_back_to_bailian_when_jev_is_preferred(self):
+        class JevQuota(Exception):
+            status_code = 402
+        existing.JevClient.error = JevQuota('quota')
+        batch = self.run_case({'review_accounts': ['其他应付款'], 'preferred_provider': 'jev'})
+        self.assertEqual(voucher_results(self.store, batch)[0]['provider'], 'bailian')
         self.assertEqual(len(self.bailian_calls), 1)
+        self.assertFalse(self.flash_calls)
+
+    def test_related_party_context_reaches_each_provider_and_excludes_notes(self):
+        self.store.save_related_party('虚构股东甲', ['甲先生'], '内部备注不发送', None, ['股东'], '持股30%')
+        expected = {'parties': [{'name': '虚构股东甲', 'aliases': ['甲先生'], 'roles': ['股东'], 'relation': '持股30%'}]}
+        for provider in ('bailian', 'jev', 'deepseek'):
+            with self.subTest(provider=provider):
+                self.run_case({'review_accounts': ['其他应付款'], 'preferred_provider': 'jev' if provider == 'jev' else 'bailian'},
+                    jev='key' if provider == 'jev' else '', bailian='key' if provider == 'bailian' else '')
+                if provider == 'bailian':
+                    state = self.bailian_calls[-1]['state']
+                elif provider == 'jev':
+                    state = existing.JevClient.calls[-1][0]
+                else:
+                    state = json.loads(self.flash_calls[-1]['messages'][1]['content'])
+                self.assertEqual(state['related_parties'], expected)
+                self.assertNotIn('内部备注不发送', json.dumps(state, ensure_ascii=False))
 
     def test_missing_bailian_falls_back_to_jev_then_missing_both_to_flash(self):
         self.run_case(bailian='')
