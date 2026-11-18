@@ -160,7 +160,8 @@ def create_book(plan_path: Path, output: Path, accept_warnings: bool = False) ->
                 raise ValueError("账套完整性检查未通过")
         finally:
             store.close()
-        with temporary.open("rb") as handle:
+        # Windows requires a writable handle to flush the completed database.
+        with temporary.open("r+b") as handle:
             os.fsync(handle.fileno())
         # Atomic and non-overwriting, including when another process creates the target.
         os.link(temporary, output)
