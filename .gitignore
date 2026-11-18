@@ -8,8 +8,16 @@ dist/
 *.sqlite-*
 .DS_Store
 
-# AI 工作区记忆（本地记录，不入库）
+# 本机工具配置与工作记录
 .workbuddy/
+/.git-auto.json
+/.zcode/
+/.zcodeignore
+/AGENTS.md
+/agents.md
+
+# 旧版根目录图标，程序与打包共用应用资源中的图标
+/图标.png
 
 # 密钥与凭据：一律不入库
 .env

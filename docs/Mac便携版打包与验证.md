@@ -1,6 +1,6 @@
 # Mac 便携版打包与验证
 
-本次版本为 0.3.0，制作于 2026 年 11 月 12 日。面向 Apple 芯片 Mac（arm64），已在本机 macOS 26.6 验证启动。尚未验证其他 macOS 版本；未提供 Intel 版。图标使用项目根目录的 `图标.png`。
+本次版本为 0.3.0，制作于 2026 年 11 月 12 日。面向 Apple 芯片 Mac（arm64），已在本机 macOS 26.6 验证启动。尚未验证其他 macOS 版本；未提供 Intel 版。当前打包脚本与应用共用 `ledger_viewer/resources/icon-beta.png`。
 
 ## 使用
 

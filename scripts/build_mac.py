@@ -34,11 +34,12 @@ def main():
         shutil.copyfile(ROOT / "ledger_viewer" / name, target)
     iconset = WORK / "DudLedger.iconset"
     iconset.mkdir(exist_ok=True)
+    icon_source = package / "resources" / "icon-beta.png"
     for size in (16, 32, 128, 256, 512):
         for scale in (1, 2):
             suffix = "@2x" if scale == 2 else ""
             run("sips", "-z", size * scale, size * scale,
-                ROOT / "图标.png", "--out", iconset / f"icon_{size}x{size}{suffix}.png")
+                icon_source, "--out", iconset / f"icon_{size}x{size}{suffix}.png")
     run("iconutil", "-c", "icns", iconset, "-o", WORK / "DudLedger.icns")
     run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--distpath", ROOT / "dist", "--workpath", WORK / "pyinstaller",
