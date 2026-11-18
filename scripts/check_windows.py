@@ -8,12 +8,10 @@ import tempfile
 from pathlib import Path
 
 from audit_mac import audit_bundle
-from build_windows import RESOURCES
+from build_windows import MANUAL, RESOURCES, ROOT, SAMPLE_BOOK, SAMPLE_ENTRY, SAMPLE_FILES
 from ledger_viewer.importer import file_hash
 from ledger_viewer.store import LedgerStore
 
-ROOT = Path(__file__).resolve().parents[1]
-SAMPLE = ROOT / '模拟账套' / '模拟数据_序时账.xlsx'
 ROW_COUNT = 1238
 TOTAL_CENTS = 5423636800
 
@@ -29,9 +27,9 @@ def agent(command, folder, *args):
     return json.loads(result.stdout)
 
 
-def exercise_import(command, folder):
+def exercise_import(command, folder, sample):
     source = folder / '模拟 序时账.xlsx'
-    shutil.copyfile(SAMPLE, source)
+    shutil.copyfile(sample, source)
     digest = file_hash(source)
     preview = agent(command, folder, 'inspect', source, '--limit', 2)
     if preview['sheets'] != ['序时账'] or preview['sha256'] != digest:
@@ -55,12 +53,19 @@ def exercise_import(command, folder):
     if file_hash(source) != digest:
         raise RuntimeError('The source workbook changed during import.')
 
+    check_book(book, digest)
+    print(f'Headless import passed: {ROW_COUNT} entries, matching totals, intact source, and voucher lookup.')
+
+
+def check_book(book, source_digest):
     store = LedgerStore.connect_existing(book)
     try:
         integrity = store.db.execute('PRAGMA integrity_check').fetchone()[0]
         totals = store.db.execute('SELECT COUNT(*), SUM(debit_cents), SUM(credit_cents) FROM entries').fetchone()
         if integrity != 'ok' or tuple(totals) != (ROW_COUNT, TOTAL_CENTS, TOTAL_CENTS):
             raise RuntimeError(f'Unexpected SQLite integrity or entry totals: {integrity}, {tuple(totals)}')
+        if [row['sha256'] for row in store.sources()] != [source_digest]:
+            raise RuntimeError('The ledger does not reference the expected sample workbook.')
         entry_id = store.db.execute('SELECT id FROM entries WHERE row_no=2').fetchone()[0]
         lines = store.voucher_lines(entry_id)
         amounts = [(line['code'], line['debit_cents'], line['credit_cents']) for line in lines]
@@ -68,7 +73,6 @@ def exercise_import(command, folder):
             raise RuntimeError(f'Unexpected voucher lines: {amounts}')
     finally:
         store.close()
-    print(f'Headless import passed: {ROW_COUNT} entries, matching totals, intact source, and voucher lookup.')
 
 
 def main():
@@ -85,8 +89,16 @@ def main():
                 raise RuntimeError(f'Missing runtime file: {path.relative_to(app)}')
         required = {'ledger_viewer.ui', 'ledger_viewer.agent_import', 'openpyxl', 'xlrd',
                     'keyring.backends.Windows', 'typesafe_sdk', 'tkinter'}
-        audit_bundle(app, binary, required, archive.with_suffix('.audit.json'))
-        exercise_import([binary], folder)
+        examples = {MANUAL: ROOT / 'docs/index.html'}
+        examples.update((relative, ROOT / relative) for relative in SAMPLE_FILES)
+        for relative, source in examples.items():
+            if file_hash(app / relative) != file_hash(source):
+                raise RuntimeError(f'Unexpected bundled file content: {relative}')
+        check_book(app / SAMPLE_BOOK, file_hash(app / SAMPLE_ENTRY))
+        print('Bundled offline manual, four example workbooks, and ready-to-open example ledger verified.')
+        audit_bundle(app, binary, required, archive.with_suffix('.audit.json'),
+                     sample_files={*SAMPLE_FILES, SAMPLE_BOOK})
+        exercise_import([binary], folder, app / SAMPLE_ENTRY)
 
 
 if __name__ == '__main__':

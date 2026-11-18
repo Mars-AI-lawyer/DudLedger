@@ -16,11 +16,11 @@ TOKEN = re.compile(rb"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z
 FORBIDDEN = {'.sqlite', '.sqlite3', '.db', '.xlsx', '.xls', '.xlsm', '.csv', '.tsv', '.log', '.pem', '.key', '.p12', '.pfx'}
 
 
-def audit_bundle(app: Path, binary: Path, required: set[str], output: Path):
+def audit_bundle(app: Path, binary: Path, required: set[str], output: Path, *, sample_files=frozenset()):
     failures, manifest = [], []
 
-    def scan(label, data):
-        if TOKEN.search(data) or data.startswith(b'SQLite format 3\0'):
+    def scan(label, data, *, allow_sqlite=False):
+        if TOKEN.search(data) or (not allow_sqlite and data.startswith(b'SQLite format 3\0')):
             failures.append(f"Sensitive content signature: {label}")
 
     def constants(label, code):
@@ -29,18 +29,19 @@ def audit_bundle(app: Path, binary: Path, required: set[str], output: Path):
 
     files = sorted(path for path in app.rglob('*') if path.is_file())
     for path in files:
-        name = path.relative_to(app).as_posix()
+        relative = path.relative_to(app)
+        name = relative.as_posix()
         if path.is_symlink():
             if not path.resolve().is_relative_to(app):
                 failures.append(f"External symlink: {name}")
             continue
-        parts = set(path.relative_to(app).parts)
-        if (path.suffix.lower() in FORBIDDEN or path.name.startswith('.env') or
+        parts = set(relative.parts)
+        if ((path.suffix.lower() in FORBIDDEN and relative not in sample_files) or path.name.startswith('.env') or
                 parts.intersection({'.git', '.venv', '.dudledger', '.workbuddy', 'examples', 'docs', 'tests'}) or
                 path.name in {'preferences.json', '.DS_Store', '.git-auto.json'}):
             failures.append(f"Forbidden file: {name}")
         data = path.read_bytes()
-        scan(name, data)
+        scan(name, data, allow_sqlite=relative in sample_files and path.suffix == '.sqlite')
         if path.suffix == '.zip':
             with zipfile.ZipFile(path) as archive:
                 for member in archive.namelist():

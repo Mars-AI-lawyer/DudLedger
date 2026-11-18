@@ -35,6 +35,7 @@
  <section class="section" id="install"><div class="section-head"><span class="section-no">01</span><h2>安装与首次使用</h2></div><p class="summary">下载适合电脑系统的软件包，完整解压后打开。</p>
  <ol class="steps"><li><strong>取得适合自己系统的软件包</strong><p>进入项目的 <a href="https://github.com/Mars-AI-lawyer/DudLedger/releases">Releases 下载页</a>，查看已发布附件。Mac 应选择与 Apple 芯片或 Intel 芯片对应的包；Windows 应选择 Windows 包。如果发布页尚无对应包，请查看发布说明，或按下方方式从源码运行。</p></li><li><strong>完整解压，保留整个文件夹</strong><p>将压缩包解压到本机有读写权限的位置，再双击其中的 DudLedger 启动程序。包含运行环境的软件包无需另装 Python。不要在压缩包预览窗口里直接运行，也不要只复制单个启动文件。</p></li><li><strong>跟随主界面引导认识入口</strong><p>首次使用会显示六步引导，可以前进、返回或跳过。以后可通过“帮助 → 重新查看使用引导”重看。左侧主要入口包括科目总览、明细账、财务报表、关注凭证、问题工作台、AI 尽调线索和计算器。</p></li><li><strong>按需要配置 AI 服务</strong><p>进入“设置 → AI 服务”填写自己的 API Key。自动表头识别使用 DeepSeek Flash；凭证抽查另支持百炼与 Jev。日常查询、计算、关注和问题记录均在本机完成；也可以选择本地规则与手动导入。</p></li></ol>
  <div class="callout"><b>先认识“账套”</b>账套是软件创建的本地 <code>.sqlite</code> 文件，用来保存导入的账目、来源、备注、问题和 AI 抽查记录。原始 Excel 仍是原始材料，导入不会改写它。下次使用“文件 → 打开账套…”继续查账。</div>
+ <div class="callout"><b>用 Windows 便携包练习</b>解压后双击 <code>DudLedger.exe</code>。在首页选择“打开已有账套”，打开“模拟账套”文件夹中的 <code>模拟序时账.sqlite</code>，即可练习查明细、看凭证和记问题。同目录有四份虚构 Excel，可另建账套练习导入。</div>
  <details><summary>下载的是源码 ZIP，如何运行？</summary><p>GitHub 的“Code → Download ZIP”下载源码，不是包含运行环境的软件包。源码用户需安装 Python 3.11 或更新版本并确保 Tkinter 可用，在项目目录创建虚拟环境并安装依赖。完整步骤见 <a href="https://github.com/Mars-AI-lawyer/DudLedger#四技术说明">README 的技术说明</a>。</p><pre class="prompt">python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate

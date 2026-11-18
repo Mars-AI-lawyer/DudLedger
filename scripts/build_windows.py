@@ -7,11 +7,38 @@ import sys
 from pathlib import Path
 
 from ledger_viewer import __version__
+from ledger_viewer.importer import ImportSpec, guess_header
+from ledger_viewer.store import LedgerStore
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / 'build' / 'windows'
 DIST = ROOT / 'dist'
 RESOURCES = ('specialist_rules.json', 'skills/dudledger-import/SKILL.md', 'resources/icon-beta.png')
+MANUAL = Path('说明书.html')
+SAMPLE_DIR = Path('模拟账套')
+SAMPLE_FILES = tuple(SAMPLE_DIR / f'模拟数据_{kind}.xlsx' for kind in ('序时账', '科目余额表', '资产负债表', '利润表'))
+SAMPLE_ENTRY = SAMPLE_DIR / '模拟数据_序时账.xlsx'
+SAMPLE_BOOK = SAMPLE_DIR / '模拟序时账.sqlite'
+
+
+def include_examples(app: Path):
+    shutil.copyfile(ROOT / 'docs/index.html', app / MANUAL)
+    (app / SAMPLE_DIR).mkdir()
+    for relative in SAMPLE_FILES:
+        shutil.copyfile(ROOT / relative, app / relative)
+
+    source = app / SAMPLE_ENTRY
+    sheet = '序时账'
+    header, _, mapping = guess_header(source, sheet, 'entry')
+    store = LedgerStore(app / SAMPLE_BOOK)
+    try:
+        store.import_sheet(ImportSpec(source, sheet, header, 'entry', mapping))
+        with store.db:
+            # Keep the bundled source reference relative to the example book.
+            store.db.execute('UPDATE sources SET original_path=filename')
+        store.db.execute('PRAGMA journal_mode=DELETE')
+    finally:
+        store.close()
 
 
 def main():
@@ -48,6 +75,7 @@ def main():
         command.extend(['--add-data', f'{target}:ledger_viewer/{Path(relative).parent.as_posix()}'])
     subprocess.run([*command, str(stage / 'run.py')], cwd=stage, check=True)
 
+    include_examples(WORK / 'runtime' / 'DudLedger')
     archive_name = f'DudLedger-{__version__}-Windows-x64'
     DIST.mkdir(exist_ok=True)
     archive = Path(shutil.make_archive(str(WORK / archive_name), 'zip', WORK / 'runtime', 'DudLedger'))

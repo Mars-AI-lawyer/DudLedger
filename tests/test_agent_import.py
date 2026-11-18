@@ -135,8 +135,9 @@ class AgentImportTest(unittest.TestCase):
         content = handoff_text([(self.source, "序时账")], self.base)
         self.assertTrue(SKILL_PATH.is_file())
         self.assertIn(str(SKILL_PATH.resolve()), content)
-        self.assertIn(str(self.source.resolve()), content)
-        self.assertIn("序时账", content)
+        context = json.loads(content.split('本机任务参数：\n', 1)[1])
+        self.assertEqual(context['sources'], [{'path': str(self.source.resolve()), 'sheet': '序时账'}])
+        self.assertEqual(context['output_folder'], str(self.base.resolve()))
 
     def test_frozen_handoff_calls_application_instead_of_python(self):
         with patch('sys.frozen', True, create=True), patch('sys.executable', '/Applications/DudLedger.app/Contents/MacOS/DudLedger'):
