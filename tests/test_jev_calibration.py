@@ -6,7 +6,7 @@ from ledger_viewer.jev_calibration import metrics
 
 class CalibrationTest(unittest.TestCase):
     def test_unapproved_examples_never_become_ground_truth(self):
-        path = Path(__file__).resolve().parents[1] / 'examples' / 'Jev中文校准样例.csv'
+        path = Path(__file__).with_name('fixtures') / 'Jev中文校准样例.csv'
         with path.open(encoding='utf-8-sig', newline='') as handle:
             samples = list(csv.DictReader(handle))
         self.assertEqual(len(samples), 72)
