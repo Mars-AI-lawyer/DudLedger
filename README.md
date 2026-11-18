@@ -1,4 +1,6 @@
-<img src="ledger_viewer/resources/icon-beta.png" alt="DudLedger 应用图标" width="96">
+<p align="center">
+  <img src="ledger_viewer/resources/icon-beta.png" alt="DudLedger 应用图标" width="96">
+</p>
 
 # DudLedger｜非诉律师尽调查账法宝
 
