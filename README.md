@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ledger_viewer/resources/icon-beta.png" alt="DudLedger 应用图标" width="96">
+  <img src="assets/readme-icon.png" alt="DudLedger 应用图标" width="96">
 </p>
 
 # DudLedger｜非诉律师尽调查账法宝
@@ -86,7 +86,7 @@ AI 凭证抽查是独立的可选功能，与导入时的表头识别分开使�
 
 ## 三、下载与说明书
 
-- **便携版**　Mac 试用包请向作者获取。Windows 试用包在打包完成后由作者提供。
+- **便携版**　[下载 macOS（Apple 芯片）和 Windows（x64）试用包](https://github.com/Mars-AI-lawyer/DudLedger/releases/tag/v0.3.0b1)。
 - **源码**　[下载源码 ZIP](https://github.com/Mars-AI-lawyer/DudLedger/archive/refs/heads/main.zip)。
 - **说明书**　[在线查看图文使用说明书](https://dudledger-manual.marshanzhen2026.chatgpt.site/)。
 
@@ -138,3 +138,9 @@ python run.py
 ```
 
 进一步了解：[导入与 Agent 接手](docs/三层Excel导入与Agent接手.md) · [律师尽调问题工作台](docs/律师尽调问题工作台.md) · [更新记录](CHANGELOG.md)
+
+## 五、开源许可
+
+DudLedger 源代码采用 **Mozilla Public License 2.0（MPL-2.0）**，允许使用（含商用）、修改和再分发。
+
+对外分发时，须保留适用的许可与版权声明，并按 MPL-2.0 向接收者提供受该许可证约束的源代码，包括相应的修改。完整条款见 [LICENSE](LICENSE)。
