@@ -58,7 +58,7 @@ python run.py</pre></details>
  <h3>特别复杂的表格：交给自己的 Agent</h3><p>遇到表头很深、多个数据区域、必要字段超出样本范围，或自动识别反复失败时，使用 <strong>“复制提示词给我的 Agent”</strong>。这一步复制的是针对当前文件的导入任务，不是凭证抽查提示词。</p>
  <ol class="steps"><li><strong>保留待处理工作表的勾选，复制提示词</strong><p>程序为尚未完成的工作表准备文件位置、工作表、建议保存目录、导入要求及本机工具位置。提示词不包含 API Key。</p></li><li><strong>粘贴给你自己使用的 Agent</strong><p>Agent 需要能读取本机文件并执行命令。普通网页聊天若无法访问这些路径，单独粘贴提示词不能完成导入。源文件必须在 Agent 所在环境可读；是否上传副本，请按本项目保密安排决定。</p></li><li><strong>让 Agent 分析、校验并创建新账套</strong><p>它可以调用随软件提供的导入工具，先检查文件，再提交列映射，运行整表校验并生成新 <code>.sqlite</code> 账套。让它说明排除行、异常及提醒；完成后在 DudLedger 打开生成的账套，抽查核对。</p></li></ol>
  <div class="callout"><b>不使用云端 AI，也能导账</b>在导入窗口的“手动设置…”选择“仅用本地规则和手动设置”，按原表设置表类型、表头和列对应，再运行本机预检。手动模式不会发送表头样本。切回 AI 模式则重新按其发送范围处理。</div>
- <p class="muted" style="font-size:13px">外部 Agent 的读取范围由你的授权和所用环境决定，不受内置“前 20 行”限制。可进一步查看 <a href="https://github.com/Mars-AI-lawyer/DudLedger/blob/main/docs/三层Excel导入与Agent接手.md">导入与 Agent 接手说明</a>。</p>
+ <p class="muted" style="font-size:13px">外部 Agent 的读取范围由你的授权和所用环境决定，不受内置“前 20 行”限制。</p>
  </section>
 
  <section class="section" id="voucher"><div class="section-head"><span class="section-no">04</span><h2>查询凭证</h2></div><p class="summary">先缩小交易范围，再双击明细，查看同张凭证中的已导入分录。</p>
@@ -126,7 +126,6 @@ https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/systemone<
 
 判断边界：不凭单笔记录推断长期挂账、尚未归还、违法占用或抽逃出资；相同名称或同金额候选不等于关联关系或真实资金闭环。仅作进一步核查线索，不作法律结论。主体身份或用途不明时，不自行补全事实，应留待人工复核。</div>
  <div class="copy-row"><button class="button" id="copy-prompt" type="button">复制示例提示词</button><span id="copy-status" role="status" aria-live="polite">复制后可在“条目内容”中修改使用。</span></div>
- <p class="muted" style="font-size:13px;margin-top:20px">各默认科目的条目与编写边界，可查阅 <a href="https://github.com/Mars-AI-lawyer/DudLedger/blob/main/docs/AI抽查默认科目与提示词.md">AI 抽查默认科目与提示词</a>。</p>
  </section>
 
  <section class="section" id="privacy"><div class="section-head"><span class="section-no">10</span><h2>保密、备份与常见问题</h2></div><p class="summary">知道数据留在哪里、什么时候会发送，才能按项目要求选择功能。</p>

@@ -35,10 +35,13 @@ dist/
 /examples/
 node_modules/
 
-# 仓库说明书与配套指南
+# 保留便携版使用的离线说明书，其余文档仅保留在本地
 /docs/*
 !/docs/index.html
-!/docs/三层Excel导入与Agent接手.md
-!/docs/AI抽查默认科目与提示词.md
-!/docs/律师尽调问题工作台.md
-!/docs/Mac便携版打包与验证.md
+
+# 本地手工验证脚本
+/tests/manual_ai_sampling.py
+/tests/manual_cascade_real.py
+/tests/manual_interaction_qa.py
+/tests/manual_test_real_files.py
+/tests/benchmark_responsiveness.py
