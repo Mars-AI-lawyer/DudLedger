@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from ledger_viewer.importer import classify_sheet
 from ledger_viewer.store import LedgerStore
 from ledger_viewer.table_tools import TableTools
-from ledger_viewer.ui import App, SettingsDialog, visible_columns
+from ledger_viewer.ui import App, RelatedPartiesDialog, RelatedPartiesPanel, SettingsDialog, visible_columns
 from ledger_viewer.voucher_selection import VoucherSelection
 
 
@@ -21,6 +21,34 @@ class Variable:
 
     def get(self):
         return self.value
+
+
+class RelatedPartiesDialogHeadlessTest(unittest.TestCase):
+    def test_dialog_centers_before_showing_and_focuses_name(self):
+        dialog, parent, window = RelatedPartiesDialog.__new__(RelatedPartiesDialog), Mock(), Mock()
+        dialog._w = '.parties'
+        for method in ('withdraw', 'destroy', 'title', 'transient', 'bind', 'minsize', 'geometry', 'deiconify', 'grab_set'):
+            setattr(dialog, method, getattr(window, method))
+        parent.winfo_x.return_value, parent.winfo_y.return_value = 80, 90
+        parent.winfo_width.return_value, parent.winfo_height.return_value = 1100, 700
+        parent.winfo_vrootx.return_value = parent.winfo_vrooty.return_value = 0
+        parent.winfo_vrootwidth.return_value, parent.winfo_vrootheight.return_value = 1600, 1000
+        with patch('ledger_viewer.ui.tk.Toplevel.__init__', return_value=None), \
+             patch('ledger_viewer.ui.RelatedPartiesPanel') as panel:
+            RelatedPartiesDialog.__init__(dialog, parent)
+        panel.assert_called_once_with(dialog, parent, on_close=dialog.destroy)
+        dialog.geometry.assert_called_once_with('700x520+280+180')
+        dialog.panel.name_entry.focus_set.assert_called_once_with()
+        method_names = [entry[0] for entry in window.mock_calls]
+        self.assertLess(method_names.index('geometry'), method_names.index('deiconify'))
+
+    def test_new_party_action_clears_selection_and_focuses_name(self):
+        panel = SimpleNamespace(view=Mock(), name_var=Variable('甲方'), relation_var=Variable('股东'), name_entry=Mock())
+        panel.view.selection.return_value = ('1',)
+        RelatedPartiesPanel._clear(panel)
+        panel.view.selection_remove.assert_called_once_with('1')
+        panel.name_entry.focus_set.assert_called_once_with()
+        self.assertEqual((panel.name_var.get(), panel.relation_var.get()), ('', ''))
 
 
 class LedgerSearchAndNavigationTest(unittest.TestCase):
@@ -115,6 +143,9 @@ class SelectionAndSettingsTest(unittest.TestCase):
         app.detail_view.identify_column.assert_not_called()
         app.store.voucher_lines.reset_mock()
         mouse = SimpleNamespace(keysym=None, x=2, y=2)
+        app.detail_view.identify_region.return_value = 'heading'
+        self.assertIsNone(App.open_voucher(app, mouse))
+        app.detail_view.identify_region.return_value = 'tree'
         app.detail_view.identify_column.return_value = '#0'
         self.assertEqual(App.open_voucher(app, mouse), 'break')
         app.store.voucher_lines.assert_not_called()

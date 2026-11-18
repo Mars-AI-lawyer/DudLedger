@@ -598,6 +598,22 @@ class JevReviewTest(unittest.TestCase):
         self.assertEqual(len(voucher_results(self.store, batch, tier='宽松', lane='candidates')), 1)  # uncertain only at 65
         self.assertEqual(len(voucher_results(self.store, batch, lane='completed')), 3)
 
+    def test_candidates_show_partial_hits_and_actionable_failures_but_not_live_pending(self):
+        FakeClient.responder = staticmethod(lambda state: response({'financing': 0.95 if state['summary'] == '普通往来' else 0.01}))
+        batch, _ = self.run_batch()
+        groups = voucher_results(self.store, batch, lane='all')
+        by_summary = {line['local']['summary']: group['key'] for group in groups for line in group['lines']}
+        hit_key, failed_key, pending_key = (by_summary[summary] for summary in ('普通往来', '执行扣款', '信息含糊'))
+        with self.store.db:
+            self.store.db.execute("UPDATE jev_batches SET status='running' WHERE id=?", (batch,))
+            self.store.db.execute("UPDATE jev_results SET status='pending' WHERE batch_id=? AND voucher_key=?", (batch, pending_key))
+            self.store.db.execute("UPDATE jev_results SET status='failed' WHERE batch_id=? AND voucher_key=?", (batch, failed_key))
+            self.store.db.execute("UPDATE jev_results SET status='pending' WHERE batch_id=? AND voucher_key=? AND id=(SELECT min(id) FROM jev_results WHERE batch_id=? AND voucher_key=?)", (batch, hit_key, batch, hit_key))
+        self.assertEqual({group['key'] for group in voucher_results(self.store, batch, lane='candidates')}, {hit_key, failed_key})
+        with self.store.db:
+            self.store.db.execute("UPDATE jev_results SET stale=1 WHERE batch_id=? AND voucher_key=?", (batch, pending_key))
+        self.assertEqual({group['key'] for group in voucher_results(self.store, batch, lane='candidates')}, {hit_key, failed_key, pending_key})
+
     def test_rule_upgrade_preserves_user_changes_and_historical_version(self):
         from ledger_viewer.jev_rules import LEGACY_V1_RULES, LEGACY_V2_RULES
         import copy

@@ -278,21 +278,16 @@ class TableToolsUiTest(unittest.TestCase):
         self.assertEqual(list(csv.reader(io.StringIO(copy.call_args.args[0]), delimiter="\t")),
                          [["有制表符\t和换行\n的摘要", "0.10"], ["另一条摘要", ""]])
 
-    def test_range_invalidates_when_sorting_through_filter_dialog(self):
+    def test_range_invalidates_when_sorting_by_column(self):
         self.view.configure(displaycolumns=("credit", "debit"))
         self.root.update()
         first, second = self.view.get_children()
         self.tools.select(first, "debit")
         self.tools.select(second, "debit", extend=True)
-        self.window._open_detail_filter('credit')
-        dialog = next(child for child in self.window.winfo_children()
-                      if child.winfo_exists() and child.title() == '明细账 · 列筛选')
-        ascending = next(button for button in dialog.sorting.winfo_children()
-                         if isinstance(button, ttk.Button) and button.cget('text').startswith('↑'))
-        ascending.invoke()
+        self.window.sort_details('credit')
         self.root.update()
         self.assertEqual(self.window.detail_sort, "credit")
-        self.assertFalse(self.window.detail_descending)
+        self.assertTrue(self.window.detail_descending)
         self.assertIsNone(self.tools.anchor)
         self.assertEqual(self.tools.summary.cells, 0)
 

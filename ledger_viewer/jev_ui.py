@@ -42,6 +42,36 @@ def wrapped_label(parent, **options):
     return label
 
 
+def review_toolbar(bar, leading, trailing, *, text_width=None):
+    bar.columnconfigure(0, weight=1)
+    leading.grid(row=0, column=0, sticky='ew')
+    trailing.grid(row=0, column=1, sticky='e')
+
+    def reflow(event=None):
+        width = event.width if event is not None else bar.winfo_width()
+        required = (text_width or leading.winfo_reqwidth()) + trailing.winfo_reqwidth() + 16
+        if width < required:
+            trailing.grid_configure(row=1, column=0, columnspan=2, pady=(3, 0))
+        else:
+            trailing.grid_configure(row=0, column=1, columnspan=1, pady=0)
+
+    bar.bind('<Configure>', reflow)
+    bar.after_idle(reflow)
+
+
+def account_choice_positions(width, option_widths):
+    positions = []
+    offset = row = 0
+    for option_width in option_widths:
+        fitted = min(width, option_width)
+        if offset and offset + fitted > width:
+            offset = 0
+            row += 1
+        positions.append((offset, row, fitted))
+        offset += fitted + 8
+    return positions, row + 1 if positions else 0
+
+
 def read_only_text(parent, text, height=12):
     widget = ScrolledText(parent, wrap='word', height=height, padx=8, pady=6)
     widget.pack(fill='both', expand=True)
@@ -188,18 +218,10 @@ class ConsentDialog(tk.Toplevel):
 
     def _confirm(self):
         try:
-            job = ReviewJob(self.store.path, self.batch_id, get_api_key(), deepseek_key=get_deepseek_key(), bailian_key=get_bailian_key())
-            job.start(self.store)
+            self.panel._start_prepared_batch(self.store, self.batch_id)
         except Exception as exc:
             messagebox.showerror('未开始审查', str(exc), parent=self)
             return
-        self.panel.batch_id = self.batch_id
-        self.panel.job = job
-        self.panel.lane.set('candidates')
-        self.panel.account.set('')
-        self.panel.category.set('全部')
-        self.panel.period.set('全部期间')
-        self.panel.refresh()
         self.destroy()
 
 
@@ -215,6 +237,7 @@ class ReviewPanel(ttk.Frame):
         self._last_refresh = 0
         self._rows_dirty = False
         self.result_offset = 0
+        self._result_scope = None
         self.job = None
         self.rows = {}
         self.batch_options = {}
@@ -222,33 +245,42 @@ class ReviewPanel(ttk.Frame):
         self.pack(fill='both', expand=True)
         actions = ttk.Frame(self, padding=6)
         actions.pack(fill='x')
-        self.start_button = ttk.Button(actions, text='开始 AI 专项抽查', command=self.new_batch, style='Accent.TButton')
+        run_actions = ttk.Frame(actions)
+        settings_actions = ttk.Frame(actions)
+        self.start_button = ttk.Button(run_actions, text='开始 AI 专项抽查', command=self.new_batch, style='Accent.TButton')
         self.start_button.pack(side='left')
-        self.cancel_button = ttk.Button(actions, text='停止', command=self.cancel, state='disabled')
+        self.cancel_button = ttk.Button(run_actions, text='停止', command=self.cancel, state='disabled')
         self.cancel_button.pack(side='left', padx=5)
-        self.more_button = ttk.Button(actions, text='更多选项', style="Ghost.TButton", command=self._toggle_options)
+        self.more_button = ttk.Button(settings_actions, text='更多选项 ▾', style="Ghost.TButton", command=self._toggle_options)
         self.more_button.pack(side='right')
+        review_toolbar(actions, run_actions, settings_actions)
+        wrapped_label(self, text='点击开始会向已配置的 AI 服务发送所选凭证分录、尽调主体信息及必要的历史背景；不上传原文件。',
+                      style='Hint.TLabel', padding=(8, 2), wraplength=1050).pack(fill='x')
         self.overview = tk.StringVar(value='待核 0 张 · 当前批次：尚无审查批次')
         wrapped_label(self, textvariable=self.overview, padding=(8, 2), wraplength=1050).pack(fill='x')
         self.scope_summary = tk.StringVar()
-        wrapped_label(self, textvariable=self.scope_summary, padding=(8, 2), wraplength=1050).pack(fill='x')
         self.options = ttk.Frame(self)
-        selection = ttk.LabelFrame(self.options, text='专项范围（可多选；未选择 = 全部已设置科目）', padding=(6, 2))
-        selection.pack(fill='x', padx=6)
-        self.account_canvas = tk.Canvas(selection, height=66, highlightthickness=0)
-        scroll = ttk.Scrollbar(selection, orient='vertical', command=self.account_canvas.yview)
-        scroll.pack(side='right', fill='y')
-        self.account_canvas.pack(side='left', fill='x', expand=True)
-        self.account_canvas.configure(yscrollcommand=scroll.set)
+        self.scope_options = ttk.LabelFrame(self, padding=(6, 2))
+        scope_label = ttk.Label(self.scope_options, textvariable=self.scope_summary)
+        self.scope_options.configure(labelwidget=scope_label)
+        self.scope_options.pack(fill='x', padx=6)
+        self.account_host = ttk.Frame(self.scope_options)
+        self.account_host.pack(fill='x')
+        self.account_host.columnconfigure(0, weight=1)
+        self.account_canvas = tk.Canvas(self.account_host, width=1, height=1, highlightthickness=0)
+        self.account_canvas.grid(row=0, column=0, sticky='ew')
+        self.account_scroll = ttk.Scrollbar(self.account_host, orient='vertical', command=self.account_canvas.yview)
+        self.account_canvas.configure(yscrollcommand=self.account_scroll.set)
         self.account_selection = ttk.Frame(self.account_canvas)
-        content = self.account_canvas.create_window(0, 0, window=self.account_selection, anchor='nw')
-        self.account_selection.bind('<Configure>', lambda _event: self.account_canvas.configure(scrollregion=self.account_canvas.bbox('all')))
-        self.account_canvas.bind('<Configure>', lambda event: self.account_canvas.itemconfigure(content, width=event.width))
-        self.account_canvas.bind('<MouseWheel>', lambda event: self.account_canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units'))
+        self.account_window = self.account_canvas.create_window(0, 0, window=self.account_selection, anchor='nw')
+        self.account_host.bind('<Configure>', self._layout_account_choices)
+        self.account_canvas.bind('<MouseWheel>', self._scroll_accounts)
+        self.account_selection.bind('<MouseWheel>', self._scroll_accounts)
         self.review_accounts = {}
         self.refresh_accounts()
-        self.progress = tk.StringVar(value='只抽查所选科目的凭证；默认百炼优先，Jev 可选，DeepSeek Flash 兜底。')
-        wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050).pack(fill='x')
+        self.progress = tk.StringVar(value='尚未开始抽查。')
+        self.progress_label = wrapped_label(self, textvariable=self.progress, padding=7, wraplength=1050)
+        self.progress_label.pack(fill='x')
         self.progress_bar = ttk.Progressbar(self, mode='determinate', maximum=1, value=0)
         self.progress_bar.pack(fill='x', padx=8, pady=(0, 7))
         primary_lanes = ttk.Frame(self, padding=(6, 0, 6, 4))
@@ -261,54 +293,60 @@ class ReviewPanel(ttk.Frame):
             self.lane_buttons[value] = button
         batch_row = ttk.Frame(self.options, padding=(6, 0))
         batch_row.pack(fill='x')
-        ttk.Label(batch_row, text='历史批次').pack(side='left', padx=(0, 5))
+        ttk.Label(batch_row, text='审查批次').pack(side='left', padx=(0, 5))
         self.batch = tk.StringVar()
-        self.batch_combo = ttk.Combobox(batch_row, textvariable=self.batch, state='readonly')
+        self.batch_combo = ttk.Combobox(batch_row, textvariable=self.batch, state='readonly', width=20)
         self.batch_combo.pack(fill='x', expand=True)
         self.batch_combo.bind('<<ComboboxSelected>>', self._select_batch)
-        lanes = ttk.LabelFrame(self.options, text='高级结果筛选', padding=(6, 2))
-        lanes.pack(fill='x', padx=6, pady=(4, 0))
-        for index, (label, value) in enumerate((('仅明确命中', 'scored'), ('信息不足／判断不确定', 'uncertain'), ('分析失败／未分析／过期', 'unfinished'))):
-            button = ttk.Radiobutton(lanes, text=label, value=value, variable=self.lane, command=self.refresh_rows)
-            button.grid(row=0, column=index, sticky='w', padx=(0, 14), pady=2)
-            self.lane_buttons[value] = button
         filters = ttk.Frame(self.options, padding=6)
         filters.pack(fill='x')
-        self.account, self.period = (tk.StringVar(value=v) for v in ('', '全部期间'))
         self.show_ignored = tk.BooleanVar(value=False)
-        ttk.Label(filters, text='科目').pack(side='left')
-        entry = ttk.Entry(filters, textvariable=self.account, width=13)
-        entry.pack(side='left', padx=5)
-        entry.bind('<Return>', lambda _e: self.refresh_rows())
-        combo = ttk.Combobox(filters, textvariable=self.period, values=['全部期间'], state='readonly', width=13)
-        combo.pack(side='left', padx=5)
-        combo.bind('<<ComboboxSelected>>', lambda _e: self.refresh_rows())
-        self.period_combo = combo
         ttk.Checkbutton(filters, text='显示已忽略', variable=self.show_ignored, command=self.refresh_rows).pack(side='left', padx=5)
-        ttk.Button(filters, text='筛选', command=self.refresh_rows).pack(side='left')
         self.category = tk.StringVar(value='全部')
-        self.category_frame = ttk.LabelFrame(self.options, text='分类', padding=(6, 2))
-        self.category_frame.pack(fill='x', padx=6)
-        self.category_frame.bind('<Configure>', lambda event: self._layout_category_buttons(event.width))
+        self.category_choices = ['全部']
+        ttk.Label(filters, text='问题分类').pack(side='left', padx=(10, 5))
+        self.category_combo = ttk.Combobox(filters, values=('全部',), state='readonly', width=12)
+        self.category_combo.current(0)
+        self.category_combo.pack(side='left', fill='x', expand=True)
+        self.category_combo.bind('<<ComboboxSelected>>', self._select_category)
         self.view = tree(self, [('voucher', '凭证', 140), ('account', '抽查科目', 110), ('amount', '金额', 110), ('summary', '摘要', 200),
             ('categories', '审查问题 / 编号', 260),
             ('analysis', '状态', 110)])
+        self.view.configure(selectmode='extended')
         self.view.bind('<Double-1>', self.open_detail)
         self.view.bind('<Return>', self.open_detail)
+        self.view.bind('<<TreeviewSelect>>', self._update_bulk_actions)
+        for sequence in ('<Command-a>', '<Control-a>'):
+            self.view.bind(sequence, self._select_page)
+        bulk = ttk.Frame(self, padding=(6, 0, 6, 4))
+        bulk.pack(fill='x', before=self.view.master)
+        bulk_actions = ttk.Frame(bulk)
+        self.select_page_button = ttk.Button(bulk_actions, text='全选本页', command=self._select_page)
+        self.select_page_button.pack(side='left')
+        self.mark_button = ttk.Button(bulk_actions, text='关注', command=self._mark_selected, state='disabled')
+        self.mark_button.pack(side='left', padx=5)
+        self.join_button = ttk.Button(bulk_actions, text='加入问题工作台…', command=self._join_selected, state='disabled')
+        self.join_button.pack(side='left')
+        self.selection_label = tk.StringVar()
+        selection = ttk.Label(bulk, textvariable=self.selection_label, style='Hint.TLabel')
+        review_toolbar(bulk, bulk_actions, selection)
+        self._update_bulk_actions()
         bottom = ttk.Frame(self, padding=6)
         bottom.pack(side='bottom', fill='x', before=self.view.master)
         self.count_label = tk.StringVar()
-        wrapped_label(bottom, textvariable=self.count_label).pack(side='left', fill='x', expand=True)
-        ttk.Button(bottom, text='查看详情', command=self.open_detail).pack(side='right')
-        self.result_prev = ttk.Button(bottom, text='上一页', command=lambda: self._result_page(-1), state='disabled')
-        self.result_prev.pack(side='right', padx=3)
-        self.result_next = ttk.Button(bottom, text='下一页', command=lambda: self._result_page(1), state='disabled')
-        self.result_next.pack(side='right', padx=3)
+        result_info = wrapped_label(bottom, textvariable=self.count_label, wraplength=220)
+        paging = ttk.Frame(bottom)
+        self.result_prev = ttk.Button(paging, text='上一页', command=lambda: self._result_page(-1), state='disabled')
+        self.result_prev.pack(side='left')
+        self.result_next = ttk.Button(paging, text='下一页', command=lambda: self._result_page(1), state='disabled')
+        self.result_next.pack(side='left', padx=3)
+        ttk.Button(paging, text='查看详情', command=self.open_detail).pack(side='left')
+        review_toolbar(bottom, result_info, paging, text_width=210)
         from .empty_state import EmptyState
         self.empty_initial = EmptyState(self.view.master, 'entries', '还没有 AI 审查结果',
-            '按专项科目新建范围；发送前可逐页预览并确认隐私说明。', '开始 AI 专项抽查', self.new_batch)
+            '请在上方选择抽查科目并开始。')
         self.empty_results = EmptyState(self.view.master, 'filter', '当前视图没有结果',
-            '可切换待核、已处理或全部，也可清除高级筛选后恢复查看。', '查看全部结果', self._show_all_results)
+            '可切换到全部结果，看看本批次已分析的其他凭证。', '查看全部结果', self._show_all_results)
         self._poll_id = self.after(200, self._poll)
         self.bind("<Destroy>", self._destroyed, add="+")
 
@@ -321,46 +359,60 @@ class ReviewPanel(ttk.Frame):
         for child in self.account_selection.winfo_children():
             child.destroy()
         self.review_accounts = {name: tk.BooleanVar(value=name in selected) for name in names}
-        self.account_canvas.configure(height=min(108, max(36, ((len(names) + 3) // 4) * 32)))
-        for index, (name, var) in enumerate(self.review_accounts.items()):
-            ttk.Checkbutton(self.account_selection, text=name, variable=var, command=self._update_scope_summary).grid(
-                row=index // 4, column=index % 4, sticky='w', padx=(0, 14))
+        for name, var in self.review_accounts.items():
+            option = ttk.Checkbutton(self.account_selection, text=name, variable=var, style='Sampling.TCheckbutton',
+                                     command=self._update_scope_summary)
+            option.bind('<MouseWheel>', self._scroll_accounts)
+        self.after_idle(self._layout_account_choices)
         self._update_scope_summary()
+
+    def _layout_account_choices(self, event=None):
+        width = event.width if event is not None else self.account_host.winfo_width()
+        if width <= 1:
+            return
+        options = self.account_selection.winfo_children()
+        widths = [option.winfo_reqwidth() for option in options]
+        row_height = max((option.winfo_reqheight() for option in options), default=1)
+        positions, rows = account_choice_positions(width, widths)
+        if rows > 3:
+            self.account_scroll.grid(row=0, column=1, sticky='ns')
+            width = max(1, width - self.account_scroll.winfo_reqwidth())
+            positions, rows = account_choice_positions(width, widths)
+        else:
+            self.account_scroll.grid_remove()
+        for option, (left, row, option_width) in zip(options, positions):
+            option.place(x=left, y=row * row_height, width=option_width, height=row_height)
+        height = max(1, rows * row_height)
+        self.account_canvas.itemconfigure(self.account_window, width=width, height=height)
+        self.account_canvas.configure(height=min(height, 3 * row_height), scrollregion=(0, 0, width, height))
+        if rows <= 3:
+            self.account_canvas.yview_moveto(0)
+
+    def _scroll_accounts(self, event):
+        if event.delta:
+            self.account_canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units')
+        return 'break'
 
     def _update_scope_summary(self):
         selected = [name for name, var in self.review_accounts.items() if var.get()]
-        scope = (f'本次范围：已选 {len(selected)} 个专项科目' if selected else
-                 f'本次范围：全部 {len(self.review_accounts)} 个已设置科目（未选择 = 全部）')
-        self.scope_summary.set(scope + ' · 按专项科目新建范围，不继承当前明细筛选')
+        scope = f'已选 {len(selected)} 个' if selected else f'未勾选即全部（{len(self.review_accounts)} 个）'
+        self.scope_summary.set(f'抽查科目 · {scope}')
 
-    def _render_category_bar(self, rules, counts):
-        for child in self.category_frame.winfo_children():
-            child.destroy()
-        # 类别→ID 映射由 _category_counts 维护；这里只重建按钮，不能清空映射，
-        # 否则点击分类后查不到 ID，筛选落空（表现为“点了没反应”）。
-        selected = self.category.get() or '全部'
-        if selected not in dict(counts) and selected != '全部':
-            selected = '全部'
-        for label, count in counts:
-            ttk.Radiobutton(self.category_frame, text=f'{label} {count}', value=label,
-                variable=self.category, command=self.refresh_rows)
-        self.category.set(selected)
-        self._layout_category_buttons()
+    def _render_categories(self, counts):
+        selected = self.category.get()
+        if selected not in dict(counts) and selected in self.category_ids and selected != '全部':
+            counts = [*counts, (selected, 0)]
+        self.category_choices = [label for label, _count in counts]
+        self.category_combo.configure(values=[f'{label}（{count}）' for label, count in counts])
+        index = self.category_choices.index(selected) if selected in self.category_choices else 0
+        self.category_combo.current(index)
+        self.category.set(self.category_choices[index])
 
-    def _layout_category_buttons(self, width=None):
-        buttons = self.category_frame.winfo_children()
-        if not buttons:
-            return
-        width = width or self.category_frame.winfo_width() or self.category_frame.winfo_reqwidth()
-        row = column = used = 0
-        for button in buttons:
-            needed = button.winfo_reqwidth() + 10
-            if used and used + needed > width:
-                row += 1
-                column = used = 0
-            button.grid(row=row, column=column, sticky='w', padx=(0, 10), pady=1)
-            column += 1
-            used += needed
+    def _select_category(self, _event=None):
+        index = self.category_combo.current()
+        if index >= 0:
+            self.category.set(self.category_choices[index])
+            self.refresh_rows()
 
     def _category_counts(self, rules, candidates):
         counts = [('全部', len(candidates))]
@@ -391,68 +443,95 @@ class ReviewPanel(ttk.Frame):
     def _toggle_options(self):
         if self.options.winfo_manager():
             self.options.pack_forget()
-            self.more_button.configure(text='更多选项')
+            self.more_button.configure(text='更多选项 ▾')
         else:
-            self.options.pack(fill='x', before=self.view.master)
-            self.more_button.configure(text='收起选项')
+            self.options.pack(fill='x', padx=6, before=self.progress_label)
+            self.more_button.configure(text='更多选项 ▴')
 
     def _show_all_results(self):
         self.lane.set('all')
-        self.account.set('')
-        self.period.set('全部期间')
         self.category.set('全部')
         self.show_ignored.set(False)
         self.refresh_rows()
 
-    def new_batch(self):
+    def new_batch(self, *, preview=False):
         if not self.app.store:
-            messagebox.showinfo('请打开账套', '请先新建或打开账套并导入明细账。', parent=self)
+            self.progress.set('请先新建或打开账套并导入明细账。')
             return
         if self.app.import_busy or self.preparing:
             self.progress.set('请完成或取消当前本地处理后再开始审查。')
             return
         if active_job(self.app.store.path):
-            messagebox.showinfo('审查正在运行', '当前账套同一时间只运行一个批次。', parent=self)
+            self.progress.set('当前账套已有正在运行的抽查。')
             return
-        self.prepare({'review_accounts': [name for name, var in self.review_accounts.items() if var.get()]})
+        scope = {'review_accounts': [name for name, var in self.review_accounts.items() if var.get()]}
+        if preview:
+            self.prepare(scope, preview=True)
+        else:
+            self.prepare(scope)
 
-    def prepare(self, scope):
+    def prepare(self, scope, *, preview=False):
         if self.preparing or self.app.import_busy:
             return
+        store = self.app.store
         scope = {**scope, 'preferred_provider': preferred_provider(self.app.controller.preferences.get('review_preferred_provider')),
                  'bailian_free_confirmed': self.app.controller.preferences.get('bailian_free_confirmed') is True,
                  'bailian_endpoint': self.app.controller.preferences.get('bailian_endpoint', BAILIAN_ENDPOINT)}
-        if not self.app.store.large_book():
-            try:
-                batch_id = prepare_batch(self.app.store, scope)
-            except Exception as exc:
-                messagebox.showerror('无法生成预览', str(exc), parent=self)
-                return
-            ConsentDialog(self, batch_id)
-            return
-        self.preparing = True
-        self.start_button.configure(state='disabled')
-        self.cancel_button.configure(state='normal')
-        self.progress.set('正在本机生成完整发送预览；此阶段不会发送数据，可停止。')
-        path = self.app.store.path
-        def work(cancelled, report):
-            store = LedgerStore.connect_existing(path, readonly=False, cancelled=cancelled)
-            try:
-                return prepare_batch(store, scope, cancelled=cancelled, progress=report)
-            finally:
-                store.close()
         def finish(batch_id):
+            if self.app.store is not store:
+                return
             self.preparing = False
             self.start_button.configure(state='normal')
             self.cancel_button.configure(state='disabled')
-            ConsentDialog(self, batch_id)
+            if preview:
+                ConsentDialog(self, batch_id)
+                return
+            try:
+                self._start_prepared_batch(store, batch_id)
+            except Exception as exc:
+                self.progress.set(f'未开始抽查：{exc}')
+                discard_preview(store, batch_id)
+
         def failed(exc):
             self.preparing = False
             self.start_button.configure(state='normal')
             self.cancel_button.configure(state='disabled')
-            self.progress.set(f'预览未完成，可重试：{exc}')
+            self.progress.set(f'凭证整理未完成，可重试：{exc}')
+
+        if not store.large_book():
+            try:
+                batch_id = prepare_batch(store, scope)
+            except Exception as exc:
+                failed(exc)
+                return
+            finish(batch_id)
+            return
+        self.preparing = True
+        self.start_button.configure(state='disabled')
+        self.cancel_button.configure(state='normal')
+        self.progress.set('正在本机整理抽查凭证；尚未发送数据，可停止。')
+        path = store.path
+        def work(cancelled, report):
+            worker_store = LedgerStore.connect_existing(path, readonly=False, cancelled=cancelled)
+            try:
+                return prepare_batch(worker_store, scope, cancelled=cancelled, progress=report)
+            finally:
+                worker_store.close()
         self.app.tasks.submit('review_prepare', work, finish, failed,
-            lambda value: self.progress.set(f'正在本机生成预览：{value}；尚未发送数据'))
+            lambda value: self.progress.set(f'正在本机整理凭证：{value}；尚未发送数据'))
+
+    def _start_prepared_batch(self, store, batch_id):
+        job = ReviewJob(store.path, batch_id, get_api_key(), deepseek_key=get_deepseek_key(), bailian_key=get_bailian_key())
+        job.start(store)
+        self.batch_id = batch_id
+        self.job = job
+        self.lane.set('candidates')
+        self.category.set('全部')
+        self.show_ignored.set(False)
+        self.view.selection_remove(*self.view.selection())
+        self.start_button.configure(state='disabled')
+        self.cancel_button.configure(state='normal')
+        self.refresh()
 
     def cancel(self):
         if self.preparing:
@@ -460,7 +539,7 @@ class ReviewPanel(ttk.Frame):
             self.preparing = False
             self.start_button.configure(state='normal')
             self.cancel_button.configure(state='disabled')
-            self.progress.set('已停止生成预览；未发送数据。')
+            self.progress.set('已停止整理本次抽查凭证；未发送数据。')
         if self.app.store:
             job = active_job(self.app.store.path)
             if job:
@@ -469,6 +548,7 @@ class ReviewPanel(ttk.Frame):
 
     def _select_batch(self, _event=None):
         self.batch_id = self.batch_options.get(self.batch.get())
+        self.category.set('全部')
         self.refresh()
 
     def refresh(self):
@@ -528,9 +608,6 @@ class ReviewPanel(ttk.Frame):
         percent = done / total * 100 if total else 0
         status = STATUS_LABELS.get(info['status'], info['status'])
         self.progress.set(f"{status} · 已处理 {done}/{total} 张（{percent:.0f}%） · 成功 {counts['successful_vouchers']} · 失败 {counts['failed_vouchers']} · 低价值未送审 {counts['skipped_vouchers']}")
-        self.lane_buttons['uncertain'].configure(text=f"信息不足／判断不确定（{counts['uncertain']}）")
-        unfinished = counts['total'] - counts.get('success', 0) - counts.get('skipped', 0)
-        self.lane_buttons['unfinished'].configure(text=f"失败／未分析（{unfinished}）／过期（{counts['stale']}）")
 
     def _result_page(self, direction):
         self.result_offset = max(0, self.result_offset + direction * 500)
@@ -541,6 +618,8 @@ class ReviewPanel(ttk.Frame):
         if not self.app.store or self.batch_id is None:
             self.view.delete(*self.view.get_children())
             self.rows = {}
+            self._result_scope = None
+            self._update_bulk_actions()
             self.progress_bar.configure(maximum=1, value=0)
             self.overview.set('待核 0 张 · 当前批次：尚无审查批次')
             self.count_label.set('尚无结果，选择科目后点击“开始 AI 专项抽查”。')
@@ -548,8 +627,9 @@ class ReviewPanel(ttk.Frame):
             self.empty_initial.show()
             self.result_prev.configure(state='disabled')
             self.result_next.configure(state='disabled')
-            for child in self.category_frame.winfo_children():
-                child.destroy()
+            self.category_ids = {}
+            self.category.set('全部')
+            self._render_categories([('全部', 0)])
             return
         self.empty_initial.hide()
         if not keep_page:
@@ -557,9 +637,12 @@ class ReviewPanel(ttk.Frame):
         self._last_refresh = time.monotonic()
         self._rows_dirty = False
         store, batch_id = self.app.store, self.batch_id
-        options = (None, self.lane.get(), self.account.get().strip(),
-            self.category_ids.get(self.category.get(), ''),
-            '' if self.period.get() == '全部期间' else self.period.get(), self.show_ignored.get())
+        lane, category, ignored = self.lane.get(), self.category_ids.get(self.category.get(), ''), self.show_ignored.get()
+        scope = (store.path, batch_id, lane, category, ignored, self.result_offset)
+        if scope != self._result_scope:
+            self._result_scope = None
+            self.view.selection_remove(*self.view.selection())
+            self._update_bulk_actions()
         cache = self._totals_cache
         def query(reader):
             revision = (reader.path, reader.setting('data_revision', '0'))
@@ -567,31 +650,34 @@ class ReviewPanel(ttk.Frame):
             context = voucher_result_context(reader, batch_id, totals)
             if context is None:
                 return None
-            groups = voucher_results(reader, batch_id, *options, context=context)
-            tier, lane, account, category, period, ignored = options
-            candidates = groups if lane == 'candidates' and not category else voucher_results(
-                reader, batch_id, tier, 'candidates', account, '', period, ignored, context=context)
-            pending = voucher_results(reader, batch_id, None, 'candidates', context=context)
-            periods = sorted({f"{r['local']['fiscal_year']}/{r['local']['period']}"
-                for lines in context['groups'].values() for r in lines})
-            return groups, candidates, len(pending), context['rules'], periods, batch_counts(reader, batch_id), context['info'], (revision, context['totals'])
+            unfiltered = voucher_results(reader, batch_id, lane=lane, include_ignored=ignored, context=context)
+            if not ignored and lane != 'candidates':
+                unfiltered = [group for group in unfiltered if group['feedback'] != 'ignore']
+            if category == 'unclassified':
+                groups = [group for group in unfiltered if not group['categories']]
+            elif category:
+                groups = [group for group in unfiltered if any(item[0] == category for item in group['categories'])]
+            else:
+                groups = unfiltered
+            pending = unfiltered if lane == 'candidates' and not ignored else voucher_results(
+                reader, batch_id, lane='candidates', context=context)
+            return groups, unfiltered, len(pending), context['rules'], batch_counts(reader, batch_id), context['info'], (revision, context['totals'])
         if store.large_book():
             self.count_label.set('正在本机更新线索…')
-            self.app._read_task('review_rows', query, self._render_rows)
+            self.app._read_task('review_rows', query, lambda result: self._render_rows(result, scope))
         else:
-            self._render_rows(query(store))
+            self._render_rows(query(store), scope)
 
-    def _render_rows(self, result):
-        if result is None:
+    def _render_rows(self, result, scope):
+        if result is None or not self.app.store or scope[:2] != (self.app.store.path, self.batch_id):
             return
-        groups, candidates, pending, rules, periods, counts, info, self._totals_cache = result
+        groups, unfiltered, pending, rules, counts, info, self._totals_cache = result
         self._counts(counts, info)
         self.overview.set(f'待核 {pending} 张 · 当前批次：{self.batch.get()}')
         if self.app.store.large_book() and not self._visible():
             self._rows_dirty = True
             return
-        self._render_category_bar(rules, self._category_counts(rules, candidates))
-        self.period_combo.configure(values=['全部期间', *periods])
+        self._render_categories(self._category_counts(rules, unfiltered))
         total = len(groups)
         self.empty_initial.hide()
         if total:
@@ -629,12 +715,60 @@ class ReviewPanel(ttk.Frame):
                 self.view.insert('', 'end', iid=item, values=values)
             self.view.move(item, '', index)
         self.view.delete(*old_items)
-        self.count_label.set(f'共 {total:,} 张 · 第 {self.result_offset // 500 + 1}/{max(1, (total + 499) // 500)} 页 · 双击查看完整凭证及提示词命中事项。')
+        self._result_scope = (*scope[:-1], self.result_offset)
+        self._update_bulk_actions()
+        modifier = '⌘' if self.tk.call('tk', 'windowingsystem') == 'aqua' else 'Ctrl'
+        self.count_label.set(f'共 {total:,} 张 · 第 {self.result_offset // 500 + 1}/{max(1, (total + 499) // 500)} 页 · {modifier}/Shift 多选，双击看详情')
+
+    def _actionable(self, group):
+        return group['local_total'] > 0 and not any(row['stale'] for row in group['lines'])
+
+    def _selected_keys(self):
+        if self._result_scope is None:
+            return ()
+        return tuple(key for key in self.view.selection() if key in self.rows and self._actionable(self.rows[key]))
+
+    def _update_bulk_actions(self, _event=None):
+        count = len(self._selected_keys())
+        skipped = len(self.view.selection()) - count if self._result_scope is not None else 0
+        for button in (self.mark_button, self.join_button):
+            button.configure(state='normal' if count else 'disabled')
+        can_select = self._result_scope is not None and any(self._actionable(group) for group in self.rows.values())
+        self.select_page_button.configure(state='normal' if can_select else 'disabled')
+        self.selection_label.set(f'已选 {count} 张' + (f' · 跳过 {skipped} 张历史凭证' if skipped else ''))
+
+    def _select_page(self, _event=None):
+        if self._result_scope is not None:
+            self.view.selection_set([key for key in self.view.get_children() if self._actionable(self.rows[key])])
+            self.view.focus_set()
+            self._update_bulk_actions()
+        return 'break'
+
+    def _mark_selected(self):
+        keys = self._selected_keys()
+        if keys:
+            self.app.mark_voucher_keys(keys)
+
+    def _join_selected(self):
+        keys = self._selected_keys()
+        if keys:
+            self.app.workbench.choose_issue(keys)
 
     def open_detail(self, _event=None):
+        if self._result_scope is None:
+            return
+        if _event is not None and getattr(_event, 'num', None) == 1:
+            if self.view.identify_region(_event.x, _event.y) in ('tree', 'cell'):
+                target = self.view.identify_row(_event.y)
+                if target in self.rows:
+                    ReviewDetail(self, self.rows[target])
+            return
         selected = self.view.selection()
         if selected:
-            ReviewDetail(self, self.rows[selected[0]])
+            target = self.view.focus()
+            ReviewDetail(self, self.rows[target if target in selected else selected[0]])
+            if _event is not None:
+                return 'break'
 
     def _visible(self):
         return self.app.current_page() == 'review'

@@ -85,6 +85,14 @@ class ReviewUITest(unittest.TestCase):
         for button in buttons:
             self.assertTrue(button.winfo_ismapped(), button.cget('text'))
             self.assertGreaterEqual(button.winfo_width(), button.winfo_reqwidth() - 8, button.cget('text'))
+        self.panel.more_button.invoke()
+        self.root.update()
+        self.assertTrue(self.panel.category_combo.winfo_ismapped())
+        self.assertTrue(self.panel.scope_options.winfo_ismapped())
+        self.panel.more_button.invoke()
+        self.root.update()
+        self.assertFalse(self.panel.options.winfo_ismapped())
+        self.assertTrue(self.panel.scope_options.winfo_ismapped())
         preview = ConsentDialog(self.panel, prepare_batch(self.app.store, {}))
         preview.geometry('670x560')
         self.root.update()
@@ -151,7 +159,7 @@ class ReviewUITest(unittest.TestCase):
         self.assertEqual(float(self.panel.progress_bar['value']), 2)
         self.assertEqual(batch_counts(self.app.store, batch)['successful_vouchers'], 2)
 
-    def test_category_bar_click_filters_without_losing_counts(self):
+    def test_category_selection_filters_without_losing_counts(self):
         extra = self.base / '第二张.csv'
         extra.write_text('日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n'
                          '2026-01-02,2,1002,银行存款,股权转让款,100,0\n', encoding='utf-8')
@@ -176,14 +184,13 @@ class ReviewUITest(unittest.TestCase):
         rules = load_rules(self.app.store)[1]
         financing = next(topic['label'] for topic in rules['topics'] if topic['id'] == 'financing')
         equity = next(topic['label'] for topic in rules['topics'] if topic['id'] == 'capital_equity')
-        # 点击单个分类：列表过滤为该分类，选中态保持，且计数条不塌缩（其他分类仍在）。
-        button = next(b for b in self.panel.category_frame.winfo_children() if b.cget('text').startswith(financing))
-        button.invoke()
+        self.panel.category_combo.current(self.panel.category_choices.index(financing))
+        self.panel._select_category()
         self.root.update()
         self.assertEqual(self.panel.category.get(), financing)
         self.assertEqual(len(self.panel.view.get_children()), 1)
         self.assertIn('股东借款', self.panel.view.item(self.panel.view.get_children()[0], 'values')[3])
-        labels = [b.cget('text') for b in self.panel.category_frame.winfo_children()]
+        labels = self.panel.category_combo.cget('values')
         self.assertTrue(any(text.startswith(equity) for text in labels))
 
     def test_confirm_results_detail_review_and_open_unlisted_voucher(self):

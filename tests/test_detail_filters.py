@@ -2,13 +2,14 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from ledger_viewer.detail_filter_ui import DetailFilterDialog
 from ledger_viewer.detail_filters import make_condition
 from ledger_viewer.importer import classify_sheet
 from ledger_viewer.store import LedgerStore
-from ledger_viewer.ui import Application
+from ledger_viewer.ui import App, Application
 
 
 def populate(store, directory):
@@ -53,6 +54,14 @@ class DetailFilterQueryTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 condition("date", "eq", invalid)
 
+    def test_voucher_heading_sorts_by_number_across_voucher_types(self):
+        with self.store.db:
+            self.store.db.execute("UPDATE entries SET voucher_no='10', voucher_type='收' WHERE voucher_no='1'")
+            self.store.db.execute("UPDATE entries SET voucher_type='付' WHERE voucher_no='2'")
+        for descending, expected in ((False, ['2', '3', '4', '5', '6', '10']),
+                                     (True, ['10', '6', '5', '4', '3', '2'])):
+            self.assertEqual([row['voucher_no'] for row in self.store.entries(sort_by='voucher', descending=descending)], expected)
+
     def test_combination_reaches_later_pages_and_export_matches_query_order(self):
         source_id = self.store.sources()[0]["id"]
         self.store.db.executemany(
@@ -96,6 +105,56 @@ class DetailFilterQueryTest(unittest.TestCase):
             self.assertEqual([row["凭证号"] for row in csv.DictReader(handle)], [row["voucher_no"] for row in rows])
 
 
+class DetailHeadingHeadlessTest(unittest.TestCase):
+    def test_sort_new_column_descending_then_ascending(self):
+        app = SimpleNamespace(detail_sort='date', detail_descending=False, refresh_details=Mock(),
+                              detail_conditions={'summary': make_condition('summary', 'contains', '借款')})
+        for column, descending in [('date', True), ('date', False), ('debit', True), ('debit', False), ('voucher', True)]:
+            App.sort_details(app, column)
+            self.assertEqual((app.detail_sort, app.detail_descending), (column, descending))
+        self.assertEqual(app.refresh_details.call_count, 5)
+        self.assertIn('summary', app.detail_conditions)
+
+    def test_right_click_maps_visible_column_and_offers_filter_and_hide(self):
+        view = Mock()
+        view.identify_region.return_value = 'heading'
+        view.identify_column.return_value = '#2'
+        view.column.return_value = 'voucher'
+        app = SimpleNamespace(detail_view=view, detail_heading_menu=Mock(), detail_restore_menu=Mock(),
+            _shown_detail_columns=Mock(return_value=('credit', 'voucher')), _has_detail_filter=Mock(return_value=False),
+            _open_detail_filter=Mock(), _set_detail_column_visibility=Mock())
+        event = SimpleNamespace(x=45, y=10, x_root=100, y_root=75)
+        self.assertEqual(App._detail_heading_context(app, event), 'break')
+        view.column.assert_called_once_with('#2', 'id')
+        actions = {call.kwargs['label']: call.kwargs for call in app.detail_heading_menu.add_command.call_args_list}
+        actions['筛选此列…']['command']()
+        actions['隐藏此列']['command']()
+        app._open_detail_filter.assert_called_once_with('voucher')
+        app._set_detail_column_visibility.assert_called_once_with('voucher', False)
+        app.detail_heading_menu.tk_popup.assert_called_once_with(100, 75)
+        view.identify_region.return_value = 'cell'
+        self.assertIsNone(App._detail_heading_context(app, event))
+        app._shown_detail_columns.return_value = ('voucher',)
+        app._change_columns = Mock()
+        App._set_detail_column_visibility(app, 'voucher', False)
+        app._change_columns.assert_not_called()
+        App._set_detail_column_visibility(app, 'debit', True)
+        app._change_columns.assert_called_once_with('detail', ['voucher', 'debit'])
+
+    def test_header_commands_sort_and_context_actions_have_separate_bindings(self):
+        app = SimpleNamespace(detail_view=Mock(), tk=Mock(), sort_details=Mock(), _open_detail_filter=Mock(),
+                              _detail_heading_context=Mock())
+        app.tk.call.return_value = 'aqua'
+        App._bind_detail_headings(app)
+        commands = {call.args[0]: call.kwargs['command'] for call in app.detail_view.heading.call_args_list}
+        for column in ('debit', 'credit', 'original', 'date', 'voucher', 'summary'):
+            commands[column]()
+            app.sort_details.assert_called_with(column)
+        app._open_detail_filter.assert_not_called()
+        self.assertEqual([call.args[0] for call in app.detail_view.bind.call_args_list],
+                         ['<Button-2>', '<Button-3>', '<Control-Button-1>'])
+
+
 class DetailFilterUITest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -120,16 +179,20 @@ class DetailFilterUITest(unittest.TestCase):
         self.view.event_generate("<ButtonRelease-1>", x=x, y=y)
         self.root.update()
 
-    def test_header_opens_filter_after_scrolling_and_popup_sorts(self):
+    def test_header_sorts_and_context_menu_opens_filter_after_scrolling(self):
         self.view.configure(displaycolumns=("summary", "debit", "date", "credit", "counterparty"))
         self.view.column("summary", width=900)
         self.view.xview_moveto(1)
         self.root.update()
         x, _, width, _ = self.view.bbox(self.view.get_children()[0], "debit")
         self.click(x + width - 16)
+        self.assertEqual((self.app.detail_sort, self.app.detail_descending), ('debit', True))
+        self.assertFalse(any(isinstance(child, DetailFilterDialog) for child in self.app.winfo_children()))
+        with patch.object(self.app.detail_heading_menu, 'tk_popup'):
+            self.view.event_generate('<Button-3>', x=x + width - 16, y=10)
+        self.app.detail_heading_menu.invoke(0)
         dialog = self.dialog()
         self.assertEqual(dialog.column, "debit")
-        self.assertEqual(self.app.detail_sort, "date")
         dialog.operator.set("小于或等于 ≤")
         dialog._operator_changed()
         dialog.start.set("100.01")
@@ -138,9 +201,9 @@ class DetailFilterUITest(unittest.TestCase):
         self.assertEqual(self.app.detail_total, 1)
         self.assertIn("已筛选 1 项", self.app.detail_info.get())
         self.assertEqual(self.view.heading("debit", "image"), (str(self.app.detail_filter_images[1]),))
-        self.click(x + 20)
-        self.dialog()._sort(False)
+        self.click(x + width - 16)
         self.assertEqual(self.app.detail_sort, "debit")
+        self.assertFalse(self.app.detail_descending)
         self.assertEqual(self.app.detail_total, 1)
         self.assertFalse(self.app.detail_next.winfo_ismapped())
         self.view.selection_set(self.view.get_children()[0])
@@ -175,17 +238,16 @@ class DetailFilterUITest(unittest.TestCase):
         self.app.clear_filter()
         self.assertEqual(self.app.detail_total, 6)
 
-    def test_filter_dialog_exposes_both_sort_directions_without_clearing_conditions(self):
+    def test_sort_directions_do_not_clear_conditions(self):
         self.app._set_detail_filter("summary", make_condition("summary", "contains", "借款"))
-        self.app._open_detail_filter("debit")
-        self.dialog()._sort(True)
+        self.app.sort_details('debit')
         self.root.update()
         self.assertEqual((self.app.detail_sort, self.app.detail_descending), ("debit", True))
         self.assertEqual(self.app.detail_total, 5)
         amounts = [self.view.set(row, "debit") for row in self.view.get_children()]
         self.assertEqual(amounts[:3], ["500.00", "101.00", "100.02"])
-        self.app._open_detail_filter("original")
-        self.dialog()._sort(False)
+        self.app.sort_details('original')
+        self.app.sort_details('original')
         self.assertEqual((self.app.detail_sort, self.app.detail_descending), ("original", False))
         self.assertIn("summary", self.app.detail_conditions)
 

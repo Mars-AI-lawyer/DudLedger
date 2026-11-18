@@ -14,9 +14,14 @@ def ordered_issue_choices(items, query='', current_id=None, recent_ids=()):
     ))
 
 
-def use_overlay_drawer(available, main_minimum, mode='issues', detached=False):
-    """Only an explicitly opened, docked issue panel becomes a drawer."""
-    return mode == 'issues' and not detached and 1 < available < 320 + main_minimum + 8
+TOOL_GRIP_WIDTH = 12
+
+
+def tool_width_limits(available, mode):
+    usable = max(2, available - TOOL_GRIP_WIDTH)
+    tool_minimum = min(300 if mode == 'issues' else 260, max(1, usable * 3 // 8))
+    main_minimum = min(400, usable // 2)
+    return tool_minimum, usable - main_minimum
 
 
 def link_feedback(title, result):

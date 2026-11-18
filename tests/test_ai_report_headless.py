@@ -4,11 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from ledger_viewer.issue_store import mark_vouchers
 from ledger_viewer.importer import ImportSpec, guess_header
 from ledger_viewer.jev_review import batch_info, prepare_batch, voucher_results
-from ledger_viewer.jev_ui import (ReviewDetail, ReviewPanel, detail_lines,
+from ledger_viewer.jev_ui import (ReviewDetail, ReviewPanel, account_choice_positions, detail_lines, review_toolbar,
     saved_voucher_lines, sent_snapshot_content)
 from ledger_viewer.store import LedgerStore
 
@@ -123,27 +124,130 @@ class AIReportHeadlessTest(unittest.TestCase):
         panel.review_accounts = {'其他应收款': Variable(False), '其他应付款': Variable(False)}
         panel.scope_summary = Variable()
         panel._update_scope_summary()
-        self.assertIn('全部 2 个已设置科目', panel.scope_summary.get())
-        self.assertIn('未选择 = 全部', panel.scope_summary.get())
-        self.assertIn('不继承当前明细筛选', panel.scope_summary.get())
+        self.assertEqual(panel.scope_summary.get(), '抽查科目 · 未勾选即全部（2 个）')
         panel.review_accounts['其他应付款'].set(True)
         panel._update_scope_summary()
-        self.assertIn('已选 1 个专项科目', panel.scope_summary.get())
+        self.assertEqual(panel.scope_summary.get(), '抽查科目 · 已选 1 个')
 
-        panel.lane = Variable('uncertain')
-        panel.account = Variable('1002')
-        panel.period = Variable('2026/1')
+        panel.lane = Variable('candidates')
         panel.category = Variable('借款')
         panel.show_ignored = Variable(True)
         calls = []
         panel.refresh_rows = lambda: calls.append(True)
         panel._show_all_results()
         self.assertEqual(panel.lane.get(), 'all')
-        self.assertEqual(panel.account.get(), '')
-        self.assertEqual(panel.period.get(), '全部期间')
         self.assertEqual(panel.category.get(), '全部')
         self.assertFalse(panel.show_ignored.get())
         self.assertEqual(calls, [True])
+
+    def test_more_options_does_not_hide_visible_account_choices(self):
+        panel = ReviewPanel.__new__(ReviewPanel)
+        panel.options, panel.scope_options = Mock(), Mock()
+        panel.more_button, panel.progress_label = Mock(), Mock()
+        panel.options.winfo_manager.return_value = ''
+        panel._toggle_options()
+        panel.options.pack.assert_called_once_with(fill='x', padx=6, before=panel.progress_label)
+        panel.options.winfo_manager.return_value = 'pack'
+        panel._toggle_options()
+        panel.options.pack_forget.assert_called_once_with()
+        self.assertEqual(panel.scope_options.mock_calls, [])
+
+    def test_narrow_toolbar_wraps_independently_of_the_result_table(self):
+        bar, actions, paging = Mock(), Mock(), Mock()
+        actions.winfo_reqwidth.return_value = 210
+        paging.winfo_reqwidth.return_value = 180
+        review_toolbar(bar, actions, paging)
+        reflow = bar.bind.call_args.args[1]
+        reflow(SimpleNamespace(width=380))
+        paging.grid_configure.assert_called_once_with(row=1, column=0, columnspan=2, pady=(3, 0))
+        reflow(SimpleNamespace(width=650))
+        self.assertEqual(paging.grid_configure.call_args.kwargs['row'], 0)
+
+    def test_account_choices_fill_the_width_instead_of_stopping_at_three_columns(self):
+        positions, rows = account_choice_positions(650, [90] * 12)
+        self.assertEqual(rows, 2)
+        self.assertEqual(sum(row == 0 for _left, row, _width in positions), 6)
+        positions, rows = account_choice_positions(260, [250, 72, 73, 60])
+        self.assertEqual(rows, 2)
+        self.assertEqual([row for _left, row, _width in positions], [0, 1, 1, 1])
+
+    def test_account_area_only_scrolls_when_more_than_three_rows_are_required(self):
+        panel = ReviewPanel.__new__(ReviewPanel)
+        panel.account_canvas, panel.account_scroll, panel.account_selection = Mock(), Mock(), Mock()
+        panel.account_window = 'choices'
+        panel.account_scroll.winfo_reqwidth.return_value = 15
+        panel.account_selection.winfo_children.return_value = [
+            Mock(winfo_reqwidth=Mock(return_value=90), winfo_reqheight=Mock(return_value=24))
+            for _index in range(12)]
+        panel._layout_account_choices(SimpleNamespace(width=650))
+        self.assertEqual(panel.account_canvas.configure.call_args.kwargs['height'], 48)
+        panel.account_scroll.grid_remove.assert_called_once_with()
+        panel._layout_account_choices(SimpleNamespace(width=300))
+        self.assertEqual(panel.account_canvas.configure.call_args.kwargs['height'], 72)
+        self.assertEqual(panel.account_canvas.configure.call_args.kwargs['scrollregion'], (0, 0, 285, 144))
+        panel.account_scroll.grid.assert_called_once()
+
+    def test_start_button_prepares_and_starts_in_place_without_preview(self):
+        panel = ReviewPanel.__new__(ReviewPanel)
+        panel.app = SimpleNamespace(store=self.store, import_busy=False, controller=SimpleNamespace(preferences={}))
+        panel.preparing = False
+        panel.review_accounts = {'其他应付款': Variable(True)}
+        panel.progress, panel.lane, panel.category, panel.show_ignored = Variable(), Variable(), Variable(), Variable()
+        panel.start_button, panel.cancel_button, panel.refresh, panel.view = Mock(), Mock(), Mock(), Mock()
+        panel.view.selection.return_value = ()
+        with patch('ledger_viewer.jev_ui.ConsentDialog') as preview, patch('ledger_viewer.jev_ui.ReviewJob') as job, \
+             patch('ledger_viewer.jev_ui.get_api_key', return_value='fake'), \
+             patch('ledger_viewer.jev_ui.get_deepseek_key', return_value=''), patch('ledger_viewer.jev_ui.get_bailian_key', return_value=''):
+            panel.new_batch()
+            preview.assert_not_called()
+            job.return_value.start.assert_called_once_with(self.store)
+            job.return_value.start.side_effect = ValueError('请检查密钥')
+            panel.new_batch()
+            self.assertIn('请检查密钥', panel.progress.get())
+        self.assertEqual(panel.lane.get(), 'candidates')
+        self.assertEqual(json.loads(batch_info(self.store, panel.batch_id)['scope_json'])['review_accounts'], ['其他应付款'])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM jev_batches').fetchone()[0], 2)
+
+    def test_bulk_actions_only_use_current_vouchers_without_opening_details(self):
+        source = self.store.path.parent / 'second.csv'
+        source.write_text('日期,凭证号,科目编码,科目名称,摘要,借方金额,贷方金额\n'
+                          '2026-01-02,2,2241,其他应付款,股东借款,0,50\n', encoding='utf-8')
+        header, _, mapping = guess_header(source, 'CSV', 'entry')
+        self.store.import_sheet(ImportSpec(source, 'CSV', header, 'entry', mapping))
+        batch = prepare_batch(self.store, {})
+        groups = voucher_results(self.store, batch, lane='all')
+        self.assertEqual(len(groups), 2)
+        keys = tuple(group['key'] for group in groups)
+        panel = ReviewPanel.__new__(ReviewPanel)
+        panel._result_scope = (self.store.path, batch)
+        panel.rows = {group['key']: group for group in groups}
+        panel.rows.update(history={'local_total': 1, 'lines': [{'stale': 1}]},
+                          missing={'local_total': 0, 'lines': [{'stale': 0}]})
+        panel.view = Mock()
+        panel.view.get_children.return_value = tuple(panel.rows)
+        panel.view.selection.return_value = (*keys, 'history', 'missing')
+        panel.mark_button, panel.join_button, panel.select_page_button = Mock(), Mock(), Mock()
+        panel.selection_label = Variable()
+        panel.app = SimpleNamespace(workbench=Mock(), mark_voucher_keys=Mock(side_effect=lambda selected: mark_vouchers(self.store, selected)))
+        panel.open_detail = Mock()
+        mark_vouchers(self.store, keys[:1])
+        self.store.db.execute("UPDATE voucher_marks SET note='已有备注' WHERE voucher_key=?", keys[:1])
+        self.store.db.commit()
+        self.assertEqual(panel._select_page(), 'break')
+        panel.view.selection_set.assert_called_once_with(list(keys))
+        self.assertIn('跳过 2 张', panel.selection_label.get())
+        panel._mark_selected()
+        panel._join_selected()
+        panel.app.mark_voucher_keys.assert_called_once_with(keys)
+        panel.app.workbench.choose_issue.assert_called_once_with(keys)
+        panel.open_detail.assert_not_called()
+        self.assertEqual(dict(self.store.db.execute('SELECT voucher_key,note FROM voucher_marks').fetchall()),
+                         {keys[0]: '已有备注', keys[1]: ''})
+        panel._result_scope = None
+        panel._mark_selected()
+        panel._join_selected()
+        panel.app.mark_voucher_keys.assert_called_once()
+        panel.app.workbench.choose_issue.assert_called_once()
 
 
 if __name__ == '__main__':

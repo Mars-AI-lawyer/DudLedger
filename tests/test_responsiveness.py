@@ -355,7 +355,7 @@ class ResponsivenessTest(unittest.TestCase):
         client.assert_not_called()
         self.assertEqual(self.app.store.db.execute('SELECT COUNT(*) FROM jev_batches').fetchone()[0], 0)
 
-    def test_background_preview_cannot_open_consent_after_book_exit(self):
+    def test_background_preparation_cannot_start_review_after_book_exit(self):
         started, release, finished = threading.Event(), threading.Event(), threading.Event()
         def prepare(store, scope, *, cancelled, progress):
             started.set()
@@ -366,14 +366,14 @@ class ResponsivenessTest(unittest.TestCase):
             return 123
         with patch.object(self.app.store, 'large_book', return_value=True), \
              patch('ledger_viewer.jev_ui.prepare_batch', side_effect=prepare), \
-             patch('ledger_viewer.jev_ui.ConsentDialog') as consent:
+             patch.object(self.app.review_panel, '_start_prepared_batch') as launch:
             self.app.review_panel.prepare({})
             self.wait_for(started.is_set)
             self.app.close_book()
             release.set()
             self.wait_for(finished.is_set)
             self.root.update()
-            consent.assert_not_called()
+            launch.assert_not_called()
         self.assertFalse(self.app.review_panel.preparing)
 
     def test_stopping_background_import_rolls_back_current_sheet(self):

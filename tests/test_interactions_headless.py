@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from ledger_viewer.account_navigation import AccountNavigation
-from ledger_viewer.detail_filter_ui import MonthSelection, heading_filter_column, month_label
+from ledger_viewer.detail_filter_ui import MonthSelection, heading_column, month_label
 from ledger_viewer.detail_filters import make_condition
 from ledger_viewer.importer import classify_sheet
 from ledger_viewer.review_rules_ui import ReviewRulesDialog
@@ -126,16 +126,17 @@ class MonthAndColumnTest(unittest.TestCase):
         model.choose('2019-01', True)
         self.assertIsNone(model.condition())
 
-    def test_only_relevant_headings_open_filters_and_separators_stay_draggable(self):
+    def test_context_targets_data_headings_and_leaves_separators_draggable(self):
         view = Mock()
         view.identify_region.return_value = 'heading'
         view.identify_column.return_value = '#2'
         for column in ('date', 'summary', 'debit', 'credit', 'original', 'name', 'counterparty', 'period', 'maker'):
             view.column.return_value = column
-            expected = column if column in ('date', 'summary', 'debit', 'credit', 'original') else None
-            self.assertEqual(heading_filter_column(view, 50, 10), expected)
+            self.assertEqual(heading_column(view, 50, 10), column)
+        view.identify_column.return_value = '#0'
+        self.assertIsNone(heading_column(view, 50, 10))
         view.identify_region.return_value = 'separator'
-        self.assertIsNone(heading_filter_column(view, 50, 10))
+        self.assertIsNone(heading_column(view, 50, 10))
 
     def test_summary_and_month_amount_filters_keep_paging_totals_and_export_consistent(self):
         with tempfile.TemporaryDirectory() as folder:

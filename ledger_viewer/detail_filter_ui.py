@@ -5,7 +5,7 @@ from tkinter import ttk
 
 from . import theme
 from .background import BackgroundTasks
-from .detail_filters import make_condition
+from .detail_filters import TEXT_COLUMNS, make_condition
 from .store import LedgerStore
 
 
@@ -25,12 +25,11 @@ def filter_arrow(view, active=False):
     return image
 
 
-def heading_filter_column(view, x: int, y: int) -> str | None:
+def heading_column(view, x: int, y: int) -> str | None:
     if view.identify_region(x, y) != "heading":
         return None
     display = view.identify_column(x)
-    column = view.column(display, "id")
-    return column if column in ('date', 'summary', 'debit', 'credit', 'original') else None
+    return view.column(display, "id") if display and display != '#0' else None
 
 
 def month_label(month):
@@ -38,7 +37,7 @@ def month_label(month):
     return f'{year}年{int(number)}月'
 
 
-def condition_label(condition):
+def condition_label(condition, labels=None):
     if condition.column == 'date' and condition.operator == 'months':
         labels = [month_label(value) for value in condition.values]
         text = '、'.join(labels[:3]) + (f' 等{len(labels)}个月' if len(labels) > 3 else '')
@@ -46,7 +45,7 @@ def condition_label(condition):
     if condition.column == 'summary':
         text = condition.values[0]
         return '摘要：' + (text[:16] + '…' if len(text) > 16 else text)
-    name = {'debit': '借方', 'credit': '贷方', 'original': '原币金额', 'date': '日期'}.get(condition.column, condition.column)
+    name = (labels or {}).get(condition.column, condition.column)
     operation = {'gt': '>', 'ge': '≥', 'eq': '=', 'le': '≤', 'lt': '<', 'between': '介于', 'contains': '包含', 'excludes': '不包含'}[condition.operator]
     return name + ' ' + operation + ' ' + ' 至 '.join(condition.values)
 
@@ -90,7 +89,6 @@ class DetailFilterDialog(tk.Toplevel):
         self.field.pack(fill='x', pady=(0, 10))
         self.field.set(self.field_labels[column])
         self.field.bind('<<ComboboxSelected>>', self._field_changed)
-        self.sorting = ttk.Frame(body)
         self.editor = ttk.Frame(body)
         self.editor.pack(fill='x')
         self.error = tk.StringVar(self)
@@ -114,17 +112,11 @@ class DetailFilterDialog(tk.Toplevel):
     def _field_changed(self, _event=None):
         self.error.set('')
         self.column = tuple(self.field_labels)[self.field.current()]
-        for child in (*self.editor.winfo_children(), *self.sorting.winfo_children()):
+        for child in self.editor.winfo_children():
             child.destroy()
-        self.sorting.pack_forget()
         self.clear.configure(state='normal' if self.app._has_detail_filter(self.column) else 'disabled')
         self.apply.configure(state='normal')
         condition = self.app.detail_conditions.get(self.column)
-        if self.column != 'summary':
-            self.sorting.pack(fill='x', before=self.editor, pady=(0, 12))
-            first, last = ('日期从早到晚', '日期从晚到早') if self.column == 'date' else ('金额从小到大', '金额从大到小')
-            ttk.Button(self.sorting, text='↑ ' + first, command=lambda: self._sort(False)).pack(side='left')
-            ttk.Button(self.sorting, text='↓ ' + last, command=lambda: self._sort(True)).pack(side='left', padx=(6, 0))
         if self.column == 'date':
             selected = condition.values if condition and condition.operator == 'months' else ()
             self.selected_months = set(selected)
@@ -133,9 +125,9 @@ class DetailFilterDialog(tk.Toplevel):
         values = condition.values if condition else ('',)
         self.start = tk.StringVar(self, values[0])
         self.end = tk.StringVar(self, values[1] if len(values) > 1 else '')
-        if self.column == 'summary':
-            self.operation = 'contains'
-            ttk.Label(self.editor, text='摘要包含关键词').pack(anchor='w', pady=(0, 4))
+        if self.column in TEXT_COLUMNS:
+            self.operation = condition.operator if condition else 'contains'
+            ttk.Label(self.editor, text=f'{self.labels[self.column]}包含关键词').pack(anchor='w', pady=(0, 4))
             entry = ttk.Entry(self.editor, textvariable=self.start, width=34)
             entry.pack(fill='x')
             entry.bind('<Return>', lambda _event: self._apply())
@@ -247,19 +239,13 @@ class DetailFilterDialog(tk.Toplevel):
     def _clear(self):
         self._commit(None)
 
-    def _sort(self, descending):
-        column = self.column
-        self.destroy()
-        if self.app.store is self.store:
-            self.app.sort_details(column, descending=descending)
-
     def _apply(self):
         if self.column == 'date':
             if not hasattr(self, 'month_selection'):
                 return
             self._commit(self.month_selection.condition())
             return
-        if self.column == 'summary' and not self.start.get().strip():
+        if self.column in TEXT_COLUMNS and not self.start.get().strip():
             self._commit(None)
             return
         values = (self.start.get(), self.end.get()) if self.operation == 'between' else (self.start.get(),)

@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from pathlib import Path
-from tkinter import ttk
 from unittest.mock import patch
 
 from openpyxl import Workbook
@@ -44,16 +43,16 @@ class ToolLayoutUITest(unittest.TestCase):
             self.assertGreaterEqual(view.column(key, 'width'), readable_minimum(key, view.column(key, 'minwidth')))
         self.assertLessEqual(view.xview()[0], view.xview()[1])
 
-    def test_main_columns_fit_both_tools_and_restore_after_closing(self):
+    def test_issue_panel_fits_columns_and_restores_original_widths_when_closed(self):
         view = self.app.detail_view
         original = {key: view.column(key, 'width') for key in self.app.table_fit.columns(view)}
-        height = view.winfo_height()
+        size = view.winfo_width(), view.winfo_height()
         self.app.workbench.show()
         self.root.update()
         self.assertFalse(self.app.workbench.detached)
-        self.assert_fitted(view)
-        self.assertEqual(view.winfo_height(), height)
-        self.drag_grip(55)
+        self.assertEqual(self.app.workbench.winfo_manager(), 'grid')
+        self.assertEqual(view.winfo_height(), size[1])
+        self.assertLess(view.winfo_width(), size[0])
         self.assert_fitted(view)
         self.app.workbench.hide()
         self.root.update()
@@ -85,6 +84,52 @@ class ToolLayoutUITest(unittest.TestCase):
         panel.show_calculator()
         self.root.update()
         self.assertEqual(panel.winfo_width(), saved_calc_width)
+
+    def test_workbench_never_overlaps_tables_and_scrollbars_at_minimum_width(self):
+        self.app.geometry('820x650')
+        self.app.workbench.show()
+        self.app.toggle_detail_accounts(True, persist=False)
+        panel = self.app.workbench
+        for page, view in (
+            ('accounts', self.app.summary_view), ('entries', self.app.detail_view),
+            ('reports', self.app.report_views['balance_sheet']), ('marks', self.app.mark_view),
+            ('review', self.app.review_panel.view),
+        ):
+            with self.subTest(page=page):
+                self.app.select_page(page)
+                self.root.update()
+                self.assertEqual(panel.winfo_manager(), 'grid')
+                self.assertGreater(view.winfo_width(), 100)
+                self.assertLessEqual(view.master.winfo_rootx() + view.master.winfo_width(), panel.grip.winfo_rootx())
+                view.xview_moveto(1)
+                first, last = view.xview()
+                self.assertGreater(first, 0)
+                self.assertAlmostEqual(last, 1)
+        self.assertTrue(self.app.review_panel.scope_options.winfo_ismapped())
+
+    def test_review_displays_more_than_three_accounts_across_a_wide_window(self):
+        self.app.select_page('review')
+        self.root.update()
+        panel = self.app.review_panel
+        options = panel.account_selection.winfo_children()
+        self.assertGreater(sum(option.winfo_y() == 0 for option in options), 3)
+        self.assertFalse(panel.account_scroll.winfo_ismapped())
+
+    def test_related_parties_dialog_keeps_fields_visible_while_list_scrolls(self):
+        for index in range(18):
+            self.app.store.save_related_party(f'测试主体{index:02}', [], '')
+        dialog = self.app.open_related_parties()
+        self.addCleanup(lambda: dialog.destroy() if dialog.winfo_exists() else None)
+        self.root.update()
+        panel = dialog.panel
+        panel.view.yview_moveto(1)
+        first, last = panel.view.yview()
+        self.assertGreater(first, 0)
+        self.assertEqual(last, 1)
+        self.assertTrue(panel.name_entry.winfo_ismapped())
+        self.assertIs(dialog.focus_get(), panel.name_entry)
+        footer = panel.grid_slaves(row=3)[0]
+        self.assertLessEqual(footer.winfo_rooty() + footer.winfo_height(), dialog.winfo_rooty() + dialog.winfo_height())
 
     def test_voucher_source_can_be_enabled_and_imported_reports_stay_compact(self):
         self.assertEqual(visible_columns('voucher', ['code', 'debit', 'source']), ['code', 'debit', 'source'])
@@ -119,8 +164,8 @@ class ToolLayoutUITest(unittest.TestCase):
         panel = self.app.review_panel
         self.app.select_page('review')
         self.root.update()
-        selection = next(child for child in panel.winfo_children() if isinstance(child, ttk.LabelFrame))
-        checkbox = selection.winfo_children()[0]
+        self.assertTrue(panel.scope_options.winfo_ismapped())
+        checkbox = panel.account_selection.winfo_children()[0]
         name = checkbox.cget('text')
         self.assertEqual(checkbox.cget('style'), 'Sampling.TCheckbutton')
         checkbox.invoke()

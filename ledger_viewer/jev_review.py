@@ -582,7 +582,7 @@ class ReviewJob:
         self.thread = None
 
     def start(self, store):
-        """Called only by the explicit confirm action after previewing this batch."""
+        """Validate and start a locally prepared batch after a user start action."""
         path = str(self.path.resolve())
         with _ACTIVE_LOCK:
             if path in _ACTIVE:
@@ -590,7 +590,7 @@ class ReviewJob:
             with store.db:
                 info = batch_info(store, self.batch_id)
                 if not info or info['status'] != 'preview':
-                    raise ValueError('批次已确认或失效，请重新预览')
+                    raise ValueError('批次已开始或失效，请重新开始抽查')
                 special = json.loads(info['body_json']).get('profile') == 'account-special-v1'
                 scope = json.loads(info['scope_json'])
                 if special and scope.get('bailian_free_confirmed') is not True:
@@ -619,7 +619,7 @@ class ReviewJob:
                 else:
                     current_rule, _ = load_rules(store)
                 if current_rule != info['rule_id']:
-                    raise ValueError('规则已变化，请重新预览并确认')
+                    raise ValueError('规则已变化，请重新开始抽查')
                 store.db.execute("UPDATE jev_batches SET status='running',confirmed_at=CURRENT_TIMESTAMP WHERE id=?", (self.batch_id,))
             _ACTIVE[path] = self
         self.thread = threading.Thread(target=self._run, daemon=True, name='jev-review')
@@ -1004,11 +1004,9 @@ def voucher_results(store, batch_id, tier='谨慎', lane='scored', account='', c
         if lane == 'completed':
             hits = lines if all(r['status'] in ('success', 'failed', 'skipped') for r in lines) else []
         elif lane == 'candidates':
-            hits = [r for r in successful if needs_review(r, threshold, tier)]
-            if any(r['status'] not in ('success', 'failed', 'skipped') for r in lines):
-                hits = []
-            elif any(r['status'] == 'failed' for r in lines):
-                hits = lines
+            hits = [r for r in lines if r['stale'] or r['status'] in ('failed', 'interrupted', 'cancelled')
+                or (r['status'] == 'success' and needs_review(r, threshold, tier))
+                or (r['status'] == 'pending' and context['info']['status'] not in ('preview', 'running'))]
         elif lane == 'scored':
             hits = [r for r in successful if has_topic_hit(r, threshold)]
         elif lane == 'uncertain':

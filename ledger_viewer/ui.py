@@ -27,9 +27,9 @@ from .deepseek_mapping import delete_api_key as deepseek_delete_api_key, get_api
 from .bailian_review import (DEFAULT_ENDPOINT as BAILIAN_ENDPOINT, delete_api_key as bailian_delete_api_key,
     get_api_key as bailian_get_api_key, key_memory_only as bailian_memory_only,
     save_api_key as bailian_save_api_key, validate_endpoint as validate_bailian_endpoint)
-from .detail_filters import EntryCondition
+from .detail_filters import EntryCondition, FILTER_COLUMNS
 from .shortcuts import VoucherShortcuts, configured_shortcuts, validate_shortcuts, SHORTCUT_LABELS, DEFAULT_SHORTCUTS, event_shortcut
-from .detail_filter_ui import DetailFilterDialog, filter_arrow, heading_filter_column
+from .detail_filter_ui import DetailFilterDialog, filter_arrow, heading_column
 from .grid_lines import DashedGrid
 from .importer import REPORT_KINDS, ImportSpec, classify_sheet, is_cashflow_sheet, file_hash, format_money, guess_header, guess_mapping, header_for_row, rows, sheet_names, text_value
 from .jev_mapping import delete_api_key, get_api_key, key_memory_only, save_api_key
@@ -102,7 +102,7 @@ DEFAULT_COLUMNS = {
     "voucher": ["code", "name", "summary", "debit", "credit"],
 }
 
-DETAIL_FILTER_LABELS = {key: title for key, title, _ in VIEW_COLUMNS["detail"] if key in ("summary", "date", "debit", "credit", "original")}
+DETAIL_FILTER_LABELS = {key: title for key, title, _ in VIEW_COLUMNS["detail"] if key in FILTER_COLUMNS}
 
 
 MONEY_COLUMN_KEYS = {"od", "oc", "pd", "pc", "yd", "yc", "cd", "cc", "debit", "credit", "original", "left_a", "left_b", "left_c", "right_a", "right_b", "right_c", "a", "b"}
@@ -160,7 +160,7 @@ def tree(parent: tk.Widget, columns: list[tuple[str, str, int]]) -> ttk.Treeview
         owner = parent.winfo_toplevel()
         controller = getattr(owner, "controller", None) or getattr(getattr(owner, "ledger_app", None), "controller", None)
         mode = getattr(controller, "scroll_mode", "system")
-        if mode == "system" or not event.delta:
+        if mode == "system" or not event.delta or event.state & 1:
             return None
         view.yview_scroll((-1 if event.delta > 0 else 1) * (1 if mode == "gentle" else 5), "units")
         return "break"
@@ -730,34 +730,40 @@ class RelatedPartiesPanel(ttk.Frame):
 
     Frame 形态以便同时用于独立对话框与设置对话框标签页。"""
 
-    def __init__(self, master, parent: "App"):
+    def __init__(self, master, parent: "App", on_close=None):
         super().__init__(master, padding=12)
         self.parent = parent
-        ttk.Label(self, text="手动输入只需名称与关系。AI 抽查时，当前账套名单中的名称、别名、身份及“与目标公司关系”"
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        notice = ttk.Label(self, text="手动输入只需名称与关系。AI 抽查时，当前账套名单中的名称、别名、身份及“与目标公司关系”"
             "会随凭证发送到本次使用的模型（百炼、Jev 或 DeepSeek），备注不发送。"
             "名单用于识别交易主体与关联资金往来；客户、供应商等不会仅因入选名单就被认定为关联方。",
-            foreground=theme.MUTED, wraplength=620, justify="left").pack(anchor="w")
-        self.view = ttk.Treeview(self, columns=("name", "relation", "roles"), show="headings", height=9)
-        for key, title, width in (("name", "名称", 220), ("relation", "与目标公司关系", 220), ("roles", "身份", 150)):
-            self.view.heading(key, text=title)
-            self.view.column(key, width=width)
-        self.view.pack(fill="both", expand=True, pady=(8, 10))
+            foreground=theme.MUTED, wraplength=620, justify="left")
+        notice.grid(row=0, column=0, sticky="ew")
+        notice.bind("<Configure>", lambda event: notice.configure(wraplength=max(200, min(620, event.width))))
+        table = ttk.Frame(self)
+        table.grid(row=1, column=0, sticky="nsew", pady=(8, 10))
+        self.view = tree(table, [("name", "名称", 205), ("relation", "与目标公司关系", 245), ("roles", "身份", 140)])
+        self.view.configure(height=9)
         self.view.bind("<<TreeviewSelect>>", self._select)
         form = ttk.Frame(self)
-        form.pack(fill="x")
+        form.grid(row=2, column=0, sticky="ew")
         ttk.Label(form, text="名称").grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.name_var).grid(row=0, column=1, sticky="ew", pady=3)
+        self.name_entry = ttk.Entry(form, textvariable=self.name_var)
+        self.name_entry.grid(row=0, column=1, sticky="ew", pady=3)
         ttk.Label(form, text="与目标公司关系").grid(row=1, column=0, sticky="w")
         self.relation_var = tk.StringVar()
         ttk.Entry(form, textvariable=self.relation_var).grid(row=1, column=1, sticky="ew", pady=3)
         form.columnconfigure(1, weight=1)
         buttons = ttk.Frame(self)
-        buttons.pack(fill="x", pady=(10, 0))
+        buttons.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         ttk.Button(buttons, text="新增", command=self._clear).pack(side="left")
         ttk.Button(buttons, text="批量导入", command=lambda: RelatedPartyImportDialog(self)).pack(side="left", padx=6)
         ttk.Button(buttons, text="删除所选", command=self._delete, style="Danger.TButton").pack(side="left")
-        ttk.Button(buttons, text="保存", command=self._save, style="Accent.TButton").pack(side="right")
+        if on_close is not None:
+            ttk.Button(buttons, text="完成", command=on_close).pack(side="right")
+        ttk.Button(buttons, text="保存", command=self._save, style="Accent.TButton").pack(side="right", padx=(0, 6))
         self._refresh()
 
     def _refresh(self) -> None:
@@ -788,6 +794,7 @@ class RelatedPartiesPanel(ttk.Frame):
             self.view.selection_remove(*selected)
         self.name_var.set("")
         self.relation_var.set("")
+        self.name_entry.focus_set()
 
     def _save(self) -> None:
         if not self.parent.store:
@@ -812,6 +819,7 @@ class RelatedPartiesPanel(ttk.Frame):
             return
         self._refresh()
         self.view.selection_set(str(saved_id))
+        self.view.see(str(saved_id))
 
     def _delete(self) -> None:
         if not self.parent.store:
@@ -828,14 +836,18 @@ class RelatedPartiesDialog(tk.Toplevel):
 
     def __init__(self, parent: "App"):
         super().__init__(parent)
+        self.withdraw()
         self.parent = parent
         self.title("当前项目 · 尽调主体名单")
-        self.geometry("680x520")
         self.transient(parent)
-        self.panel = RelatedPartiesPanel(self, parent)
+        self.panel = RelatedPartiesPanel(self, parent, on_close=self.destroy)
         self.panel.pack(fill="both", expand=True)
-        ttk.Button(self.panel, text="完成", command=self.destroy).pack(side="right", pady=(8, 0))
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.minsize(530, 315)
+        center_window(self, parent, 700, 520)
+        self.deiconify()
         self.grab_set()
+        self.panel.name_entry.focus_set()
 
 
 class ReconciliationDialog(tk.Toplevel):
@@ -2277,7 +2289,7 @@ class App(tk.Toplevel):
         self.detail_search_wrap.grid(row=0, column=1, sticky='ew', padx=(4, 8))
         self.detail_search_wrap.columnconfigure(1, weight=1)
         ttk.Label(self.detail_search_wrap, text='全文', style='Hint.TLabel').grid(row=0, column=0, padx=(0, 4))
-        self.detail_search_entry = ttk.Entry(self.detail_search_wrap, textvariable=self.search)
+        self.detail_search_entry = ttk.Entry(self.detail_search_wrap, textvariable=self.search, width=12)
         self.detail_search_entry.grid(row=0, column=1, sticky='ew')
         self.detail_search_entry.bind('<Return>', lambda _event: self.submit_detail_search())
         self.detail_search_entry.bind('<Escape>', lambda _event: self.clear_detail_search())
@@ -2304,6 +2316,7 @@ class App(tk.Toplevel):
         self.detail_filter_button = ttk.Button(self.detail_actions, text='筛选', width=0,
                                                style='Ghost.TButton', command=self._open_detail_filter)
         self.detail_filter_button.pack(side='right', padx=(0, 4))
+        self.navigation_tooltip.attach(self.detail_filter_button, lambda: '单击列标题排序；右击可筛选、隐藏或恢复列')
         self.detail_controls.bind("<Configure>", self._resize_detail_controls)
         self.detail_scope.bind("<Configure>", self._resize_detail_controls)
         self.detail_actions.bind("<Configure>", self._resize_detail_controls)
@@ -2312,12 +2325,15 @@ class App(tk.Toplevel):
         self.detail_page_label = tk.StringVar(value="第 1 / 1 页")
         self.detail_body = ttk.Panedwindow(frames[1], orient="horizontal")
         self.detail_body.pack(fill="both", expand=True)
+        self.detail_body.bind("<Configure>", self._fit_detail_account_pane)
         self.detail_accounts = AccountNavigation(self.detail_body, self._choose_detail_account)
         self.detail_table = ttk.Frame(self.detail_body)
         self.detail_body.add(self.detail_table, weight=1)
         self.detail_view = tree(self.detail_table, VIEW_COLUMNS["detail"])
         self.detail_filter_images = (filter_arrow(self.detail_view), filter_arrow(self.detail_view, active=True))
-        self.detail_view.bind("<ButtonPress-1>", self._detail_filter_click)
+        self.detail_heading_menu = tk.Menu(self.detail_view, tearoff=False)
+        self.detail_restore_menu = tk.Menu(self.detail_heading_menu, tearoff=False)
+        self._bind_detail_headings()
         self.detail_tools = TableTools(self.detail_view, {"debit", "credit", "original"},
                                        panel_parent=self.workbench.calculator_host("明细账"), show_stats=False, merged_feedback=True,
                                        on_toggle=lambda reveal: self.workbench.set_calculator(self.detail_tools, "明细账", reveal))
@@ -2345,8 +2361,6 @@ class App(tk.Toplevel):
         self.detail_view.bind("<Double-1>", self.open_voucher)
         self.detail_view.bind("<Return>", self.open_voucher)
         self.detail_view.bind("<<TreeviewSelect>>", self._update_detail_mark, add="+")
-        for key in DETAIL_FILTER_LABELS:
-            self.detail_view.heading(key, command=lambda column=key: self._open_detail_filter(column))
         self._update_detail_headings()
         self.report_views: dict[str, ttk.Treeview] = {}
         self.report_info: dict[str, tk.StringVar] = {}
@@ -2394,18 +2408,22 @@ class App(tk.Toplevel):
         self.source_view.bind("<Double-1>", lambda _event: self.show_precheck_detail())
         mark_top = ttk.Frame(frames[6], padding=5)
         mark_top.pack(fill="x")
+        mark_top.columnconfigure(0, weight=1)
         mark_search_row = ttk.Frame(mark_top)
-        mark_search_row.pack(fill="x")
+        mark_search_row.grid(row=0, column=0, sticky='ew')
         ttk.Label(mark_search_row, text="查找").pack(side="left")
-        mark_entry = ttk.Entry(mark_search_row, textvariable=self.mark_search)
+        mark_entry = ttk.Entry(mark_search_row, textvariable=self.mark_search, width=12)
         mark_entry.pack(side="left", fill="x", expand=True, padx=5)
         mark_entry.bind("<Return>", lambda _event: self.refresh_marks())
         ttk.Button(mark_search_row, text="筛选", style="Ghost.TButton", command=self.refresh_marks).pack(side="left")
-        self.mark_note_toggle = ttk.Button(mark_search_row, text='编辑备注 ▸', style="Ghost.TButton", command=self.toggle_mark_note)
+        mark_actions = ttk.Frame(mark_top)
+        mark_actions.grid(row=0, column=1, sticky='e')
+        mark_top.bind('<Configure>', lambda _event: self._flow_bar(mark_top, mark_search_row, mark_actions))
+        self.mark_note_toggle = ttk.Button(mark_actions, text='编辑备注 ▸', style="Ghost.TButton", command=self.toggle_mark_note)
         self.mark_note_toggle.pack(side='left', padx=(8, 0))
-        self.mark_join = ttk.Button(mark_search_row, text="加入问题…（0）", command=lambda: self._join_selected(self.mark_view, self.mark_selection), state='disabled')
+        self.mark_join = ttk.Button(mark_actions, text="加入问题…（0）", command=lambda: self._join_selected(self.mark_view, self.mark_selection), state='disabled')
         self.mark_join.pack(side='right', padx=4)
-        mark_more = ttk.Menubutton(mark_search_row, text='更多 ▾')
+        mark_more = ttk.Menubutton(mark_actions, text='更多 ▾')
         mark_more.pack(side='right')
         mark_menu = tk.Menu(mark_more, tearoff=False)
         mark_menu.add_command(label='取消所选关注…', command=self.remove_selected_mark)
@@ -2624,8 +2642,7 @@ class App(tk.Toplevel):
     def update_workbench_presentation(self) -> None:
         count = getattr(self, 'workbench_count', 0)
         detached = bool(getattr(self.workbench, 'detached', False))
-        overlay = bool(getattr(self.workbench, 'overlay', False))
-        state = ' · 独立显示' if detached and self.workbench.issues_visible else ' · 覆盖显示' if overlay else ''
+        state = ' · 独立显示' if detached and self.workbench.issues_visible else ''
         text = '问题工作台' + (f'  {count}' if count else '') + state
         self.workbench_button.configure(text=text)
         issues_open = ((detached and self.workbench.window.state() != 'withdrawn') or
@@ -2718,7 +2735,6 @@ class App(tk.Toplevel):
         review.add_command(label="关注凭证", command=lambda: self.select_page("marks"))
         review.add_command(label="问题工作台", command=self.workbench.show)
         review.add_command(label="AI 尽调线索", command=lambda: (self.review_panel.refresh(), self.select_page("review")))
-        review.add_command(label="筛选全部凭证…", command=lambda: (self.select_page("review"), self.review_panel.new_batch()))
         review.add_command(label="尽调主体名单…", command=self.open_related_parties)
         review.add_command(label="核对提醒…", command=lambda: self.open_utility("核对提醒"))
         review.add_command(label="核对范围…", command=self.open_reconciliation)
@@ -2727,6 +2743,8 @@ class App(tk.Toplevel):
         options.add_command(label="偏好设置…", command=self.open_settings)
         options.add_command(label="新账套默认文件夹…", command=self.choose_book_folder)
         options.add_command(label="AI审查设置", command=self.open_review_rules)
+        options.add_command(label="AI 抽查发送预览（可选）…",
+                            command=lambda: (self.select_page("review"), self.review_panel.new_batch(preview=True)))
         menu.add_cascade(label="设置", menu=options)
         help_menu = tk.Menu(menu, tearoff=False)
         help_menu.add_command(label="重新查看使用引导", command=self.show_usage_tour)
@@ -3356,11 +3374,52 @@ class App(tk.Toplevel):
             initial = column or next((key for key in DETAIL_FILTER_LABELS if self._has_detail_filter(key)), "date")
             DetailFilterDialog(self, DETAIL_FILTER_LABELS, initial)
 
-    def _detail_filter_click(self, event):
-        column = heading_filter_column(self.detail_view, event.x, event.y)
-        if column is not None:
-            self._open_detail_filter(column)
-            return "break"
+    def _bind_detail_headings(self):
+        for key in ENTRY_SORT_COLUMNS:
+            self.detail_view.heading(key, command=lambda selected=key: self.sort_details(selected))
+        for sequence in ('<Button-2>', '<Button-3>'):
+            self.detail_view.bind(sequence, self._detail_heading_context)
+        if self.tk.call('tk', 'windowingsystem') == 'aqua':
+            self.detail_view.bind('<Control-Button-1>', self._detail_heading_context)
+
+    def _detail_heading_context(self, event):
+        column = heading_column(self.detail_view, event.x, event.y)
+        if column is None:
+            return None
+        menu = self.detail_heading_menu
+        menu.delete(0, 'end')
+        if column in DETAIL_FILTER_LABELS:
+            menu.add_command(label='筛选此列…', command=lambda: self._open_detail_filter(column))
+            if self._has_detail_filter(column):
+                menu.add_command(label='清除此列筛选', command=lambda: self._set_detail_filter(column, None))
+            menu.add_separator()
+        shown = self._shown_detail_columns()
+        menu.add_command(label='隐藏此列', state='normal' if len(shown) > 1 else 'disabled',
+                         command=lambda: self._set_detail_column_visibility(column, False))
+        hidden = [(key, title) for key, title, _ in VIEW_COLUMNS['detail'] if key not in shown]
+        if hidden:
+            self.detail_restore_menu.delete(0, 'end')
+            for key, title in hidden:
+                self.detail_restore_menu.add_command(label=title,
+                    command=lambda selected=key: self._set_detail_column_visibility(selected, True))
+            menu.add_cascade(label='恢复隐藏列', menu=self.detail_restore_menu)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
+    def _shown_detail_columns(self):
+        shown = tuple(self.detail_view.cget('displaycolumns'))
+        return tuple(self.detail_view.cget('columns')) if shown == ('#all',) else shown
+
+    def _set_detail_column_visibility(self, column, visible):
+        shown = self._shown_detail_columns()
+        selected = [key for key in shown if key != column]
+        if visible:
+            selected.append(column)
+        if selected:
+            self._change_columns('detail', selected)
 
     def _set_detail_filter(self, column: str, condition: EntryCondition | tuple[str, str] | None) -> None:
         if column == "period":
@@ -3404,7 +3463,7 @@ class App(tk.Toplevel):
     def sort_details(self, column: str, descending: bool | None = None) -> None:
         if column not in ENTRY_SORT_COLUMNS:
             return
-        self.detail_descending = descending if descending is not None else (not self.detail_descending if column == self.detail_sort else False)
+        self.detail_descending = descending if descending is not None else (column != self.detail_sort or not self.detail_descending)
         self.detail_sort = column
         self.refresh_details()
 
@@ -3704,11 +3763,11 @@ class App(tk.Toplevel):
         return name
 
     @staticmethod
-    def _flow_bar(container, first, second):
-        if container.winfo_width() < first.winfo_reqwidth() + second.winfo_reqwidth() + 12:
-            second.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+    def _flow_bar(container, first, second, *, column=1, between=0):
+        if container.winfo_width() < first.winfo_reqwidth() + second.winfo_reqwidth() + between + 12:
+            second.grid(row=1, column=0, columnspan=column + 1, sticky="w", pady=(4, 0))
         else:
-            second.grid(row=0, column=1, columnspan=1, sticky="e", pady=0)
+            second.grid(row=0, column=column, columnspan=1, sticky="e", pady=0)
 
     def _resize_detail_controls(self, event=None):
         width = self.detail_controls.winfo_width()
@@ -3717,7 +3776,8 @@ class App(tk.Toplevel):
         wrap = max(120, min(340, width // 2))
         if int(self.detail_scope.cget('wraplength')) != wrap:
             self.detail_scope.configure(wraplength=wrap)
-        self._flow_bar(self.detail_controls, self.detail_scope_wrap, self.detail_actions)
+        self._flow_bar(self.detail_controls, self.detail_scope_wrap, self.detail_actions,
+                       column=2, between=self.detail_search_wrap.winfo_reqwidth() + 12)
 
     def _detail_query_filters(self):
         period_start, period_end = self._period_bounds()
@@ -3796,7 +3856,7 @@ class App(tk.Toplevel):
         end = offset + len(rows_found)
         shown = f"显示 {offset + 1}—{end} 条" if rows_found else "暂无匹配明细"
         filter_count = len(self.detail_conditions) + bool(self.detail_search) + self._has_detail_filter("period")
-        filter_info = f" · 已筛选 {filter_count} 项" if filter_count else " · 点击摘要、日期或金额列标题筛选"
+        filter_info = f" · 已筛选 {filter_count} 项" if filter_count else " · 单击列标题排序，右击筛选或隐藏"
         self.detail_info.set(f"共 {total:,} 条 · {shown}{filter_info} · {self._period_label()}")
         self.detail_selection.set_context(self.detail_info.get())
         self._update_filter_chips()
@@ -3820,7 +3880,7 @@ class App(tk.Toplevel):
             ttk.Button(self.detail_filter_bar, text=f'期间：{self._period_label()} ×', style='Ghost.TButton',
                        command=lambda: self._set_detail_filter('period', None))
         for column, condition in self.detail_conditions.items():
-            ttk.Button(self.detail_filter_bar, text=condition_label(condition) + ' ×', style='Ghost.TButton',
+            ttk.Button(self.detail_filter_bar, text=condition_label(condition, DETAIL_FILTER_LABELS) + ' ×', style='Ghost.TButton',
                        command=lambda key=column: self._set_detail_filter(key, None))
         ttk.Button(self.detail_filter_bar, text='清除搜索与筛选', style='Quiet.TButton', command=self.clear_filter)
         count = len(self.detail_conditions) + bool(self.detail_search) + bool(has_period)
@@ -3845,7 +3905,8 @@ class App(tk.Toplevel):
     def _update_detail_headings(self) -> None:
         for key, title, _ in VIEW_COLUMNS["detail"]:
             arrow = (" ↓" if self.detail_descending else " ↑") if key == self.detail_sort else ""
-            image = self.detail_filter_images[self._has_detail_filter(key)] if key in DETAIL_FILTER_LABELS else ""
+            filtered = key in DETAIL_FILTER_LABELS and self._has_detail_filter(key)
+            image = self.detail_filter_images[1] if filtered else ""
             condition = self.detail_conditions.get(key)
             if condition:
                 if key == 'summary':
@@ -3881,6 +3942,13 @@ class App(tk.Toplevel):
         if persist and self.store:
             self.store.save_setting("detail_account_tree", "show" if visible else "hide")
         self.after_idle(self._resize_workspace)
+
+    def _fit_detail_account_pane(self, event):
+        if self.workbench.visible and len(self.detail_body.panes()) > 1:
+            table_width = min(240, event.width * 3 // 5)
+            maximum = event.width - table_width
+            if self.detail_body.sashpos(0) > maximum:
+                self.detail_body.sashpos(0, maximum)
 
     def _refresh_detail_accounts(self):
         if not self.store:
@@ -3960,8 +4028,11 @@ class App(tk.Toplevel):
     def open_voucher(self, _event: object = None, entry_id: int | None = None, *, edit_attention: bool = False,
                      replace_window: tk.Toplevel | None = None) -> None:
         mouse_event = _event is not None and getattr(_event, 'keysym', None) != 'Return'
-        if mouse_event and getattr(_event, 'x', None) is not None and self.detail_view.identify_column(_event.x) == "#0":
-            return "break"
+        if mouse_event and getattr(_event, 'x', None) is not None:
+            if self.detail_view.identify_region(_event.x, _event.y) not in ('tree', 'cell'):
+                return
+            if self.detail_view.identify_column(_event.x) == '#0':
+                return 'break'
         if not self.store:
             return
         if replace_window is not None and replace_window.winfo_exists() and not replace_window.request_close():

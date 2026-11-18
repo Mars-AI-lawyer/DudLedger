@@ -3,13 +3,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ledger_viewer.table_layout import WorkspaceTableFit, readable_minimum
+from ledger_viewer.ui import App
 from ledger_viewer.workbench import RightWorkbench
 from ledger_viewer.workbench_support import (
+    TOOL_GRIP_WIDTH,
     VoucherDragSession,
     drag_handle_at,
     link_feedback,
     ordered_issue_choices,
-    use_overlay_drawer,
+    tool_width_limits,
 )
 
 
@@ -69,15 +71,6 @@ class TableLayoutHeadlessTest(unittest.TestCase):
         self.assertEqual(view.widths, original)
         self.assertEqual(view.scroll_calls, [.25])
 
-    def test_overlay_restores_instead_of_compressing_the_ledger(self):
-        fitter, view, app = self.fixture()
-        original = dict(view.widths)
-        fitter.fit()
-        app.workbench.overlay = True
-        fitter.fit()
-        self.assertEqual(view.widths, original)
-        self.assertEqual(view.scroll_calls, [.25])
-
     def test_original_widths_stay_unchanged_when_they_fit(self):
         fitter, view, _app = self.fixture(800)
         original = dict(view.widths)
@@ -87,12 +80,14 @@ class TableLayoutHeadlessTest(unittest.TestCase):
 
 
 class WorkbenchSupportTest(unittest.TestCase):
-    def test_narrow_issue_panel_uses_overlay_without_detaching(self):
-        self.assertTrue(use_overlay_drawer(700, 525))
-        self.assertFalse(use_overlay_drawer(1000, 525))
-        self.assertFalse(use_overlay_drawer(700, 525, detached=True))
-        self.assertFalse(use_overlay_drawer(700, 525, mode='calculator'))
-        self.assertFalse(use_overlay_drawer(1, 525))
+    def test_both_tools_stay_resizable_with_a_narrow_window(self):
+        for mode in ('issues', 'calculator'):
+            for width in (560, 728, 1040, 1440):
+                with self.subTest(mode=mode, width=width):
+                    lower, upper = tool_width_limits(width, mode)
+                    self.assertLess(lower, upper)
+                    remaining = width - TOOL_GRIP_WIDTH - upper
+                    self.assertGreaterEqual(remaining, min(400, (width - TOOL_GRIP_WIDTH) // 2))
 
     def test_issue_chooser_pins_current_then_recent_and_filters(self):
         items = [
@@ -120,6 +115,47 @@ class WorkbenchSupportTest(unittest.TestCase):
 
 
 class WorkbenchActionHeadlessTest(unittest.TestCase):
+    def test_docking_reserves_space_and_narrow_window_divider_moves_in_both_directions(self):
+        panel = Mock()
+        panel.app.content.winfo_width.return_value = 728
+        panel.visible, panel.width, panel.mode = True, None, 'issues'
+        RightWorkbench.layout(panel)
+        panel.grid.assert_called_once_with(row=0, column=2, sticky='nsew')
+        panel.grip.grid.assert_called_once_with(row=0, column=1, sticky='ns')
+        panel.place.assert_not_called()
+        start_width = panel.configure.call_args.kwargs['width']
+        panel.winfo_width.return_value = start_width
+        RightWorkbench._start_resize(panel, SimpleNamespace(x_root=600))
+        RightWorkbench._resize(panel, SimpleNamespace(x_root=580))
+        self.assertEqual(panel.width, start_width + 20)
+        RightWorkbench._resize(panel, SimpleNamespace(x_root=620))
+        self.assertEqual(panel.width, start_width - 20)
+        RightWorkbench._finish_resize(panel, None)
+        RightWorkbench._resize(panel, SimpleNamespace(x_root=200))
+        self.assertEqual(panel.width, start_width - 20)
+
+    def test_open_account_tree_cannot_take_the_entire_ledger_viewport(self):
+        app = SimpleNamespace(workbench=SimpleNamespace(visible=True), detail_body=Mock())
+        app.detail_body.panes.return_value = ('accounts', 'entries')
+        app.detail_body.sashpos.return_value = 380
+        App._fit_detail_account_pane(app, SimpleNamespace(width=400))
+        app.detail_body.sashpos.assert_called_with(0, 160)
+        app.detail_body.sashpos.reset_mock()
+        app.workbench.visible = False
+        App._fit_detail_account_pane(app, SimpleNamespace(width=400))
+        app.detail_body.sashpos.assert_not_called()
+
+    def test_detail_toolbar_does_not_place_actions_on_top_of_search(self):
+        container, scope, actions = Mock(), Mock(), Mock()
+        scope.winfo_reqwidth.return_value = 150
+        actions.winfo_reqwidth.return_value = 200
+        container.winfo_width.return_value = 360
+        App._flow_bar(container, scope, actions, column=2, between=100)
+        actions.grid.assert_called_with(row=1, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        container.winfo_width.return_value = 650
+        App._flow_bar(container, scope, actions, column=2, between=100)
+        actions.grid.assert_called_with(row=0, column=2, columnspan=1, sticky='e', pady=0)
+
     def test_nav_state_leaves_count_and_text_to_app_presentation(self):
         app = SimpleNamespace(update_workbench_presentation=Mock(),
                               workbench_button=Mock(), calculator_button=Mock())

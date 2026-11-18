@@ -7,7 +7,7 @@ from . import issue_store as data
 from . import theme
 from .importer import format_money
 from .voucher_notes import voucher_key
-from .workbench_support import link_feedback, ordered_issue_choices, use_overlay_drawer
+from .workbench_support import TOOL_GRIP_WIDTH, link_feedback, ordered_issue_choices, tool_width_limits
 
 
 class Draft:
@@ -173,7 +173,7 @@ class RightWorkbench(ttk.Frame):
         self.app = app
         self.visible = False
         self.mode = 'issues'
-        self.width = 360
+        self.width = None
         self.calculator_width = 300
         self.active_tools = self.last_tools = None
         self.current = self.draft = None
@@ -181,7 +181,7 @@ class RightWorkbench(ttk.Frame):
         self.persisted_store = None
         self.loading_selection = False
         self.detached = False
-        self.overlay = False
+        self._resize_start = None
         self.window = None
         self.recent_issue_ids = []
         self._drag_highlight = None
@@ -204,9 +204,9 @@ class RightWorkbench(ttk.Frame):
         top.grid(row=0, column=0, sticky='ew')
         self.heading = tk.StringVar(value='问题工作台')
         ttk.Label(top, textvariable=self.heading, style="Title.TLabel").pack(side='left')
-        self.detach_button = ttk.Button(top, text='独立窗口', style="Ghost.TButton", command=self.detach)
-        self.detach_button.pack(side='right', padx=4)
         ttk.Button(top, text='×', width=2, style="Ghost.TButton", command=self.hide).pack(side='right')
+        self.detach_button = ttk.Button(top, text='独立窗口', style='Ghost.TButton', command=self.detach)
+        self.detach_button.pack(side='right', padx=4)
         self.calc_body = ttk.Frame(self)
         self.calc_body.columnconfigure(0, weight=1)
         self.calc_body.rowconfigure(1, weight=1)
@@ -214,11 +214,11 @@ class RightWorkbench(ttk.Frame):
         self.calc_source_label = ttk.Label(self.calc_body, textvariable=self.calc_source, padding=8, wraplength=420)
         self.calc_source_label.grid(row=0, column=0, sticky='ew')
         self.calc_hosts = {}
-        self.grip = ttk.Frame(app.content, width=8, cursor='sb_h_double_arrow', style='Resize.TFrame')
+        self.grip = ttk.Frame(app.content, width=TOOL_GRIP_WIDTH, cursor='sb_h_double_arrow', style='Resize.TFrame')
         self.grip.bind('<ButtonPress-1>', self._start_resize)
         self.grip.bind('<B1-Motion>', self._resize)
         self.grip.bind('<ButtonRelease-1>', self._finish_resize)
-        app.navigation_tooltip.attach(self.grip, lambda: '左右拖动，调整工具区宽度')
+        app.navigation_tooltip.attach(self.grip, lambda: '左右拖动，调整主区域和工具区的宽度')
         self._build_issues(self)
 
     @property
@@ -323,7 +323,9 @@ class RightWorkbench(ttk.Frame):
         self.detail.bind('<Configure>', lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
         self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfigure(self.detail_window, width=e.width))
         self.canvas.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
-        ttk.Label(self.issue_body, textvariable=self.feedback, style='Hint.TLabel', wraplength=380, padding=6).grid(row=2, column=0, sticky='ew')
+        feedback = ttk.Label(self.issue_body, textvariable=self.feedback, style='Hint.TLabel', wraplength=380, padding=6)
+        feedback.grid(row=2, column=0, sticky='ew')
+        feedback.bind('<Configure>', lambda event: feedback.configure(wraplength=max(100, event.width - 12)))
         self.empty_detail()
         if hasattr(self.app, 'voucher_actions'):
             self.app.voucher_actions.attach(self.voucher_view, lambda row: self.rows[row][1])
@@ -602,52 +604,31 @@ class RightWorkbench(ttk.Frame):
         return self.show(reset_directory=False) if self.detached else self._rehost(True)
 
     def dock(self):
-        # Docking is always allowed: insufficient space becomes an overlay drawer.
         return self._rehost(False)
 
     def layout(self):
         if hasattr(self.app, 'table_fit'):
             self.app.table_fit.schedule()
         if not self.visible:
-            self.overlay = False
+            self._resize_start = None
             self.grid_remove()
-            self.place_forget()
             self.grip.grid_remove()
-            self.grip.place_forget()
             self._nav_state()
             return
         available = self.app.content.winfo_width()
-        minimum = self._main_minimum()
-        desired = self.width if self.mode == 'issues' else self.calculator_width
-        self.overlay = use_overlay_drawer(available, minimum, self.mode, self.detached)
-        if self.overlay:
-            width = min(desired, max(280, available - 24))
-            self.grid_remove()
-            self.grip.grid_remove()
-            self.configure(width=width)
-            self.grid_propagate(False)
-            self.place(relx=1, anchor='ne', x=0, y=0, width=width, relheight=1)
-            self.grip.place(relx=1, anchor='ne', x=-width, y=0, width=8, relheight=1)
-            self.lift()
-            self.grip.lift()
-            self.heading.set('问题工作台（覆盖显示）')
-        else:
-            self.place_forget()
-            self.grip.place_forget()
-            width = min(desired, max(320 if self.mode == 'issues' else 260, available - minimum - 8))
-            self.configure(width=width)
-            self.grid_propagate(False)
-            self.grip.grid(row=0, column=1, sticky='ns')
-            self.grid(row=0, column=2, sticky='nsew')
-            if self.mode == 'issues':
-                self.heading.set('问题工作台')
+        lower, upper = tool_width_limits(available, self.mode)
+        desired = self.calculator_width
+        if self.mode == 'issues':
+            desired = self.width or min(420, (available - TOOL_GRIP_WIDTH) * 7 // 16)
+        width = max(lower, min(upper, desired))
+        self.configure(width=width)
+        self.grid_propagate(False)
+        self.grip.grid(row=0, column=1, sticky='ns')
+        self.grid(row=0, column=2, sticky='nsew')
         if self.mode == 'calculator' and self.active_tools:
             self.active_tools.set_compact_width(width - 8)
             self.calc_source_label.configure(wraplength=width - 16)
         self._nav_state()
-
-    def _main_minimum(self):
-        return self.app.table_fit.minimum_width() if hasattr(self.app, 'table_fit') else 525
 
     def _start_resize(self, event):
         self._resize_start = (event.x_root, self.winfo_width())
@@ -666,12 +647,12 @@ class RightWorkbench(ttk.Frame):
             self.app.calculator_button.state(['selected' if self.visible and self.mode == 'calculator' else '!selected'])
 
     def _resize(self, event):
-        minimum = 320 if self.mode == 'issues' else 260
+        if self._resize_start is None:
+            return
         available = self.app.content.winfo_width()
-        maximum = (max(minimum, available - 24) if self.overlay
-                   else max(minimum, available - self._main_minimum() - 8))
-        start = getattr(self, '_resize_start', None)
-        desired = start[1] + start[0] - event.x_root if start else self.app.content.winfo_rootx() + self.app.content.winfo_width() - event.x_root
+        minimum, maximum = tool_width_limits(available, self.mode)
+        start_x, start_width = self._resize_start
+        desired = start_width + start_x - event.x_root
         width = max(minimum, min(maximum, desired))
         if self.mode == 'issues':
             self.width = width

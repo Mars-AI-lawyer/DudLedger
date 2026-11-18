@@ -21,7 +21,7 @@ class SpecialistUITest(unittest.TestCase):
         self.app.search.set('不会影响抽查')
         self.assertEqual(tuple(self.panel.review_accounts), ACCOUNTS)
         with patch('ledger_viewer.jev_ui.ConsentDialog') as consent:
-            self.panel.new_batch()
+            self.panel.new_batch(preview=True)
         batch = consent.call_args.args[1]
         self.assertEqual(batch_counts(self.app.store, batch)['total'], 2)
         self.assertEqual(json.loads(batch_info(self.app.store, batch)['scope_json'])['review_accounts'], list(ACCOUNTS))
@@ -80,7 +80,7 @@ class SpecialistUITest(unittest.TestCase):
         self.assertEqual(len([t for t in load_rules(self.app.store)[1]['topics'] if t['account'] == '银行存款']), 2)
         self.panel.review_accounts['银行存款'].set(True)
         with patch('ledger_viewer.jev_ui.ConsentDialog') as consent:
-            self.panel.new_batch()
+            self.panel.new_batch(preview=True)
         self.assertEqual(batch_counts(self.app.store, consent.call_args.args[1])['vouchers'], 1)
 
     def test_empty_prompt_cannot_be_saved_and_unmodified_cancel_needs_no_confirmation(self):

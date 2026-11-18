@@ -41,24 +41,13 @@ class WorkspaceTableFit:
             columns = tuple(view.cget('columns'))
         return (('#0',) if 'tree' in tuple(map(str, view.cget('show'))) else ()) + columns
 
-    def minimum_width(self):
-        view = next((view for view in self.views if view.winfo_ismapped()), None)
-        if view is None:
-            return 525
-        minimum = max(525, sum(view.column(key, 'minwidth') for key in self.columns(view)) + 24)
-        navigation = getattr(self.app, 'detail_accounts', None)
-        if view is self.app.detail_view and navigation and navigation.winfo_ismapped():
-            minimum += navigation.winfo_width() + 6
-        return minimum
-
     def schedule(self, _event=None):
         if self.job is None:
             self.job = self.app.after_idle(self.fit)
 
     def fit(self):
         self.job = None
-        if not self.app.workbench.visible or getattr(self.app.workbench, 'overlay', False):
-            # Overlay drawers cover auxiliary space; they never compress the ledger.
+        if not self.app.workbench.visible:
             for view, widths in self.saved.items():
                 for key, width in widths.items():
                     view.column(key, width=width)

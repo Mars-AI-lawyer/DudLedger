@@ -376,17 +376,19 @@ class IssueWorkbenchUITest(unittest.TestCase):
         self.assertFalse(self.panel.detached)
         self.assertEqual(self.panel.issue_id, self.issue)
 
-    def test_small_window_uses_overlay_without_detaching(self):
+    def test_small_window_keeps_workbench_and_ledger_side_by_side(self):
         self.app.geometry('820x520')
         self.root.set_font_size(18, persist=False)
         self.root.update()
         self.assertFalse(self.panel.detached)
-        self.assertTrue(self.panel.overlay)
+        self.assertEqual(self.panel.winfo_manager(), 'grid')
         self.assertTrue(self.panel.issues_visible)
-        self.assertGreaterEqual(self.app.detail_view.winfo_width(), 520)
+        self.assertGreater(self.app.detail_view.winfo_width(), 250)
+        self.assertLessEqual(self.app.detail_view.master.winfo_rootx() + self.app.detail_view.master.winfo_width(),
+                             self.panel.grip.winfo_rootx())
         self.assertTrue(self.app.workbench_button.winfo_ismapped())
 
-    def test_overlay_keeps_unsaved_editor_accessible(self):
+    def test_narrow_docked_workbench_keeps_unsaved_editor_accessible(self):
         self.panel.notes.insert('end', '不可丢弃的笔记')
         with patch('ledger_viewer.issue_store.save_issue', side_effect=OSError('保存失败')):
             self.app.geometry('820x520')

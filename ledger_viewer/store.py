@@ -104,7 +104,7 @@ ENTRY_SORT_COLUMNS = {
     "date": ("e.entry_date",),
     "year": ("CAST(e.fiscal_year AS INTEGER)", "e.fiscal_year"),
     "period": ("CAST(e.fiscal_year AS INTEGER)", "CAST(e.period AS INTEGER)"),
-    "voucher": ("e.voucher_type", "CAST(e.voucher_no AS INTEGER)", "e.voucher_no"),
+    "voucher": ("CAST(e.voucher_no AS INTEGER)", "e.voucher_no", "e.voucher_type"),
     "debit": ("e.debit_cents",), "credit": ("e.credit_cents",),
     "original": ("e.original_amount COLLATE ledger_decimal",),
 }
